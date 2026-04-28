@@ -1,0 +1,28 @@
+image: python:3.12
+
+stages:
+  - lint
+  - test
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  paths:
+    - .cache/pip
+
+before_script:
+  - python --version
+  - python -m pip install --upgrade pip
+  - python -m pip install -e ".[dev]"
+
+lint:
+  stage: lint
+  script:
+    - ruff check src tests scripts
+
+test:
+  stage: test
+  script:
+    - pytest
+
