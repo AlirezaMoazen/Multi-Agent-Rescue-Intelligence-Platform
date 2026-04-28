@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  # Base service definition
+  base: &base
+    build: .
+    volumes:
+      # Mount the current directory into the container to reflect local changes
+      - .:/app
+    environment:
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app/src
+
+  # Service for interactive development
+  dev:
+    <<: *base
+    command: /bin/bash
+    stdin_open: true # Equivalent to docker run -i
+    tty: true        # Equivalent to docker run -t
+
+  # Service to run tests
+  test:
+    <<: *base
+    command: pytest
+
+  # Service to run linting
+  lint:
+    <<: *base
+    command: ruff check src tests scripts
+
+  # Service to run the simulation
+  run:
+    <<: *base
+    command: python scripts/run_scenario.py
