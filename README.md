@@ -8,18 +8,18 @@ selects a strategy to find the known number of targets.
 
 ```text
 .
-├── configs/                  # Scenario and training configuration files
-├── data/                     # Generated scenario inputs and run outputs
-├── docs/                     # Design notes and task documentation
-├── scripts/                  # Command-line entry points for common workflows
-├── src/rescue_sim/           # Main Python package
-│   ├── agents/               # Single-agent policy and behavior logic
-│   ├── environment/          # Grid, obstacles, targets, sensors, movement
-│   ├── learning/             # Search/RL algorithms and training loops
-│   ├── simulation/           # Scenario orchestration and metrics
-│   ├── visualization/        # Plotting or GUI helpers
-│   └── config/               # Typed configuration loading
-└── tests/                    # Unit and integration tests
+|-- configs/                  # Scenario and training configuration files
+|-- data/                     # Generated scenario inputs and run outputs
+|-- docs/                     # Design notes and task documentation
+|-- scripts/                  # Command-line entry points for common workflows
+|-- src/rescue_sim/           # Main Python package
+|   |-- agents/               # Single-agent policy and behavior logic
+|   |-- environment/          # Grid, obstacles, targets, sensors, movement
+|   |-- learning/             # Search/RL algorithms and training loops
+|   |-- simulation/           # Scenario orchestration and metrics
+|   |-- visualization/        # Plotting or GUI helpers
+|   `-- config/               # Typed configuration loading
+`-- tests/                    # Unit and integration tests
 ```
 
 ## Task Scope
