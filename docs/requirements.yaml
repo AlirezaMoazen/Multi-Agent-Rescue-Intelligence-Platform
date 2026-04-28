@@ -1,0 +1,218 @@
+project:
+  name: rescue-sim
+  backlog_task: ST04
+  title: Single agent rescue team
+  source: backlog_MARL.pdf
+  implementation_languages:
+    application_code: Python
+    configuration: YAML
+  objective: >
+    Build a Python simulator for a single rescue agent that explores generated
+    damaged-area scenarios, avoids obstacles, and finds a known number of rescue
+    targets.
+
+scope:
+  included:
+    - Generate several single-agent rescue scenarios.
+    - Configure grid size, obstacle density, target count, start position, sensor range, and max steps.
+    - Place one rescue agent at a valid starting position.
+    - Place obstacles and targets probabilistically using reproducible random seeds.
+    - Let the agent observe its surroundings through a sensor model.
+    - Let the agent move with an initially deterministic movement model.
+    - Let the agent explore until all known targets are found or the scenario reaches max_steps.
+    - Record run metrics for strategy comparison.
+    - Provide tests for generation, movement, sensing, simulation stopping, and strategy behavior.
+  excluded_for_st04:
+    - Multi-agent coordination.
+    - Agent-to-agent communication.
+    - Central multi-agent optimization server.
+    - Distributed multi-agent learning.
+    - Stochastic movement or uncertain sensor readings.
+
+architecture_mapping:
+  agents:
+    path: src/rescue_sim/agents
+    responsibility:
+      - Store single-agent state.
+      - Expose the agent position and sensor range.
+      - Keep decision policy separate from raw agent state.
+  config:
+    path: src/rescue_sim/config
+    responsibility:
+      - Load YAML scenario files.
+      - Validate grid, agent, and simulation settings.
+      - Provide typed Python settings objects.
+  environment:
+    path: src/rescue_sim/environment
+    responsibility:
+      - Represent the grid.
+      - Store obstacle and target positions.
+      - Generate reproducible scenarios.
+      - Validate movement against grid bounds and obstacles.
+      - Produce sensor observations.
+  learning:
+    path: src/rescue_sim/learning
+    responsibility:
+      - Implement baseline exploration strategy.
+      - Add later strategy optimization or reinforcement learning algorithms.
+      - Compare strategies using metrics from simulation runs.
+  simulation:
+    path: src/rescue_sim/simulation
+    responsibility:
+      - Coordinate configuration, scenario generation, agent actions, and metrics.
+      - Stop runs when all targets are found or max_steps is reached.
+  visualization:
+    path: src/rescue_sim/visualization
+    responsibility:
+      - Render grids, obstacles, targets, agent position, and explored cells.
+      - Keep visualization optional so tests and CLI runs work without a GUI.
+
+functional_requirements:
+  - id: FR-001
+    name: Load YAML scenario configuration
+    description: The simulator shall load scenario parameters from YAML files.
+    acceptance_criteria:
+      - configs/default_scenario.yaml can be loaded by Python code.
+      - Missing or invalid required values produce clear validation errors.
+  - id: FR-002
+    name: Generate rescue grid
+    description: The simulator shall generate a two-dimensional grid with configurable width and height.
+    acceptance_criteria:
+      - Every generated cell is inside the configured dimensions.
+      - The grid contains the requested number of targets.
+  - id: FR-003
+    name: Place obstacles probabilistically
+    description: The generator shall place obstacles using obstacle_probability from YAML configuration.
+    acceptance_criteria:
+      - The agent start position is never an obstacle.
+      - Generated scenarios are reproducible when the same random_seed is used.
+  - id: FR-004
+    name: Place rescue targets
+    description: The generator shall place rescue targets on valid non-obstacle cells.
+    acceptance_criteria:
+      - Targets are never placed on obstacle cells.
+      - Targets are never placed on the agent start position.
+      - The target count matches the configured target_count.
+  - id: FR-005
+    name: Use deterministic movement
+    description: The agent shall move deterministically between adjacent valid grid cells.
+    acceptance_criteria:
+      - Moves outside the grid are rejected.
+      - Moves into obstacles are rejected.
+      - Valid moves update the agent position predictably.
+  - id: FR-006
+    name: Provide sensor observations
+    description: The sensor model shall return visible cells, obstacles, and targets within sensor_range.
+    acceptance_criteria:
+      - Observations include cells within the configured range.
+      - Observations exclude cells outside the configured range.
+      - Observations do not include cells outside the grid.
+  - id: FR-007
+    name: Track discovered targets
+    description: The simulation shall record targets found by the agent.
+    acceptance_criteria:
+      - A target is counted as found when the agent reaches it or observes it according to the selected rule.
+      - Already discovered targets are not counted twice.
+  - id: FR-008
+    name: Stop simulation correctly
+    description: The simulation shall stop when all known targets are found or max_steps is reached.
+    acceptance_criteria:
+      - A successful run ends after finding target_count targets.
+      - An incomplete run ends no later than max_steps.
+  - id: FR-009
+    name: Record metrics
+    description: Each run shall produce metrics for evaluating the strategy.
+    acceptance_criteria:
+      - Metrics include steps_taken, targets_found, success, and explored_cells.
+      - Metrics can be serialized to YAML.
+  - id: FR-010
+    name: Provide command-line scenario runner
+    description: A Python script shall run one configured scenario from the command line.
+    acceptance_criteria:
+      - scripts/run_scenario.py accepts or uses a YAML configuration file.
+      - The runner prints or writes run metrics.
+
+non_functional_requirements:
+  - id: NFR-001
+    name: Python-only application code
+    description: Simulator source code shall be written in Python.
+  - id: NFR-002
+    name: YAML configuration and outputs
+    description: Scenario configuration and machine-readable run outputs shall use YAML.
+  - id: NFR-003
+    name: Reproducibility
+    description: Runs with the same YAML configuration and random seed shall produce the same scenario.
+  - id: NFR-004
+    name: Testability
+    description: Core logic shall be testable without a GUI.
+  - id: NFR-005
+    name: Modularity
+    description: Environment, agent state, strategy, simulation, and visualization shall remain separate modules.
+  - id: NFR-006
+    name: Extensibility
+    description: The architecture shall allow later ST05 and ST06 multi-agent extensions without rewriting ST04 core logic.
+
+configuration_requirements:
+  scenario_yaml:
+    required_sections:
+      grid:
+        width: positive integer
+        height: positive integer
+        obstacle_probability: number between 0.0 and 1.0
+        target_count: non-negative integer
+        random_seed: optional integer
+      agent:
+        start_x: integer inside grid
+        start_y: integer inside grid
+        sensor_range: non-negative integer
+      simulation:
+        max_steps: positive integer
+
+output_requirements:
+  metrics_yaml:
+    fields:
+      scenario_id: string
+      success: boolean
+      steps_taken: integer
+      targets_found: integer
+      target_count: integer
+      explored_cells: integer
+      final_position:
+        x: integer
+        y: integer
+      random_seed: optional integer
+
+testing_requirements:
+  unit_tests:
+    - Grid generation keeps the start position free.
+    - Targets are generated only on valid cells.
+    - Movement validation rejects obstacles and out-of-bounds positions.
+    - Sensor observations respect sensor_range.
+    - Simulation runner stops on success and max_steps.
+  integration_tests:
+    - A complete scenario can run from YAML configuration.
+    - Metrics are produced in the expected YAML-compatible structure.
+
+milestones:
+  - id: M1
+    name: Deterministic grid baseline
+    deliverables:
+      - YAML config loader
+      - grid generator
+      - movement validation
+      - baseline exploration strategy
+      - basic tests
+  - id: M2
+    name: Complete ST04 simulation loop
+    deliverables:
+      - simulation runner
+      - sensor model
+      - target discovery tracking
+      - run metrics
+  - id: M3
+    name: Strategy evaluation
+    deliverables:
+      - repeatable scenario batches
+      - strategy comparison metrics
+      - optional visualization
+
