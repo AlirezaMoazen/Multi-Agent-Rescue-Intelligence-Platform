@@ -1,0 +1,15 @@
+grid:
+  width: 20
+  height: 20
+  obstacle_probability: 0.15
+  target_count: 4
+  random_seed: 42
+
+agent:
+  start_x: 0
+  start_y: 0
+  sensor_range: 3
+
+simulation:
+  max_steps: 500
+
