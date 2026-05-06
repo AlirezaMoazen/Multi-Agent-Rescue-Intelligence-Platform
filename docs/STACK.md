@@ -7,8 +7,9 @@
 - **Antigravity**
 - **Codex**
 - **Claude Code**
-- **ChatGPT**
+
 
 ## AI Models Used
 - **Claude Models**
 - **Gemini Models**
+- **GPT Models**
