@@ -1,13 +1,21 @@
 # Architecture
 
-This document describes the initial architecture for the ST04 single-agent
-rescue simulator.
+This document describes the architecture for the Multi-Agent Rescue Teams
+simulator. The current focus is Sprint 2: the damaged-area simulator foundation.
 
 ## Goal
 
-The system simulates one rescue agent exploring a generated damaged area. The
-agent knows how many targets exist and must find all targets while avoiding
-obstacles.
+The system simulates a damaged rescue area where agents can move, observe nearby
+cells, detect targets, communicate information, and later improve rescue
+strategies through learning methods.
+
+The architecture is built incrementally:
+
+1. damaged-area grid simulator
+2. single-agent exploration and learning
+3. multi-agent coordination
+4. distributed learning and uncertainty
+5. graphical/demo improvements
 
 ## Package Structure
 
@@ -29,8 +37,10 @@ The environment represents a rescue scenario as a grid. It owns the static map
 data:
 
 - grid width and height
+- blocked cells and walls
 - obstacle positions
-- target positions
+- Target A positions
+- Target B positions
 
 The first implementation uses deterministic movement. A move is valid only when
 the destination is inside the grid and not blocked by an obstacle.
@@ -47,11 +57,12 @@ The generator creates reproducible scenarios from configuration values:
 
 The start position is kept free of obstacles and targets.
 
-### Sensor Model
+### Sensor / Observation Model
 
-The sensor model returns the agent's local observation. In the baseline version,
-this should include visible cells, obstacles, and targets within the configured
-sensor range.
+The sensor model returns what an agent can observe from its current position.
+In Sprint 2, this includes nearby visible cells, obstacles, and targets. Later
+increments will extend this to other agents, communication radius, and uncertain
+sensor readings.
 
 ### Agent
 
