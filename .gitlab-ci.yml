@@ -26,3 +26,14 @@ test:
   script:
     - pytest
 
+# --- Simple MR Approval Workaround ---
+# This job runs only on Merge Requests and requires a manual "Play" click to finish.
+# Since the pipeline won't succeed until this is clicked, the MR cannot be merged.
+peer-approval:
+  stage: test
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: manual
+      allow_failure: false
+  script:
+    - echo "Merge Request manually approved by a peer!"
