@@ -68,7 +68,6 @@ Main dependencies are declared in [pyproject.toml](pyproject.toml):
 
 - [Architecture](docs/architecture.md)
 - [Requirements](docs/requirements.yaml)
-- [ST04 design notes](docs/st04_design.md)
 
 ## Configuration
 
@@ -155,24 +154,4 @@ CI installs the package with:
 python -m pip install -e ".[dev]"
 ```
 
-## Implementation Status
-
-Completed foundation:
-
-- Python package structure
-- architecture documentation
-- YAML requirements specification
-- default YAML scenario file
-- GitLab CI pipeline
-- initial grid and scenario generation skeleton
-- first generation test
-
-Next implementation steps:
-
-- YAML configuration loader
-- deterministic movement validation
-- sensor observation logic
-- baseline exploration strategy
-- full simulation runner
-- YAML metrics output
 
