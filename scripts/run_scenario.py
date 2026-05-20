@@ -1,8 +1,8 @@
-"""Run one ST04 rescue scenario."""
+"""Run one ST02 rescue scenario."""
 
 
 def main() -> None:
-    print("ST04 scenario runner is ready for implementation.")
+    print("ST02 scenario runner is ready for implementation.")
 
 
 if __name__ == "__main__":

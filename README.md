@@ -95,7 +95,8 @@ grid:
   width: 20
   height: 20
   obstacle_probability: 0.15
-  target_count: 4
+  target_a_count: 2
+  target_b_count: 2
   random_seed: 42
 
 agent:
