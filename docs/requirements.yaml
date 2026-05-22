@@ -14,7 +14,7 @@ project:
 scope:
   current:
     - Generate grid-based rescue scenarios.
-    - Configure grid size, obstacle density, target count, start position, sensor range, and max steps.
+    - Configure grid size, obstacle density, Target A count, Target B count, start position, sensor range, and max steps.
     - Place agents at valid starting positions.
     - Place obstacles and targets probabilistically using reproducible random seeds.
     - Distinguish between Target A and Target B.
@@ -80,7 +80,7 @@ functional_requirements:
     description: The simulator shall generate a two-dimensional grid with configurable width and height.
     acceptance_criteria:
       - Every generated cell is inside the configured dimensions.
-      - The grid contains the requested number of targets.
+      - The grid contains the requested number of Target A and Target B positions.
   - id: FR-003
     name: Place obstacles probabilistically
     description: The generator shall place obstacles using obstacle_probability from YAML configuration.
@@ -93,7 +93,7 @@ functional_requirements:
     acceptance_criteria:
       - Targets are never placed on obstacle cells.
       - Targets are never placed on the agent start position.
-      - The target count matches the configured target_count.
+      - The Target A and Target B counts match the configured target_a_count and target_b_count.
   - id: FR-005
     name: Use deterministic movement
     description: The agent shall move deterministically between adjacent valid grid cells.
@@ -118,7 +118,7 @@ functional_requirements:
     name: Stop simulation correctly
     description: The simulation shall stop when all known targets are found or max_steps is reached.
     acceptance_criteria:
-      - A successful run ends after finding target_count targets.
+      - A successful run ends after finding all configured Target A and Target B positions.
       - An incomplete run ends no later than max_steps.
   - id: FR-009
     name: Record metrics
@@ -160,7 +160,8 @@ configuration_requirements:
         width: positive integer
         height: positive integer
         obstacle_probability: number between 0.0 and 1.0
-        target_count: non-negative integer
+        target_a_count: non-negative integer
+        target_b_count: non-negative integer
         random_seed: optional integer
       agent:
         start_x: integer inside grid
@@ -176,7 +177,8 @@ output_requirements:
       success: boolean
       steps_taken: integer
       targets_found: integer
-      target_count: integer
+      target_a_count: integer
+      target_b_count: integer
       explored_cells: integer
       final_position:
         x: integer

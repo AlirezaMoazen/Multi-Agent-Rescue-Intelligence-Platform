@@ -51,7 +51,8 @@ The generator creates reproducible scenarios from configuration values:
 
 - map size
 - obstacle probability
-- target count
+- Target A count
+- Target B count
 - random seed
 - agent start position
 
