@@ -26,8 +26,8 @@ output.
 |---|---|---:|
 | Adriana | Finish grid environment: blocked cells, walls, valid movements, obstacles not overlapping starting points, random generation using seeds, tests. Fix Target A / Target B spawning instead of generic targets. | 15h |
 | Cristina | Add central sensor model and basic communication with agent: what and how sensor tells agent and vice versa, what sensor knows, tests. | 18h |
-| xxx | Add simple visual output and connect all parts: text grid, config loading, simulation loop, metrics, integration test. | 16h |
-| xxx | Make movement model for agents: allowed movements, avoid obstacles, tests, central sensor compatibility. | 16h |
+| Alireza | Add simple visual output and connect all parts: text grid, config loading, simulation loop, metrics, integration test. | 16h |
+| Mustafa | Make movement model for agents: allowed movements, avoid obstacles, tests, central sensor compatibility. | 16h |
 | Everyone | Code review, CI/test fixes, merge fixes, meetings. | 7h |
 
 ## Capacity
