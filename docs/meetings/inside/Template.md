@@ -1,26 +1,31 @@
-# Meeting Notes: [Date]
+# Meeting Notes: [Date: 22.05.2026]
 
 ## Attendees
-- [ ] [Name 1]
-- [ ] [Name 2]
-- [ ] [Name 3]
+- [ ] [Adriana]
+- [ ] [Mustafa]
+- [ ] [Cristina]
+- [ ] [Alireza]
 
-## Updates (Who did what)
-*Brief updates on what was accomplished since the last meeting.*
-- [Name 1]: 
-- [Name 2]: 
+
 
 ## Agenda / What we discussed
 *Key topics discussed during the meeting.*
-1. Topic 1
-2. Topic 2
+1. Sprint 2 backlog and task responsiblilities
+2. How movement should interact with grid obstacles and sensors.
+3. What needs to be ready before opening merge requests.
+4. Testing expectations for each task.
 
 ## Decisions Made
 *Clear record of any decisions agreed upon.*
-- [ ] Decision 1
-- [ ] Decision 2
+- [ ] Movement will allow up, down, left, right, and wait.
+- [ ] Invalid moves will keep the agent in the same position.
+- [ ] Movement must reject obstacles and positions outside the grid.
+- [ ] Each feature should include tests before merge.
 
 ## Action Items (Next things to do)
 *Tasks assigned during the meeting.*
-- [ ] Task 1 - @[Assignee] - [Due Date]
-- [ ] Task 2 - @[Assignee] - [Due Date]
+- [ ] Finish movement model tests - @Mustafa 27.05.2026
+- [ ] Finish Target A / Target b spawning test - @Adriana 27.05.2026
+- [ ] Implement central sensor communication -@Cristina 27.05.2026
+- [ ] Connect visual output with simulation loop -@Alireza 27.05.2026
+- [ ] Review each merge request - @Everyone 27.05.2026
