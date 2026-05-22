@@ -1,33 +1,34 @@
 project:
   name: rescue-sim
-  backlog_task: ST04
-  title: Single agent rescue team
+  title: Multi-Agent Rescue Teams simulator
   source: backlog_MARL.pdf
+  current_sprint: Sprint 2
   implementation_languages:
     application_code: Python
     configuration: YAML
   objective: >
-    Build a Python simulator for a single rescue agent that explores generated
-    damaged-area scenarios, avoids obstacles, and finds a known number of rescue
-    targets.
+    Build a Python simulator for a damaged rescue area where agents can explore,
+    observe obstacles and targets, communicate information, and later improve
+    rescue strategies using learning methods.
 
 scope:
-  included:
-    - Generate several single-agent rescue scenarios.
-    - Configure grid size, obstacle density, target count, start position, sensor range, and max steps.
-    - Place one rescue agent at a valid starting position.
+  current:
+    - Generate grid-based rescue scenarios.
+    - Configure grid size, obstacle density, Target A count, Target B count, start position, sensor range, and max steps.
+    - Place agents at valid starting positions.
     - Place obstacles and targets probabilistically using reproducible random seeds.
-    - Let the agent observe its surroundings through a sensor model.
-    - Let the agent move with an initially deterministic movement model.
-    - Let the agent explore until all known targets are found or the scenario reaches max_steps.
-    - Record run metrics for strategy comparison.
+    - Distinguish between Target A and Target B.
+    - Let agents observe surroundings through a sensor model.
+    - Let agents move with an initially deterministic movement model.
+    - Record basic metrics for strategy comparison.
     - Provide tests for generation, movement, sensing, simulation stopping, and strategy behavior.
-  excluded_for_st04:
-    - Multi-agent coordination.
-    - Agent-to-agent communication.
-    - Central multi-agent optimization server.
+  future:
+    - Single-agent autonomous exploration and learning.
+    - Central multi-agent reinforcement learning.
+    - Agent-to-agent communication with radius limits.
     - Distributed multi-agent learning.
-    - Stochastic movement or uncertain sensor readings.
+    - Stochastic movement and uncertain sensor readings.
+    - Graphical simulator and final live demo.
 
 architecture_mapping:
   agents:
@@ -79,7 +80,7 @@ functional_requirements:
     description: The simulator shall generate a two-dimensional grid with configurable width and height.
     acceptance_criteria:
       - Every generated cell is inside the configured dimensions.
-      - The grid contains the requested number of targets.
+      - The grid contains the requested number of Target A and Target B positions.
   - id: FR-003
     name: Place obstacles probabilistically
     description: The generator shall place obstacles using obstacle_probability from YAML configuration.
@@ -92,7 +93,7 @@ functional_requirements:
     acceptance_criteria:
       - Targets are never placed on obstacle cells.
       - Targets are never placed on the agent start position.
-      - The target count matches the configured target_count.
+      - The Target A and Target B counts match the configured target_a_count and target_b_count.
   - id: FR-005
     name: Use deterministic movement
     description: The agent shall move deterministically between adjacent valid grid cells.
@@ -117,7 +118,7 @@ functional_requirements:
     name: Stop simulation correctly
     description: The simulation shall stop when all known targets are found or max_steps is reached.
     acceptance_criteria:
-      - A successful run ends after finding target_count targets.
+      - A successful run ends after finding all configured Target A and Target B positions.
       - An incomplete run ends no later than max_steps.
   - id: FR-009
     name: Record metrics
@@ -150,7 +151,7 @@ non_functional_requirements:
     description: Environment, agent state, strategy, simulation, and visualization shall remain separate modules.
   - id: NFR-006
     name: Extensibility
-    description: The architecture shall allow later ST05 and ST06 multi-agent extensions without rewriting ST04 core logic.
+    description: The architecture shall allow later central and distributed multi-agent extensions without rewriting the simulator core.
 
 configuration_requirements:
   scenario_yaml:
@@ -159,7 +160,8 @@ configuration_requirements:
         width: positive integer
         height: positive integer
         obstacle_probability: number between 0.0 and 1.0
-        target_count: non-negative integer
+        target_a_count: non-negative integer
+        target_b_count: non-negative integer
         random_seed: optional integer
       agent:
         start_x: integer inside grid
@@ -175,7 +177,8 @@ output_requirements:
       success: boolean
       steps_taken: integer
       targets_found: integer
-      target_count: integer
+      target_a_count: integer
+      target_b_count: integer
       explored_cells: integer
       final_position:
         x: integer
@@ -203,7 +206,7 @@ milestones:
       - baseline exploration strategy
       - basic tests
   - id: M2
-    name: Complete ST04 simulation loop
+    name: Complete damaged-area simulation loop
     deliverables:
       - simulation runner
       - sensor model

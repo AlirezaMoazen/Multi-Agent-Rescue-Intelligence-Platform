@@ -1,31 +1,42 @@
 # Rescue Sim
 
-Python implementation for backlog task **ST04: Single agent rescue team** from
-the Multi-Agent Rescue Teams project.
+Python simulator for the Multi-Agent Rescue Teams project.
 
-The simulator models one rescue agent exploring a generated damaged area with
-configurable obstacles and rescue targets. The agent knows how many targets
-exist and must find them while avoiding blocked cells.
+The project goal is to build a damaged-area rescue simulation where agents can
+explore an environment, detect rescue targets, communicate observations, and
+improve rescue strategies over time.
+
+## Project Status
+
+Current sprint: Sprint 2, May 6 - May 27
+
+Sprint 2 goal: create the first working damaged-area simulator foundation with
+grid environment, Target A/B spawning, valid movement, central sensor
+communication, simple visual output, and basic integration.
+
+Planning documents:
+
+- [Product Backlog](docs/product_backlog.md)
+- [Sprint 2 Backlog](docs/sprints/sprint_2.md)
 
 ## Current Scope
 
-ST04 focuses on the single-agent version of the rescue task:
+The current implementation focuses on the Sprint 2 damaged-area simulator
+foundation:
 
-- generate several rescue scenarios
-- configure grid size, obstacle density, targets, start position, sensor range, and max steps
-- place one rescue agent at a valid starting cell
-- use a deterministic movement model first
-- provide sensor observations around the agent
-- explore until all known targets are found or the run reaches `max_steps`
-- record metrics so strategies can be compared
+- generate grid-based rescue scenarios
+- configure grid size, obstacle density, targets, start positions, sensor range, and max steps
+- place obstacles and rescue targets using reproducible random seeds
+- distinguish between Target A and Target B
+- validate movements against walls, blocked cells, and obstacles
+- provide basic sensor observations
+- support basic communication between the agent and sensor model
+- run a simple scenario loop
+- produce basic visual/text feedback and metrics
 
-Out of scope for ST04:
-
-- multi-agent coordination
-- agent-to-agent communication
-- central multi-agent optimization
-- distributed multi-agent learning
-- uncertain movement or uncertain sensor readings
+Future increments will add autonomous exploration, single-agent learning,
+multi-agent coordination, distributed learning, uncertainty, validation, and
+final graphical/demo improvements.
 
 ## Technology
 
@@ -50,8 +61,9 @@ Main dependencies are declared in [pyproject.toml](pyproject.toml):
 |   `-- default_scenario.yaml  # Example YAML scenario configuration
 |-- docs/
 |   |-- architecture.md        # Architecture overview
-|   |-- requirements.yaml      # ST04 requirements specification
-|   `-- st04_design.md         # Initial design notes
+|   |-- product_backlog.md     # Ordered Product Backlog
+|   |-- requirements.yaml      # Project requirements
+|   `-- sprints/               # Sprint Backlogs and sprint planning
 |-- scripts/
 |   `-- run_scenario.py        # Scenario runner entry point
 |-- src/rescue_sim/
@@ -68,6 +80,8 @@ Main dependencies are declared in [pyproject.toml](pyproject.toml):
 
 - [Architecture](docs/architecture.md)
 - [Requirements](docs/requirements.yaml)
+- [Product Backlog](docs/product_backlog.md)
+- [Sprint 2 Backlog](docs/sprints/sprint_2.md)
 
 ## Configuration
 
@@ -81,7 +95,8 @@ grid:
   width: 20
   height: 20
   obstacle_probability: 0.15
-  target_count: 4
+  target_a_count: 2
+  target_b_count: 2
   random_seed: 42
 
 agent:
@@ -122,8 +137,8 @@ The scenario runner is prepared as the command-line entry point:
 python scripts/run_scenario.py
 ```
 
-The current runner is a placeholder while the ST04 simulation loop is being
-implemented.
+Sprint 2 work will turn this into a runnable damaged-area scenario with basic
+metrics and visual/text output.
 
 ## Test and Lint
 

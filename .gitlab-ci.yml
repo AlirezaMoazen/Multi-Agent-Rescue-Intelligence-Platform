@@ -1,5 +1,16 @@
 image: python:3.12
 
+default:
+  tags:
+    - container
+    - podman
+    - "builder 1"
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+
 stages:
   - lint
   - test
