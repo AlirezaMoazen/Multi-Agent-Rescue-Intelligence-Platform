@@ -1,5 +1,7 @@
 # Product Backlog
 
+PDF version: [Product Backlog](product_backlog.pdf)
+
 Product Goal: build a multi-agent rescue simulation where agents explore a
 damaged area, detect targets, communicate useful information, learn from the
 environment, and improve rescue strategy over time.

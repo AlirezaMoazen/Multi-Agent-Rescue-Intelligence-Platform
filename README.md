@@ -16,8 +16,9 @@ communication, simple visual output, and basic integration.
 
 Planning documents:
 
-- [Product Backlog](docs/product_backlog.md)
-- [Sprint 2 Backlog](docs/sprints/sprint_2.md)
+- [Product Backlog](docs/product_backlog.md) ([PDF version](docs/product_backlog.pdf))
+- [Sprint 2 Backlog](docs/sprints/sprint_2.md) ([PDF version](docs/sprints/sprint_2.pdf))
+- [Sprint 3 Backlog](docs/sprints/sprint_3.md) ([PDF version](docs/sprints/sprint_3.pdf))
 
 ## Current Scope
 
@@ -80,8 +81,9 @@ Main dependencies are declared in [pyproject.toml](pyproject.toml):
 
 - [Architecture](docs/architecture.md)
 - [Requirements](docs/requirements.yaml)
-- [Product Backlog](docs/product_backlog.md)
-- [Sprint 2 Backlog](docs/sprints/sprint_2.md)
+- [Product Backlog](docs/product_backlog.md) ([PDF version](docs/product_backlog.pdf))
+- [Sprint 2 Backlog](docs/sprints/sprint_2.md) ([PDF version](docs/sprints/sprint_2.pdf))
+- [Sprint 3 Backlog](docs/sprints/sprint_3.md) ([PDF version](docs/sprints/sprint_3.pdf))
 
 ## Configuration
 
