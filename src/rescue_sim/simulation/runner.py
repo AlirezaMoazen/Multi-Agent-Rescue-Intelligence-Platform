@@ -1,4 +1,4 @@
-"""Simulation runner for ST04 scenarios."""
+"""Simulation runner for ST02 scenarios."""
 
 
 class SimulationRunner:
