@@ -1,4 +1,4 @@
-"""Typed settings for ST04 scenarios."""
+"""Typed settings for ST02 scenarios."""
 
 from dataclasses import dataclass
 
@@ -8,7 +8,8 @@ class GridSettings:
     width: int
     height: int
     obstacle_probability: float
-    target_count: int
+    target_a_count: int
+    target_b_count: int
     random_seed: int | None = None
 
 
