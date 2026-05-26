@@ -1,12 +1,41 @@
-"""Helper for coordinating environment components without learning logic."""
+"""Helper for coordinating environment components with systematic grid coverage."""
+
+from collections import deque
 
 from rescue_sim.environment.grid import Grid, Position
 from rescue_sim.environment.movement import MovementModel
 from rescue_sim.environment.sensors import CentralSensor
 
 
+def find_path_bfs(grid: Grid, start: Position, target: Position) -> list[str]:
+    """Finds the shortest list of movement directions from start to target using BFS."""
+    if start == target:
+        return []
+
+    # Using deque for efficient O(1) pops and appends in BFS
+    queue: deque[tuple[Position, list[str]]] = deque([(start, [])])
+    visited = {start}
+    movement = MovementModel()
+
+    while queue:
+        current_pos, path_actions = queue.popleft()
+
+        if current_pos == target:
+            return path_actions
+
+        allowed = movement.allowed_moves(grid, current_pos)
+        for move, next_pos in allowed.items():
+            if move == "wait":
+                continue
+            if next_pos not in visited:
+                visited.add(next_pos)
+                queue.append((next_pos, path_actions + [move]))
+
+    return []  # No path found (e.g. if the target cell is fully enclosed by obstacles)
+
+
 class EnvironmentHelper:
-    """Coordinates grid, sensor, and movement logic with a deterministic strategy."""
+    """Coordinates grid, sensor, and movement logic with a systematic snake-sweep strategy."""
 
     def __init__(self, grid: Grid, start_pos: Position, sensor_range: int):
         self.grid = grid
@@ -20,29 +49,56 @@ class EnvironmentHelper:
         self.rescued = []
         self.total_reward = 0.0
 
-        # Deterministic cycle of directions: "just goes till its wall then it goes right down left"
-        self.direction_sequence = ["forward", "right", "down", "left"]
-        self.current_dir_index = 0
+        # Build Boustrophedon (snake-like) sweep list of coordinates to cover the entire grid
+        self.visit_order: list[Position] = []
+        for y in range(grid.height):
+            # Sweep left-to-right on even rows, right-to-left on odd rows
+            if y % 2 == 0:
+                x_range = range(grid.width)
+            else:
+                x_range = range(grid.width - 1, -1, -1)
+
+            for x in x_range:
+                pos = Position(x, y)
+                if pos not in grid.obstacles:
+                    self.visit_order.append(pos)
+
+        # Track visited cells to avoid backtracking to cells we've already searched
+        self.visited_cells = set()
+        self.current_path_actions: list[str] = []
 
     def step(self, step_idx: int) -> dict:
-        """Executes one simulation step using environment modules and a deterministic strategy."""
+        """Executes one simulation step using environment modules and a systematic snake-sweep strategy."""
         # 1. Observe the environment using CentralSensor
         self.sensor.observe("0", self.agent_position, self.sensor_range)
 
-        # 2. Select next movement direction deterministically
-        action = self.direction_sequence[self.current_dir_index]
+        # Mark current position as visited
+        self.visited_cells.add(self.agent_position)
 
-        # Check if the current direction is blocked or out of bounds.
-        # If so, cycle through directions until we find one that is allowed.
-        attempts = 0
-        while not self.movement.is_allowed(self.grid, self.agent_position, action) and attempts < 4:
-            self.current_dir_index = (self.current_dir_index + 1) % 4
-            action = self.direction_sequence[self.current_dir_index]
-            attempts += 1
+        # 2. Get next movement action
+        action = None
 
-        # If all 4 directions are blocked, wait
-        if attempts == 4 and not self.movement.is_allowed(self.grid, self.agent_position, action):
-            action = "wait"
+        # Execute any pre-planned moves along our path
+        while self.current_path_actions:
+            next_action = self.current_path_actions.pop(0)
+            if self.movement.is_allowed(self.grid, self.agent_position, next_action):
+                action = next_action
+                break
+
+        # If we don't have a plan, find the next unvisited cell in our sweep sequence
+        if action is None:
+            for target_cell in self.visit_order:
+                if target_cell not in self.visited_cells:
+                    # Find a BFS path to it around obstacles
+                    path = find_path_bfs(self.grid, self.agent_position, target_cell)
+                    if path:
+                        self.current_path_actions = path
+                        break
+
+            if self.current_path_actions:
+                action = self.current_path_actions.pop(0)
+            else:
+                action = "wait"
 
         # 3. Apply the movement using MovementModel
         result = self.movement.apply(self.grid, self.agent_position, action)
