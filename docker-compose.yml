@@ -2,9 +2,6 @@ services:
   # Base service definition
   base: &base
     build: .
-    volumes:
-      # Mount shared folder so backend always reads the latest shared.py
-      - ./shared:/app/shared
     environment:
       - PYTHONDONTWRITEBYTECODE=1
       - PYTHONUNBUFFERED=1
@@ -19,7 +16,6 @@ services:
     volumes:
       # Mount source so --reload picks up changes
       - ./src:/app/src
-      - ./shared:/app/shared
       - ./configs:/app/configs
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
