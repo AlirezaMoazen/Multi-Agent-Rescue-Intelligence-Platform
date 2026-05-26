@@ -20,6 +20,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -73,6 +74,12 @@ current_config = SimConfig()
 
 
 # ── REST endpoints ──────────────────────────────────────────────────────────
+@app.get("/")
+async def root_redirect():
+    """Redirect root to /app."""
+    return RedirectResponse(url="/app")
+
+
 @app.get("/api/config")
 async def get_config():
     return current_config
