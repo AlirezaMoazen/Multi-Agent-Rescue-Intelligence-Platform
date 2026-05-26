@@ -4,7 +4,6 @@ import asyncio
 import json
 import random
 import sys
-import os
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
