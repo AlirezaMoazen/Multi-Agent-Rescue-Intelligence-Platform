@@ -11,17 +11,17 @@ class Position:
 
 @dataclass(frozen=True)
 class Grid:
-    width: int
-    height: int
-    obstacles: frozenset[Position]
+    x_size: int
+    y_size: int
+    walls: frozenset[Position]
     target_a_positions: frozenset[Position]
     target_b_positions: frozenset[Position]
 
     def contains(self, position: Position) -> bool:
-        return 0 <= position.x < self.width and 0 <= position.y < self.height
+        return 0 <= position.x < self.x_size and 0 <= position.y < self.y_size
 
     def is_blocked(self, position: Position) -> bool:
-        return position in self.obstacles
+        return position in self.walls
 
     def is_valid_position(self, position: Position) -> bool:
         return self.contains(position) and not self.is_blocked(position)

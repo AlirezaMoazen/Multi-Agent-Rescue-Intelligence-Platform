@@ -22,6 +22,14 @@ class Grid:
     def set_special(self, x: int, y: int):
         if self.is_within_bounds(x, y):
             self.data[y, x] = 2
+
+    def set_target_a(self, x: int, y: int):
+        if self.is_within_bounds(x, y):
+            self.data[y, x] = 2
+
+    def set_target_b(self, x: int, y: int):
+        if self.is_within_bounds(x, y):
+            self.data[y, x] = 3
             
     def get_cell(self, x: int, y: int) -> int:
         if self.is_within_bounds(x, y):
