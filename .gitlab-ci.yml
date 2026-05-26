@@ -37,7 +37,7 @@ test:
   script:
     - pytest
 
-# --- Simple MR Approval Workaround ---
+# --- Simple MR Approval Workaround --- (DOES NOT WORK!!!)
 # This job runs only on Merge Requests and requires a manual "Play" click to finish.
 # Since the pipeline won't succeed until this is clicked, the MR cannot be merged.
 peer-approval:
