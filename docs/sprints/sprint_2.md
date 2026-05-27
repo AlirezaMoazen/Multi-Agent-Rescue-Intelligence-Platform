@@ -1,5 +1,7 @@
 # Sprint 2 Backlog
 
+PDF version: [Sprint 2 Backlog](sprint_2.pdf)
+
 Sprint: Sprint 2  
 Dates: May 6 - May 27  
 Team capacity: 4 people x 18h = 72h
