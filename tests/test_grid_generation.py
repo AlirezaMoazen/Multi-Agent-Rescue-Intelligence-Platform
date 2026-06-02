@@ -18,7 +18,7 @@ def test_generated_grid_keeps_start_free() -> None:
         start=start,
     )
 
-    assert start not in grid.walls
+    assert start not in grid.obstacles
     assert start not in grid.target_a_positions
     assert start not in grid.target_b_positions
     assert len(grid.target_a_positions) == 2
@@ -60,15 +60,15 @@ def test_targets_do_not_overlap_obstacles() -> None:
 
     all_targets = grid.target_a_positions | grid.target_b_positions
 
-    assert all_targets.isdisjoint(grid.walls)
+    assert all_targets.isdisjoint(grid.obstacles)
 
 
 # Checks that positions outside the grid bounds are not valid.
 def test_grid_rejects_out_of_bounds_position() -> None:
     grid = Grid(
-        x_size=3,
-        y_size=3,
-        walls=frozenset(),
+        width=3,
+        height=3,
+        obstacles=frozenset(),
         target_a_positions=frozenset(),
         target_b_positions=frozenset(),
     )
@@ -83,9 +83,9 @@ def test_grid_rejects_out_of_bounds_position() -> None:
 def test_grid_rejects_obstacle_position() -> None:
     obstacle = Position(1, 1)
     grid = Grid(
-        x_size=3,
-        y_size=3,
-        walls=frozenset({obstacle}),
+        width=3,
+        height=3,
+        obstacles=frozenset({obstacle}),
         target_a_positions=frozenset(),
         target_b_positions=frozenset(),
     )
@@ -96,9 +96,9 @@ def test_grid_rejects_obstacle_position() -> None:
 # Checks that an empty in-bounds cell is a valid position.
 def test_grid_accepts_free_position() -> None:
     grid = Grid(
-        x_size=3,
-        y_size=3,
-        walls=frozenset({Position(1, 1)}),
+        width=3,
+        height=3,
+        obstacles=frozenset({Position(1, 1)}),
         target_a_positions=frozenset(),
         target_b_positions=frozenset(),
     )
@@ -152,9 +152,9 @@ def test_grid_detects_target_positions() -> None:
     target_b = Position(2, 0)
     empty = Position(0, 0)
     grid = Grid(
-        x_size=3,
-        y_size=3,
-        walls=frozenset(),
+        width=3,
+        height=3,
+        obstacles=frozenset(),
         target_a_positions=frozenset({target_a}),
         target_b_positions=frozenset({target_b}),
     )
@@ -170,9 +170,9 @@ def test_grid_returns_target_type_at_position() -> None:
     target_b = Position(2, 0)
     empty = Position(0, 0)
     grid = Grid(
-        x_size=3,
-        y_size=3,
-        walls=frozenset(),
+        width=3,
+        height=3,
+        obstacles=frozenset(),
         target_a_positions=frozenset({target_a}),
         target_b_positions=frozenset({target_b}),
     )

@@ -8,9 +8,9 @@ from rescue_sim.environment.sensors import CentralSensor
 def make_grid() -> Grid:
     # Small fixed grid used in all central sensor tests.
     return Grid(
-        x_size=5,
-        y_size=5,
-        walls=frozenset({Position(1, 2), Position(3, 3)}),
+        width=5,
+        height=5,
+        obstacles=frozenset({Position(1, 2), Position(3, 3)}),
         target_a_positions=frozenset({Position(2, 1)}),
         target_b_positions=frozenset({Position(4, 4)}),
     )

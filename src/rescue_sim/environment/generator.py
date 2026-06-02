@@ -15,7 +15,7 @@ def generate_grid(settings: GridSettings, start: Position) -> Grid:
     if not (0 <= start.x < settings.width and 0 <= start.y < settings.height):
         raise ValueError("start position must be inside the grid")
 
-    walls: set[Position] = set()
+    obstacles: set[Position] = set()
     candidates: list[Position] = []     
 
     for y in range(settings.height):
@@ -24,7 +24,7 @@ def generate_grid(settings: GridSettings, start: Position) -> Grid:
             if position == start:
                 continue
             if rng.random() < settings.obstacle_probability:
-                walls.add(position)
+                obstacles.add(position)
             else:
                 candidates.append(position)
 
@@ -41,9 +41,9 @@ def generate_grid(settings: GridSettings, start: Position) -> Grid:
     target_b_positions = set(rng.sample(remaining_candidates, settings.target_b_count))
 
     return Grid(
-        x_size=settings.width,
-        y_size=settings.height,
-        walls=frozenset(walls),
+        width=settings.width,
+        height=settings.height,
+        obstacles=frozenset(obstacles),
         target_a_positions=frozenset(target_a_positions),
         target_b_positions=frozenset(target_b_positions),
     )

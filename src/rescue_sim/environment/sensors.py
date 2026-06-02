@@ -20,11 +20,11 @@ class Observation:
     newly_discovered_cells: frozenset[Position]
     # Visible cells which are ocupied by obstacles
     obstacles: frozenset[Position]
-    # Visible cells from the agent that contain a target
+    # Visible cells that contain a target.
     targets: frozenset[Position]
-    # Type of every visible target, for example A or B
+    # Type of every visible target, for example A or B.
     target_types: dict[Position, str]
-    # Targets that were discovered for the first time in this observation
+    # Targets that were discovered for the first time in this observation.
     newly_discovered_targets: frozenset[Position]
 
 
@@ -69,22 +69,22 @@ class CentralSensor:
 
     def observe(self, agent_id: str | int, position: Position, sensor_range: int) -> Observation:
         """Receive an agent position and return the visible local observation."""
-        # The sensor range cannot be negative because it represents a distance
+        # The sensor range cannot be negative because it represents a distance.
         if sensor_range < 0:
             raise ValueError("sensor_range must be non-negative")
-        # The agent must be inside the grid before asking for an observation
+        # The agent must be inside the grid before asking for an observation.
         if not self.grid.contains(position):
             raise ValueError("agent position must be inside the grid")
 
-        # We store all agent ids as strings so ids have a consistent format
+        # We store all agent ids as strings so ids have a consistent format.
         normalized_agent_id = str(agent_id)
-        # First we calculate which cells are visible from the agent position
+        # First we calculate which cells are visible from the agent position.
         visible_cells = self._visible_cells_from(position, sensor_range)
-        # We keep the old memory to know what is new in this observation
+        # We keep the old memory to know what is new in this observation.
         previously_discovered_cells = set(self._discovered_cells)
         previously_discovered_targets = set(self._discovered_targets)
 
-        # From the visible cells, we separate obstacles and targets
+        # From the visible cells, we separate obstacles and targets.
         obstacles = frozenset(cell for cell in visible_cells if self.grid.is_blocked(cell))
         target_types = {
             cell: target_type
@@ -93,12 +93,12 @@ class CentralSensor:
         }
         targets = frozenset(target_types)
 
-        # Now the central memory is updated with the new information
+        # Now the central memory is updated with the new information.
         self._discovered_cells.update(visible_cells)
         self._discovered_targets.update(target_types)
         self._agent_positions[normalized_agent_id] = position
 
-        # This is the message that the central sensor sends back to the agent
+        # This is the message that the central sensor sends back to the agent.
         observation = Observation(
             agent_id=normalized_agent_id,
             agent_position=position,
