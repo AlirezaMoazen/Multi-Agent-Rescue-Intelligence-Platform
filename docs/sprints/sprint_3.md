@@ -26,10 +26,10 @@ scenarios.
 
 | Person | Tasks | Hours |
 |---|---|---:|
-| Mostafa | Implement autonomous exploration baseline: autonomous move selection, visited-cell tracking, valid movement use, deterministic baseline behavior, and tests. | 18h |
+| Cristina | Implement autonomous exploration baseline: autonomous move selection, visited-cell tracking, valid movement use, deterministic baseline behavior, and tests. | 18h |
 | Alireza | Define state-space data structure and reward logic: state representation, action format, reward rules, episode termination rules, and tests/documentation for the learning contract. | 15h |
-| cristina | Implement single-agent learning logic, part 1: Q-table structure, action selection, Q-value update, repeated training episodes, and basic training metrics. | 15h |
-| adriana | Implement single-agent learning logic, part 2: evaluation runner, scenario comparison, baseline comparison, success-rate/steps/reward metrics, and report-ready output. | 15h |
+| Mustafa | Implement single-agent learning logic, part 1: Q-table structure, action selection, Q-value update, repeated training episodes, and basic training metrics. | 15h |
+| Adriana | Implement single-agent learning logic, part 2: evaluation runner, scenario comparison, baseline comparison, success-rate/steps/reward metrics, and report-ready output. | 15h |
 | Everyone | Code review, CI/test fixes, merge fixes, integration support, and sprint meetings. | 9h |
 
 
