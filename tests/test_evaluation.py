@@ -3,11 +3,14 @@ from rescue_sim.environment.grid import Position
 from rescue_sim.simulation.evaluation import (
     EvaluationScenario,
     RunTrace,
+    TrainableSingleAgent,
     calculate_run_metrics,
     evaluate_agents,
+    run_learning_episode,
     report_to_csv,
     report_to_json,
 )
+from rescue_sim.environment.generator import generate_grid
 
 
 def test_calculate_run_metrics_reports_success_and_exploration() -> None:
@@ -82,3 +85,52 @@ def test_evaluation_includes_single_agent_count_everywhere() -> None:
     assert {scenario["num_agents"] for scenario in report.scenarios} == {1}
     assert {run["num_agents"] for run in report.runs} == {1}
     assert {aggregate["num_agents"] for aggregate in report.aggregates} == {1}
+
+
+def test_evaluation_reports_learning_feedback_for_trained_agent() -> None:
+    report = evaluate_agents(
+        [
+            EvaluationScenario(
+                name="learning-feedback",
+                grid_settings=GridSettings(
+                    width=4,
+                    height=4,
+                    obstacle_probability=0.0,
+                    target_a_count=1,
+                    target_b_count=0,
+                    random_seed=5,
+                ),
+                max_steps=20,
+            )
+        ],
+        training_episodes=5,
+    )
+
+    feedback = report.learning_feedback[0]
+
+    assert feedback["scenario_name"] == "learning-feedback"
+    assert feedback["training_episodes"] == 5
+    assert feedback["learned_state_actions"] > 0
+    assert "trained" in report.sprint_demo_summary
+
+
+def test_learning_episode_updates_agent_q_values() -> None:
+    scenario = EvaluationScenario(
+        name="q-values",
+        grid_settings=GridSettings(
+            width=4,
+            height=4,
+            obstacle_probability=0.0,
+            target_a_count=1,
+            target_b_count=0,
+            random_seed=9,
+        ),
+        max_steps=20,
+    )
+    grid = generate_grid(scenario.grid_settings, start=scenario.start)
+    learner = TrainableSingleAgent(seed=9)
+
+    trace = run_learning_episode(scenario=scenario, grid=grid, learner=learner)
+
+    assert trace.episode_steps
+    assert learner.q_values
