@@ -1,35 +1,46 @@
-version: '3.8'
-
 services:
   # Base service definition
   base: &base
     build: .
-    volumes:
-      # Mount the current directory into the container to reflect local changes
-      - .:/app
     environment:
       - PYTHONDONTWRITEBYTECODE=1
       - PYTHONUNBUFFERED=1
-      - PYTHONPATH=/app/src
+      - PYTHONPATH=/app/src:/app
 
-  # Service for interactive development
+  # ── Visualization dashboard (backend + frontend) ────────────────────
+  viz:
+    <<: *base
+    ports:
+      - "8000:8000"
+    command: uvicorn src.rescue_sim.visualization.api:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      # Mount source so --reload picks up changes
+      - ./src:/app/src
+      - ./configs:/app/configs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+
+  # ── Interactive development shell ───────────────────────────────────
   dev:
     <<: *base
     command: /bin/bash
-    stdin_open: true # Equivalent to docker run -i
-    tty: true        # Equivalent to docker run -t
+    stdin_open: true
+    tty: true
 
-  # Service to run tests
+  # ── Run tests ──────────────────────────────────────────────────────
   test:
     <<: *base
     command: pytest
 
-  # Service to run linting
+  # ── Run linting ────────────────────────────────────────────────────
   lint:
     <<: *base
     command: ruff check src tests scripts
 
-  # Service to run the simulation
+  # ── Run the simulation script ──────────────────────────────────────
   run:
     <<: *base
     command: python scripts/run_scenario.py
