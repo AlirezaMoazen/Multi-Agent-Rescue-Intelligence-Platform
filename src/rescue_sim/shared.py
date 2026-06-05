@@ -90,6 +90,36 @@ class Grid:
         return None
 
 
+@dataclass(frozen=True, slots=True)
+class GridState:
+    """State of the grid including its dimensions, obstacles, and active target positions."""
+
+    width: int
+    height: int
+    obstacles: frozenset[Position]
+    target_a_positions: frozenset[Position]
+    target_b_positions: frozenset[Position]
+
+    def contains(self, position: Position) -> bool:
+        return 0 <= position.x < self.width and 0 <= position.y < self.height
+
+    def is_blocked(self, position: Position) -> bool:
+        return position in self.obstacles
+
+    def is_valid_position(self, position: Position) -> bool:
+        return self.contains(position) and not self.is_blocked(position)
+
+    def has_target(self, position: Position) -> bool:
+        return position in self.target_a_positions or position in self.target_b_positions
+
+    def target_type_at(self, position: Position) -> str | None:
+        if position in self.target_a_positions:
+            return "A"
+        if position in self.target_b_positions:
+            return "B"
+        return None
+
+
 MOVE_DELTAS: dict[str, tuple[int, int]] = {
     "up": (0, -1),
     "forward": (0, -1),
@@ -305,6 +335,15 @@ class LearningState:
     def remaining_targets(self) -> int:
         return len(self.remaining_target_a_positions) + len(self.remaining_target_b_positions)
 
+    def is_terminal(self, max_steps: int) -> bool:
+        """Check if the state is terminal (episode complete).
+
+        An episode ends when either:
+        1. all targets are rescued (remaining_targets == 0)
+        2. max_steps is reached (steps_taken >= max_steps)
+        """
+        return self.remaining_targets == 0 or self.steps_taken >= max_steps
+
 
 @dataclass(frozen=True, slots=True)
 class RewardConfig:
@@ -317,6 +356,7 @@ class RewardConfig:
     rescued_target_a: float = 10.0
     rescued_target_b: float = 10.0
     completed_episode_bonus: float = 0.0
+    repeated_cell: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,6 +368,20 @@ class RewardEvent:
     newly_discovered_cells: int = 0
     rescued_target_type: TargetType | None = None
     completed_episode: bool = False
+    repeated_cell: bool = False
+
+
+# Standard Sprint 3 reward configuration for Q-learning.
+SPRINT3_REWARD_CONFIG = RewardConfig(
+    move=-1.0,
+    invalid_move=-5.0,
+    wait=-2.0,
+    discovered_cell_bonus=2.0,
+    repeated_cell=-1.5,
+    rescued_target_a=150.0,
+    rescued_target_b=100.0,
+    completed_episode_bonus=50.0,
+)
 
 
 def calculate_reward(
@@ -348,8 +402,13 @@ def calculate_reward(
         reward = config.rescued_target_b
 
     reward += event.newly_discovered_cells * config.discovered_cell_bonus
+    
+    if event.repeated_cell:
+        reward += config.repeated_cell
+        
     if event.completed_episode:
         reward += config.completed_episode_bonus
+        
     return reward
 
 
