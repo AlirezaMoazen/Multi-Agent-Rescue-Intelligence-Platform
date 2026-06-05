@@ -90,34 +90,8 @@ class Grid:
         return None
 
 
-@dataclass(frozen=True, slots=True)
-class GridState:
-    """State of the grid including its dimensions, obstacles, and active target positions."""
-
-    width: int
-    height: int
-    obstacles: frozenset[Position]
-    target_a_positions: frozenset[Position]
-    target_b_positions: frozenset[Position]
-
-    def contains(self, position: Position) -> bool:
-        return 0 <= position.x < self.width and 0 <= position.y < self.height
-
-    def is_blocked(self, position: Position) -> bool:
-        return position in self.obstacles
-
-    def is_valid_position(self, position: Position) -> bool:
-        return self.contains(position) and not self.is_blocked(position)
-
-    def has_target(self, position: Position) -> bool:
-        return position in self.target_a_positions or position in self.target_b_positions
-
-    def target_type_at(self, position: Position) -> str | None:
-        if position in self.target_a_positions:
-            return "A"
-        if position in self.target_b_positions:
-            return "B"
-        return None
+# Reuse Grid as GridState to avoid duplicating the data contract and behavior
+GridState = Grid
 
 
 MOVE_DELTAS: dict[str, tuple[int, int]] = {
