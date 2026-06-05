@@ -8,9 +8,10 @@ and evaluation work should follow.
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Protocol, TypedDict, runtime_checkable
+from typing import Callable, Dict, List, Protocol, Tuple, TypedDict, runtime_checkable
 
 
 # Existing Sprint 2 contracts
@@ -88,6 +89,10 @@ class Grid:
         if position in self.target_b_positions:
             return "B"
         return None
+
+
+# Reuse Grid as GridState to avoid duplicating the data contract and behavior
+GridState = Grid
 
 
 MOVE_DELTAS: dict[str, tuple[int, int]] = {
@@ -305,6 +310,15 @@ class LearningState:
     def remaining_targets(self) -> int:
         return len(self.remaining_target_a_positions) + len(self.remaining_target_b_positions)
 
+    def is_terminal(self, max_steps: int) -> bool:
+        """Check if the state is terminal (episode complete).
+
+        An episode ends when either:
+        1. all targets are rescued (remaining_targets == 0)
+        2. max_steps is reached (steps_taken >= max_steps)
+        """
+        return self.remaining_targets == 0 or self.steps_taken >= max_steps
+
 
 @dataclass(frozen=True, slots=True)
 class RewardConfig:
@@ -317,6 +331,7 @@ class RewardConfig:
     rescued_target_a: float = 10.0
     rescued_target_b: float = 10.0
     completed_episode_bonus: float = 0.0
+    repeated_cell: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,6 +343,20 @@ class RewardEvent:
     newly_discovered_cells: int = 0
     rescued_target_type: TargetType | None = None
     completed_episode: bool = False
+    repeated_cell: bool = False
+
+
+# Standard Sprint 3 reward configuration for Q-learning.
+SPRINT3_REWARD_CONFIG = RewardConfig(
+    move=-1.0,
+    invalid_move=-5.0,
+    wait=-2.0,
+    discovered_cell_bonus=2.0,
+    repeated_cell=-1.5,
+    rescued_target_a=150.0,
+    rescued_target_b=100.0,
+    completed_episode_bonus=50.0,
+)
 
 
 def calculate_reward(
@@ -348,8 +377,13 @@ def calculate_reward(
         reward = config.rescued_target_b
 
     reward += event.newly_discovered_cells * config.discovered_cell_bonus
+    
+    if event.repeated_cell:
+        reward += config.repeated_cell
+        
     if event.completed_episode:
         reward += config.completed_episode_bonus
+        
     return reward
 
 
@@ -394,3 +428,118 @@ class StrategyInterface(Protocol):
 
     def update(self, transition: Transition) -> None:
         ...
+
+
+# ---------------------------------------------------------------------------
+# Legacy structures preserved from the old shared folder for backward compatibility
+# ---------------------------------------------------------------------------
+
+class Sensor:
+    """Local sensor that reports neighboring cells as numeric states."""
+
+    def __init__(self, agent: "Agent"):
+        self.agent = agent
+
+    def get_location(self) -> Tuple[int, int]:
+        return self.agent.x, self.agent.y
+
+    def sense_environment(self, grid: object) -> Dict[str, int]:
+        x, y = self.get_location()
+        return {
+            "forward": cell_value_at(grid, x, y - 1),
+            "down": cell_value_at(grid, x, y + 1),
+            "left": cell_value_at(grid, x - 1, y),
+            "right": cell_value_at(grid, x + 1, y),
+        }
+
+
+class Agent:
+    """Mutable agent helper used by simple simulations and visualization."""
+
+    def __init__(self, start_x: int, start_y: int, grid: object):
+        self.x = start_x
+        self.y = start_y
+        self.grid = grid
+        self.sensor = Sensor(self)
+        self.history = [(start_x, start_y)]
+
+    def forward(self) -> bool:
+        return self._try_move(0, -1)
+
+    def down(self) -> bool:
+        return self._try_move(0, 1)
+
+    def left(self) -> bool:
+        return self._try_move(-1, 0)
+
+    def right(self) -> bool:
+        return self._try_move(1, 0)
+
+    def _try_move(self, dx: int, dy: int) -> bool:
+        next_x = self.x + dx
+        next_y = self.y + dy
+        if cell_value_at(self.grid, next_x, next_y) == 1:
+            return False
+
+        self.x = next_x
+        self.y = next_y
+        self.history.append((self.x, self.y))
+        return True
+
+
+def cell_value_at(grid: object, x: int, y: int) -> int:
+    """Return 0 empty, 1 wall/out of bounds, 2 target A, or 3 target B."""
+    if hasattr(grid, "get_cell"):
+        return grid.get_cell(x, y)
+
+    position = Position(x, y)
+    if not grid.contains(position) or grid.is_blocked(position):
+        return 1
+    if position in grid.target_a_positions:
+        return 2
+    if position in grid.target_b_positions:
+        return 3
+    return 0
+
+
+class RLAgent:
+    """Q-learning helper used by the visualization."""
+
+    def __init__(
+        self,
+        actions: List[str],
+        learning_rate: float = 0.1,
+        discount_factor: float = 0.9,
+        exploration_rate: float = 1.0,
+    ):
+        self.q_table = {}
+        self.actions = actions
+        self.lr = learning_rate
+        self.gamma = discount_factor
+        self.epsilon = exploration_rate
+
+    def get_state_key(self, state_dict: Dict[str, int]) -> str:
+        return str(sorted(state_dict.items()))
+
+    def choose_action(self, state_dict: Dict[str, int]) -> str:
+        state = self.get_state_key(state_dict)
+        if state not in self.q_table:
+            self.q_table[state] = {action: 0.0 for action in self.actions}
+
+        if random.uniform(0, 1) < self.epsilon:
+            return random.choice(self.actions)
+        return max(self.q_table[state], key=self.q_table[state].get)
+
+    def learn(self, state_dict: Dict[str, int], action: str, reward: float, next_state_dict: Dict[str, int]):
+        state = self.get_state_key(state_dict)
+        next_state = self.get_state_key(next_state_dict)
+
+        if state not in self.q_table:
+            self.q_table[state] = {a: 0.0 for a in self.actions}
+        if next_state not in self.q_table:
+            self.q_table[next_state] = {a: 0.0 for a in self.actions}
+
+        current_q = self.q_table[state][action]
+        max_next_q = max(self.q_table[next_state].values())
+        new_q = current_q + self.lr * (reward + self.gamma * max_next_q - current_q)
+        self.q_table[state][action] = new_q

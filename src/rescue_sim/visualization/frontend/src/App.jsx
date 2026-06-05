@@ -119,7 +119,10 @@ export default function App() {
                 <span className="legend-swatch" style={{ background: '#1e293b' }} /> Wall
               </div>
               <div className="legend-item">
-                <span className="legend-swatch" style={{ background: '#f87171' }} /> Target
+                <span className="legend-swatch" style={{ background: '#f87171' }} /> Target A
+              </div>
+              <div className="legend-item">
+                <span className="legend-swatch" style={{ background: '#fb923c' }} /> Target B
               </div>
               <div className="legend-item">
                 <span className="legend-swatch" style={{ background: 'rgba(52,211,153,0.4)' }} /> Rescued

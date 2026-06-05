@@ -194,10 +194,11 @@ async def simulation_ws(websocket: WebSocket):
 
                 # Build JSON-serializable obstacle & target lists
                 obstacles = [{"x": p.x, "y": p.y} for p in grid.obstacles]
-                all_targets = (
-                    list(grid.target_a_positions) + list(grid.target_b_positions)
-                )
-                targets = [{"x": p.x, "y": p.y} for p in all_targets]
+                targets = []
+                for p in grid.target_a_positions:
+                    targets.append({"x": p.x, "y": p.y, "type": "A"})
+                for p in grid.target_b_positions:
+                    targets.append({"x": p.x, "y": p.y, "type": "B"})
 
                 # Create our EnvironmentHelper to run sensors, movement, and grid logic
                 helper = EnvironmentHelper(grid, start_pos, config.sensor_range)

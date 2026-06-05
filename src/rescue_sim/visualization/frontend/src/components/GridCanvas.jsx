@@ -43,9 +43,9 @@ export default function GridCanvas({ grid, agents, rescued, trails }) {
     const obstacleSet = new Set();
     obstacles.forEach(o => obstacleSet.add(`${o.x},${o.y}`));
 
-    // Build target set
-    const targetSet = new Set();
-    targets.forEach(t => targetSet.add(`${t.x},${t.y}`));
+    // Build target map
+    const targetMap = new Map();
+    (targets || []).forEach(t => targetMap.set(`${t.x},${t.y}`, t));
 
     // Clear
     ctx.fillStyle = '#0f172a';
@@ -61,21 +61,43 @@ export default function GridCanvas({ grid, agents, rescued, trails }) {
         if (obstacleSet.has(key)) {
           ctx.fillStyle = '#1e293b';
           ctx.fillRect(px, py, cellSize, cellSize);
-        } else if (targetSet.has(key) && !rescuedSet.has(key)) {
-          // Active target — glowing red
-          ctx.fillStyle = '#450a0a';
+        } else if (targetMap.has(key) && !rescuedSet.has(key)) {
+          const target = targetMap.get(key);
+          const isA = target.type === 'A';
+          
+          // Active target — glowing red for A, orange for B
+          ctx.fillStyle = isA ? '#450a0a' : '#431407';
           ctx.fillRect(px, py, cellSize, cellSize);
-          ctx.fillStyle = '#f87171';
+          ctx.fillStyle = isA ? '#f87171' : '#fb923c';
           const pad = Math.max(2, cellSize * 0.2);
           ctx.beginPath();
           ctx.arc(px + cellSize / 2, py + cellSize / 2, cellSize / 2 - pad, 0, Math.PI * 2);
           ctx.fill();
+
+          // Write letter inside target
+          if (cellSize >= 16 && target.type) {
+            ctx.fillStyle = '#ffffff';
+            ctx.font = `bold ${Math.max(8, cellSize * 0.4)}px Inter, sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(target.type, px + cellSize / 2, py + cellSize / 2 + 1);
+          }
         } else if (rescuedSet.has(key)) {
           // Rescued target — dim green
           ctx.fillStyle = '#052e16';
           ctx.fillRect(px, py, cellSize, cellSize);
           ctx.fillStyle = 'rgba(52,211,153,0.4)';
           ctx.fillRect(px + 2, py + 2, cellSize - 4, cellSize - 4);
+
+          // Write dim letter inside rescued target
+          const target = targetMap.get(key);
+          if (cellSize >= 16 && target && target.type) {
+            ctx.fillStyle = 'rgba(255,255,255,0.4)';
+            ctx.font = `bold ${Math.max(8, cellSize * 0.4)}px Inter, sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(target.type, px + cellSize / 2, py + cellSize / 2 + 1);
+          }
         } else {
           ctx.fillStyle = '#0f172a';
           ctx.fillRect(px, py, cellSize, cellSize);
