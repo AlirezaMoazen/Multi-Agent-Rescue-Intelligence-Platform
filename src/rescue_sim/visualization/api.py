@@ -308,23 +308,6 @@ async def simulation_ws(websocket: WebSocket):
                         valid_actions = (Action.WAIT,)
 
                     action = learner.choose_action(state, valid_actions)
-                    if run_mode == "evaluate":
-                        fallback_action = _navigation_fallback_action(
-                            grid=grid,
-                            position=position,
-                            goals=frozenset(active_targets),
-                            visited=frozenset(visited_positions),
-                            valid_actions=valid_actions,
-                        )
-                        action_values = learner.q_table.get(state, {})
-                        learned_value = action_values.get(action, 0.0)
-                        if learned_value <= 0.0 or _would_repeat_cell(
-                            grid,
-                            position,
-                            action,
-                            visited_positions,
-                        ):
-                            action = fallback_action or action
                     movement_result = movement.apply(grid, position, action.value)
                     next_position = movement_result.end
                     next_observation = sensor.observe(
@@ -746,66 +729,6 @@ def _explorable_cell_count(grid: object) -> int:
     return grid.width * grid.height - len(grid.obstacles)
 
 
-def _would_repeat_cell(
-    grid: object,
-    position: Position,
-    action: Action,
-    visited_positions: set[Position],
-) -> bool:
-    next_position = _next_position(position, action)
-    return grid.is_valid_position(next_position) and next_position in visited_positions
-
-
-def _navigation_fallback_action(
-    grid: object,
-    position: Position,
-    goals: frozenset[Position],
-    visited: frozenset[Position],
-    valid_actions: tuple[Action, ...],
-) -> Action | None:
-    next_step = _next_step_towards_any(grid, position, goals)
-    if next_step is None:
-        free_unvisited = frozenset(
-            Position(x, y)
-            for y in range(grid.height)
-            for x in range(grid.width)
-            if grid.is_valid_position(Position(x, y)) and Position(x, y) not in visited
-        )
-        next_step = _next_step_towards_any(grid, position, free_unvisited)
-
-    if next_step is None:
-        return None
-
-    action = _action_towards(position, next_step)
-    return action if action in valid_actions else None
-
-
-def _next_step_towards_any(
-    grid: object,
-    start: Position,
-    goals: frozenset[Position],
-) -> Position | None:
-    if not goals:
-        return None
-
-    queue: list[tuple[Position, Position | None]] = [(start, None)]
-    seen = {start}
-
-    while queue:
-        current, first_step = queue.pop(0)
-        if current in goals:
-            return first_step
-
-        for action in (Action.RIGHT, Action.DOWN, Action.LEFT, Action.UP):
-            neighbor = _next_position(current, action)
-            if neighbor in seen or not grid.is_valid_position(neighbor):
-                continue
-            seen.add(neighbor)
-            queue.append((neighbor, neighbor if first_step is None else first_step))
-
-    return None
-
-
 def _next_position(position: Position, action: Action) -> Position:
     if action == Action.RIGHT:
         return Position(position.x + 1, position.y)
@@ -816,13 +739,3 @@ def _next_position(position: Position, action: Action) -> Position:
     if action == Action.UP:
         return Position(position.x, position.y - 1)
     return position
-
-
-def _action_towards(current: Position, next_position: Position) -> Action:
-    if next_position.x > current.x:
-        return Action.RIGHT
-    if next_position.y > current.y:
-        return Action.DOWN
-    if next_position.x < current.x:
-        return Action.LEFT
-    return Action.UP
