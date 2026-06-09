@@ -15,7 +15,7 @@ function formatNumber(value, digits = 1) {
   return Number(value ?? 0).toFixed(digits);
 }
 
-export default function EvaluationPanel() {
+export default function EvaluationPanel({ refreshKey }) {
   const [report, setReport] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -23,7 +23,7 @@ export default function EvaluationPanel() {
   useEffect(() => {
     let cancelled = false;
 
-    fetch(`${getApiBaseUrl()}/api/evaluation`)
+    fetch(`${getApiBaseUrl()}/api/evaluation?refresh=${refreshKey}`)
       .then((response) => {
         if (!response.ok) {
           throw new Error(`Evaluation request failed (${response.status})`);
@@ -50,7 +50,7 @@ export default function EvaluationPanel() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [refreshKey]);
 
   return (
     <div className="card">

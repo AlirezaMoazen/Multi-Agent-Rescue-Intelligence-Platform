@@ -28,6 +28,7 @@ export default function App() {
 
   const isRunning = sim.status === 'running';
   const isComplete = sim.status === 'complete';
+  const evaluationRefreshKey = isComplete ? sim.episodeMetrics.length : 0;
 
   const handleStart = () => {
     sim.start({ ...config });
@@ -149,7 +150,7 @@ export default function App() {
         <div className="side-panel">
           <ParameterPanel config={config} onChange={setConfig} disabled={isRunning} />
           <MetricsChart metrics={sim.episodeMetrics} />
-          <EvaluationPanel />
+          <EvaluationPanel refreshKey={evaluationRefreshKey} />
         </div>
       </main>
     </div>

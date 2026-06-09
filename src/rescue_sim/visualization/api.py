@@ -31,7 +31,7 @@ from rescue_sim.environment.grid import Position
 from rescue_sim.environment.movement import MovementModel
 from rescue_sim.environment.sensors import CentralSensor
 from rescue_sim.learning.q_learning import QLearningAgent
-from rescue_sim.simulation.evaluation import evaluate_agents
+from rescue_sim.simulation.evaluation import EvaluationScenario, evaluate_agents
 from rescue_sim.shared import Action, LearningState, RewardEvent, TargetType, calculate_reward
 
 app = FastAPI(title="Rescue Sim Visualization API")
@@ -107,7 +107,32 @@ async def health():
 async def get_evaluation():
     """Return baseline vs trained-agent metrics for the visualization dashboard."""
 
-    return asdict(evaluate_agents())
+    scenarios = _evaluation_scenarios_from_config(current_config)
+    return asdict(evaluate_agents(scenarios=scenarios))
+
+
+def _evaluation_scenarios_from_config(config: SimConfig) -> list[EvaluationScenario]:
+    """Build fresh same-config scenarios so dashboard metrics reflect current runs."""
+
+    target_a = math.ceil(config.target_count / 2)
+    target_b = config.target_count - target_a
+    seeds = [random.randint(0, 999999) for _ in range(4)]
+
+    return [
+        EvaluationScenario(
+            name=f"current_config_seed_{seed}",
+            grid_settings=GridSettings(
+                width=config.grid_width,
+                height=config.grid_height,
+                obstacle_probability=config.obstacle_probability,
+                target_a_count=target_a,
+                target_b_count=target_b,
+                random_seed=seed,
+            ),
+            max_steps=config.max_steps,
+        )
+        for seed in seeds
+    ]
 
 
 # ── WebSocket simulation stream ────────────────────────────────────────────
