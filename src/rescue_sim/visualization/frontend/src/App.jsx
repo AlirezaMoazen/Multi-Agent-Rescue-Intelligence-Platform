@@ -5,13 +5,14 @@ import GridCanvas from './components/GridCanvas';
 import ControlPanel from './components/ControlPanel';
 import ParameterPanel from './components/ParameterPanel';
 import MetricsChart from './components/MetricsChart';
+import EvaluationPanel from './components/EvaluationPanel';
 
 const DEFAULT_CONFIG = {
   grid_width: 20,
   grid_height: 20,
   obstacle_probability: 0.15,
   target_count: 4,
-  num_agents: 2,
+  num_agents: 1,
   sensor_range: 3,
   max_steps: 500,
   num_episodes: 50,
@@ -148,6 +149,7 @@ export default function App() {
         <div className="side-panel">
           <ParameterPanel config={config} onChange={setConfig} disabled={isRunning} />
           <MetricsChart metrics={sim.episodeMetrics} />
+          <EvaluationPanel />
         </div>
       </main>
     </div>

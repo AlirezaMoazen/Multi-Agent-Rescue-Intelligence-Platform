@@ -13,6 +13,7 @@ environment layer and streams the state to the frontend over WebSocket.
 """
 
 import asyncio
+from dataclasses import asdict, replace
 import json
 import math
 import random
@@ -30,7 +31,8 @@ from rescue_sim.environment.grid import Position
 from rescue_sim.environment.movement import MovementModel
 from rescue_sim.environment.sensors import CentralSensor
 from rescue_sim.learning.q_learning import QLearningAgent
-from rescue_sim.shared import Action, RewardEvent, TargetType, calculate_reward
+from rescue_sim.simulation.evaluation import evaluate_agents
+from rescue_sim.shared import Action, LearningState, RewardEvent, TargetType, calculate_reward
 
 app = FastAPI(title="Rescue Sim Visualization API")
 
@@ -99,6 +101,13 @@ async def set_config(config: SimConfig):
 async def health():
     """Health check endpoint for Docker."""
     return {"status": "ok"}
+
+
+@app.get("/api/evaluation")
+async def get_evaluation():
+    """Return baseline vs trained-agent metrics for the visualization dashboard."""
+
+    return asdict(evaluate_agents())
 
 
 # ── WebSocket simulation stream ────────────────────────────────────────────
@@ -260,13 +269,14 @@ async def simulation_ws(websocket: WebSocket):
                     except asyncio.TimeoutError:
                         pass
 
-                    state = learner.state_from_observation(
+                    state = _visual_learning_state(
+                        learner=learner,
                         observation=observation,
                         grid=grid,
                         found_targets=frozenset(found_targets),
-                        steps_taken=step,
                     )
                     valid_actions = learner.valid_actions(movement, grid, position)
+                    valid_actions = _movement_actions_first(valid_actions)
                     if not valid_actions:
                         valid_actions = (Action.WAIT,)
 
@@ -308,13 +318,14 @@ async def simulation_ws(websocket: WebSocket):
                     )
                     total_reward += reward
 
-                    next_state = learner.state_from_observation(
+                    next_state = _visual_learning_state(
+                        learner=learner,
                         observation=next_observation,
                         grid=grid,
                         found_targets=frozenset(found_targets),
-                        steps_taken=step + 1,
                     )
                     next_valid_actions = learner.valid_actions(movement, grid, next_position)
+                    next_valid_actions = _movement_actions_first(next_valid_actions)
                     if not next_valid_actions:
                         next_valid_actions = (Action.WAIT,)
                     learner.update_q_value(
@@ -364,7 +375,7 @@ async def simulation_ws(websocket: WebSocket):
                     "exploration_rate": round(learner.epsilon, 4),
                 }
                 episode_metrics.append(metric)
-                learner.epsilon = max(0.05, learner.epsilon * 0.95)
+                learner.epsilon = max(0.05, learner.epsilon * 0.85)
 
                 success_rate = sum(
                     1 for m in episode_metrics if m["success"]
@@ -405,3 +416,33 @@ async def simulation_ws(websocket: WebSocket):
             await websocket.close()
         except Exception:
             pass
+
+
+def _visual_learning_state(
+    learner: QLearningAgent,
+    observation: object,
+    grid: object,
+    found_targets: frozenset[Position],
+) -> LearningState:
+    """Build a reusable visual-training state for the Q-table.
+
+    The learner's state builder includes ``steps_taken`` for terminal checks in
+    offline training. The live visualization already checks max steps in its
+    loop, so keeping the step count in the Q-table would make the same cell look
+    like a different state at every time step and hide learning across episodes.
+    """
+
+    state = learner.state_from_observation(
+        observation=observation,
+        grid=grid,
+        found_targets=found_targets,
+        steps_taken=0,
+    )
+    return replace(state, steps_taken=0)
+
+
+def _movement_actions_first(actions: tuple[Action, ...]) -> tuple[Action, ...]:
+    """Avoid no-op exploration in the live demo unless the agent is stuck."""
+
+    moving_actions = tuple(action for action in actions if action != Action.WAIT)
+    return moving_actions or actions
