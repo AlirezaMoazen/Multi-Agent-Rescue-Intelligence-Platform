@@ -27,7 +27,10 @@ from pydantic import BaseModel
 from rescue_sim.config.settings import GridSettings
 from rescue_sim.environment.generator import generate_grid
 from rescue_sim.environment.grid import Position
-from rescue_sim.environment.helper import EnvironmentHelper
+from rescue_sim.environment.movement import MovementModel
+from rescue_sim.environment.sensors import CentralSensor
+from rescue_sim.learning.q_learning import QLearningAgent
+from rescue_sim.shared import Action, RewardEvent, TargetType, calculate_reward
 
 app = FastAPI(title="Rescue Sim Visualization API")
 
@@ -155,6 +158,12 @@ async def simulation_ws(websocket: WebSocket):
 
             episode_metrics: list[dict] = []
             should_stop = False
+            learner = QLearningAgent(
+                learning_rate=config.learning_rate,
+                discount_factor=config.discount_factor,
+                epsilon=config.exploration_rate,
+                rng=random.Random(0),
+            )
 
             for episode in range(config.num_episodes):
                 if should_stop:
@@ -200,8 +209,15 @@ async def simulation_ws(websocket: WebSocket):
                 for p in grid.target_b_positions:
                     targets.append({"x": p.x, "y": p.y, "type": "B"})
 
-                # Create our EnvironmentHelper to run sensors, movement, and grid logic
-                helper = EnvironmentHelper(grid, start_pos, config.sensor_range)
+                movement = MovementModel()
+                sensor = CentralSensor(grid)
+                position = start_pos
+                found_targets: set[Position] = set()
+                active_targets = set(grid.target_a_positions) | set(grid.target_b_positions)
+                rescued: list[dict] = []
+                visited_positions = {start_pos}
+                total_reward = 0.0
+                observation = sensor.observe("agent-1", position, config.sensor_range)
 
                 # Send initial state
                 await websocket.send_json(
@@ -223,7 +239,7 @@ async def simulation_ws(websocket: WebSocket):
                 steps = 0
 
                 for step in range(config.max_steps):
-                    if not helper.has_active_targets():
+                    if not active_targets:
                         break
 
                     # Check for cancellation or speed update
@@ -243,8 +259,81 @@ async def simulation_ws(websocket: WebSocket):
                     except asyncio.TimeoutError:
                         pass
 
-                    # Step the environment using the helper
-                    agent_state = helper.step(step)
+                    state = learner.state_from_observation(
+                        observation=observation,
+                        grid=grid,
+                        found_targets=frozenset(found_targets),
+                        steps_taken=step,
+                    )
+                    valid_actions = learner.valid_actions(movement, grid, position)
+                    if not valid_actions:
+                        valid_actions = (Action.WAIT,)
+
+                    action = learner.choose_action(state, valid_actions)
+                    movement_result = movement.apply(grid, position, action.value)
+                    next_position = movement_result.end
+                    next_observation = sensor.observe(
+                        "agent-1",
+                        next_position,
+                        config.sensor_range,
+                    )
+
+                    target_type = grid.target_type_at(next_position)
+                    rescued_target_type = None
+                    if target_type is not None and next_position not in found_targets:
+                        found_targets.add(next_position)
+                        active_targets.discard(next_position)
+                        rescued_target_type = TargetType(target_type)
+                        rescued.append(
+                            {
+                                "x": next_position.x,
+                                "y": next_position.y,
+                                "step": step,
+                                "type": target_type,
+                            }
+                        )
+
+                    done = not active_targets
+                    reward = calculate_reward(
+                        RewardEvent(
+                            moved=movement_result.moved,
+                            move=action.value,
+                            newly_discovered_cells=len(next_observation.newly_discovered_cells),
+                            rescued_target_type=rescued_target_type,
+                            completed_episode=done,
+                            repeated_cell=next_position in visited_positions,
+                        ),
+                        learner.reward_config,
+                    )
+                    total_reward += reward
+
+                    next_state = learner.state_from_observation(
+                        observation=next_observation,
+                        grid=grid,
+                        found_targets=frozenset(found_targets),
+                        steps_taken=step + 1,
+                    )
+                    next_valid_actions = learner.valid_actions(movement, grid, next_position)
+                    if not next_valid_actions:
+                        next_valid_actions = (Action.WAIT,)
+                    learner.update_q_value(
+                        state=state,
+                        action=action,
+                        reward=reward,
+                        next_state=next_state,
+                        next_valid_actions=next_valid_actions,
+                    )
+
+                    position = next_position
+                    observation = next_observation
+                    visited_positions.add(position)
+                    agent_state = {
+                        "id": 0,
+                        "x": position.x,
+                        "y": position.y,
+                        "action": action.value,
+                        "reward": round(reward, 2),
+                    }
                     steps = step + 1
 
                     await websocket.send_json(
@@ -253,8 +342,8 @@ async def simulation_ws(websocket: WebSocket):
                             "episode": episode,
                             "step": steps,
                             "agents": [agent_state],
-                            "rescued": helper.get_rescued_list(),
-                            "active_targets": helper.get_active_targets_count(),
+                            "rescued": rescued,
+                            "active_targets": len(active_targets),
                         }
                     )
 
@@ -263,17 +352,18 @@ async def simulation_ws(websocket: WebSocket):
                 if should_stop:
                     break
 
-                success = not helper.has_active_targets()
+                success = not active_targets
                 metric = {
                     "episode": episode,
                     "steps": steps,
-                    "rescued_count": len(helper.get_rescued_list()),
+                    "rescued_count": len(rescued),
                     "target_count": config.target_count,
                     "success": success,
-                    "total_reward": helper.get_total_reward(),
-                    "exploration_rate": round(config.exploration_rate, 4),
+                    "total_reward": round(total_reward, 2),
+                    "exploration_rate": round(learner.epsilon, 4),
                 }
                 episode_metrics.append(metric)
+                learner.epsilon = max(0.05, learner.epsilon * 0.95)
 
                 success_rate = sum(
                     1 for m in episode_metrics if m["success"]
