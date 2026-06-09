@@ -13,6 +13,9 @@ from typing import Callable, Iterable, Literal
 from rescue_sim.config.settings import GridSettings
 from rescue_sim.environment.generator import generate_grid
 from rescue_sim.environment.grid import Grid, Position
+from rescue_sim.environment.movement import MovementModel
+from rescue_sim.environment.sensors import CentralSensor
+from rescue_sim.learning.q_learning import QLearningAgent
 from rescue_sim.shared import Action, RewardConfig, RewardEvent, TargetType, calculate_reward
 
 AgentName = Literal["baseline", "trained"]
@@ -248,12 +251,19 @@ def evaluate_agents(
     )
     runs: list[RunMetrics] = []
     learning_feedback: list[LearningFeedback] = []
-    learner = TrainableSingleAgent(seed=10_000)
+    learner = QLearningAgent(
+        actions=ACTIONS,
+        learning_rate=0.2,
+        discount_factor=0.9,
+        epsilon=0.35,
+        reward_config=EVALUATION_REWARD_CONFIG,
+        rng=Random(10_000),
+    )
 
     for training_scenario in selected_training_scenarios:
         training_grid = generate_grid(training_scenario.grid_settings, start=training_scenario.start)
         learning_feedback.append(
-            train_single_agent(learner, training_scenario, training_grid, training_episodes)
+            train_q_learning_agent(learner, training_scenario, training_grid, training_episodes)
         )
 
     for scenario in selected_scenarios:
@@ -267,7 +277,7 @@ def evaluate_agents(
         )
         runs.append(calculate_run_metrics(baseline_trace))
 
-        trained_trace = run_trained_agent_on_grid(
+        trained_trace = run_q_learning_agent_on_grid(
             scenario=scenario,
             grid=grid,
             learner=learner,
@@ -356,6 +366,163 @@ def run_agent_on_grid(
     return RunTrace(
         scenario_name=scenario.name,
         agent_name=agent_name,
+        seed=scenario.grid_settings.random_seed,
+        num_agents=NUM_AGENTS,
+        steps_taken=steps_taken,
+        max_steps=scenario.max_steps,
+        total_reward=round(total_reward, 4),
+        rescued_targets=len(rescued),
+        total_targets=len(all_targets),
+        explored_cells=len(visited),
+        explorable_cells=_explorable_cell_count(grid),
+        episode_steps=tuple(episode_steps),
+    )
+
+
+def train_q_learning_agent(
+    learner: QLearningAgent,
+    scenario: EvaluationScenario,
+    grid: Grid,
+    training_episodes: int,
+) -> LearningFeedback:
+    """Train the real Sprint 3 QLearningAgent on one training scenario."""
+
+    episode_traces: list[RunTrace] = []
+
+    for episode_number in range(training_episodes):
+        learner.epsilon = max(0.05, learner.epsilon * (0.96**episode_number))
+        trace = run_q_learning_agent_on_grid(
+            scenario=scenario,
+            grid=grid,
+            learner=learner,
+            training=True,
+        )
+        episode_traces.append(trace)
+
+    first_trace = episode_traces[0]
+    last_trace = episode_traces[-1]
+    return LearningFeedback(
+        scenario_name=scenario.name,
+        training_episodes=training_episodes,
+        first_episode_steps=first_trace.steps_taken,
+        last_episode_steps=last_trace.steps_taken,
+        first_episode_reward=first_trace.total_reward,
+        last_episode_reward=last_trace.total_reward,
+        learned_state_actions=len(learner.q_table),
+    )
+
+
+def run_q_learning_agent_on_grid(
+    scenario: EvaluationScenario,
+    grid: Grid,
+    learner: QLearningAgent,
+    training: bool = False,
+) -> RunTrace:
+    """Run the real QLearningAgent and optionally update its Q-table."""
+
+    movement = MovementModel()
+    sensor = CentralSensor(grid)
+    position = scenario.start
+    visited = {position}
+    rescued: set[Position] = set()
+    all_targets = grid.target_a_positions | grid.target_b_positions
+    total_reward = 0.0
+    steps_taken = 0
+    episode_steps: list[EpisodeStep] = []
+    previous_epsilon = learner.epsilon
+
+    if not training:
+        learner.epsilon = 0.0
+
+    observation = sensor.observe("agent-1", position, sensor_range=max(grid.width, grid.height))
+
+    for step in range(1, scenario.max_steps + 1):
+        if rescued == all_targets:
+            break
+
+        previous_position = position
+        state = learner.state_from_observation(
+            observation=observation,
+            grid=grid,
+            found_targets=frozenset(rescued),
+            steps_taken=0,
+        )
+        valid_actions = learner.valid_actions(movement, grid, position)
+        valid_actions = tuple(action for action in valid_actions if action != Action.WAIT) or valid_actions
+        if not valid_actions:
+            valid_actions = (Action.WAIT,)
+
+        action = learner.choose_action(state, valid_actions)
+        movement_result = movement.apply(grid, position, action.value)
+        position = movement_result.end
+        next_observation = sensor.observe("agent-1", position, sensor_range=max(grid.width, grid.height))
+        steps_taken = step
+
+        repeated_cell = position in visited
+        newly_discovered_cells = 0
+        if position not in visited:
+            visited.add(position)
+            newly_discovered_cells = 1
+
+        rescued_target_type = None
+        if position in all_targets and position not in rescued:
+            rescued.add(position)
+            rescued_target_type = _target_type_enum(grid, position)
+
+        done = rescued == all_targets
+        step_reward = calculate_reward(
+            RewardEvent(
+                moved=movement_result.moved,
+                move=action.value,
+                newly_discovered_cells=newly_discovered_cells,
+                rescued_target_type=rescued_target_type,
+                completed_episode=done,
+                repeated_cell=repeated_cell,
+            ),
+            learner.reward_config,
+        )
+        total_reward += step_reward
+
+        next_state = learner.state_from_observation(
+            observation=next_observation,
+            grid=grid,
+            found_targets=frozenset(rescued),
+            steps_taken=0,
+        )
+        next_valid_actions = learner.valid_actions(movement, grid, position)
+        next_valid_actions = (
+            tuple(action for action in next_valid_actions if action != Action.WAIT)
+            or next_valid_actions
+        )
+        if not next_valid_actions:
+            next_valid_actions = (Action.WAIT,)
+        if training:
+            learner.update_q_value(
+                state=state,
+                action=action,
+                reward=step_reward,
+                next_state=next_state,
+                next_valid_actions=next_valid_actions,
+            )
+
+        observation = next_observation
+        episode_steps.append(
+            EpisodeStep(
+                state=previous_position,
+                action=action,
+                reward=round(step_reward, 4),
+                next_state=position,
+                rescued_targets=len(rescued),
+                explored_cells=len(visited),
+            )
+        )
+
+    if not training:
+        learner.epsilon = previous_epsilon
+
+    return RunTrace(
+        scenario_name=scenario.name,
+        agent_name="trained",
         seed=scenario.grid_settings.random_seed,
         num_agents=NUM_AGENTS,
         steps_taken=steps_taken,
@@ -606,7 +773,7 @@ def report_to_csv(report: EvaluationReport) -> str:
 def build_sprint_demo_summary(aggregates: list[dict]) -> str:
     """Create a concise text summary for the sprint demo."""
 
-    lines = ["Single-agent evaluation compares the baseline and trained mock agent."]
+    lines = ["Single-agent evaluation compares the baseline and trained Q-learning agent."]
     for aggregate in aggregates:
         lines.append(
             (
