@@ -80,7 +80,7 @@ class SimConfig(BaseModel):
     discount_factor: float = 0.9
     exploration_rate: float = 1.0
     speed_ms: int = 100  # delay between steps in ms
-    run_mode: str = "train"  # train | evaluate
+    run_mode: str = "train"  # train | evaluate | instant_train
 
 
 # ── Global state ────────────────────────────────────────────────────────────
@@ -145,7 +145,7 @@ async def simulation_ws(websocket: WebSocket):
                 continue
 
             config = current_config
-            run_mode = config.run_mode if config.run_mode in {"train", "evaluate"} else "train"
+            run_mode = config.run_mode if config.run_mode in {"train", "evaluate", "instant_train"} else "train"
 
             # ── Validation ────────────────────────────────────────────────
             if (
@@ -257,21 +257,22 @@ async def simulation_ws(websocket: WebSocket):
                 observation = sensor.observe("agent-1", position, config.sensor_range)
 
                 # Send initial state
-                await websocket.send_json(
-                    {
-                        "type": "episode_start",
-                        "episode": episode,
-                        "grid": {
-                            "width": config.grid_width,
-                            "height": config.grid_height,
-                            "obstacles": obstacles,
-                            "targets": targets,
-                        },
-                        "agents": [
-                            {"x": start_pos.x, "y": start_pos.y, "id": 0}
-                        ],
-                    }
-                )
+                if run_mode != "instant_train":
+                    await websocket.send_json(
+                        {
+                            "type": "episode_start",
+                            "episode": episode,
+                            "grid": {
+                                "width": config.grid_width,
+                                "height": config.grid_height,
+                                "obstacles": obstacles,
+                                "targets": targets,
+                            },
+                            "agents": [
+                                {"x": start_pos.x, "y": start_pos.y, "id": 0}
+                            ],
+                        }
+                    )
 
                 steps = 0
 
@@ -279,22 +280,27 @@ async def simulation_ws(websocket: WebSocket):
                     if not active_targets:
                         break
 
-                    # Check for cancellation or speed update
-                    try:
-                        cancel_check = await asyncio.wait_for(
-                            websocket.receive_text(), timeout=0.001
-                        )
-                        cancel_msg = json.loads(cancel_check)
-                        if cancel_msg.get("type") == "stop":
-                            await websocket.send_json({"type": "stopped"})
-                            should_stop = True
-                            break
-                        if cancel_msg.get("type") == "config":
-                            new_cfg = SimConfig(**cancel_msg.get("data", {}))
-                            current_config = new_cfg
-                            config = new_cfg
-                    except asyncio.TimeoutError:
-                        pass
+                    # Check for cancellation or speed update (throttled in instant_train to avoid latency)
+                    check_cancel = True
+                    if run_mode == "instant_train" and step % 20 != 0:
+                        check_cancel = False
+
+                    if check_cancel:
+                        try:
+                            cancel_check = await asyncio.wait_for(
+                                websocket.receive_text(), timeout=0.001
+                            )
+                            cancel_msg = json.loads(cancel_check)
+                            if cancel_msg.get("type") == "stop":
+                                await websocket.send_json({"type": "stopped"})
+                                should_stop = True
+                                break
+                            if cancel_msg.get("type") == "config":
+                                new_cfg = SimConfig(**cancel_msg.get("data", {}))
+                                current_config = new_cfg
+                                config = new_cfg
+                        except asyncio.TimeoutError:
+                            pass
 
                     state = _visual_learning_state(
                         learner=learner,
@@ -355,7 +361,7 @@ async def simulation_ws(websocket: WebSocket):
                     next_valid_actions = _movement_actions_first(next_valid_actions)
                     if not next_valid_actions:
                         next_valid_actions = (Action.WAIT,)
-                    if run_mode == "train":
+                    if run_mode in {"train", "instant_train"}:
                         learner.update_q_value(
                             state=state,
                             action=action,
@@ -376,18 +382,19 @@ async def simulation_ws(websocket: WebSocket):
                     }
                     steps = step + 1
 
-                    await websocket.send_json(
-                        {
-                            "type": "step",
-                            "episode": episode,
-                            "step": steps,
-                            "agents": [agent_state],
-                            "rescued": rescued,
-                            "active_targets": len(active_targets),
-                        }
-                    )
+                    if run_mode != "instant_train":
+                        await websocket.send_json(
+                            {
+                                "type": "step",
+                                "episode": episode,
+                                "step": steps,
+                                "agents": [agent_state],
+                                "rescued": rescued,
+                                "active_targets": len(active_targets),
+                            }
+                        )
 
-                    await asyncio.sleep(config.speed_ms / 1000.0)
+                        await asyncio.sleep(config.speed_ms / 1000.0)
 
                 if should_stop:
                     break
@@ -403,7 +410,7 @@ async def simulation_ws(websocket: WebSocket):
                     "exploration_rate": round(learner.epsilon, 4),
                 }
                 episode_metrics.append(metric)
-                if run_mode == "train":
+                if run_mode in {"train", "instant_train"}:
                     learner.epsilon = max(0.05, learner.epsilon * 0.85)
 
                 success_rate = sum(
@@ -422,9 +429,11 @@ async def simulation_ws(websocket: WebSocket):
                         ),
                     }
                 )
+                if run_mode == "instant_train":
+                    await asyncio.sleep(0)
 
             if not should_stop:
-                if run_mode == "train":
+                if run_mode in {"train", "instant_train"}:
                     trained_visual_learner = learner
                     trained_visual_seed = scenario_seed
                 if run_mode == "evaluate" and episode_metrics:

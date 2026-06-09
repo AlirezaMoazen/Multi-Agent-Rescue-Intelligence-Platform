@@ -270,6 +270,16 @@ body {
   border-color: transparent;
 }
 
+.btn-success {
+  background: var(--accent-green-dim);
+  border-color: transparent;
+  color: var(--accent-green);
+}
+.btn-success:hover {
+  background: rgba(52, 211, 153, 0.25);
+  border-color: transparent;
+}
+
 .btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;

@@ -36,6 +36,12 @@ export default function App() {
     sim.start(nextConfig);
   };
 
+  const handleInstantTrain = () => {
+    const nextConfig = { ...config, run_mode: 'instant_train' };
+    setConfig(nextConfig);
+    sim.start(nextConfig);
+  };
+
   const handleRunLearned = () => {
     const nextConfig = { ...config, run_mode: 'evaluate' };
     setConfig(nextConfig);
@@ -146,6 +152,7 @@ export default function App() {
           <ControlPanel
             status={sim.status}
             onStart={handleStart}
+            onInstantTrain={handleInstantTrain}
             onRunLearned={handleRunLearned}
             onStop={handleStop}
             onRestart={handleRestart}

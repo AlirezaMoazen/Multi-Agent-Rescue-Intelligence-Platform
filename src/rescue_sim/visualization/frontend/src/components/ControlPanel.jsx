@@ -4,6 +4,7 @@
 export default function ControlPanel({
   status,
   onStart,
+  onInstantTrain,
   onRunLearned,
   onStop,
   onRestart,
@@ -19,6 +20,11 @@ export default function ControlPanel({
       {isIdle && (
         <button id="btn-start" className="btn btn-primary" onClick={onStart} disabled={disabled}>
           ▶ Start Simulation
+        </button>
+      )}
+      {isIdle && (
+        <button id="btn-instant-train" className="btn btn-success" onClick={onInstantTrain} disabled={disabled}>
+          ⚡ Train Instantly
         </button>
       )}
       {isIdle && (
