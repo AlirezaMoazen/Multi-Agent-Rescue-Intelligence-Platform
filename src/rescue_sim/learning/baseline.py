@@ -588,10 +588,14 @@ class PrioritizedPlanningExplorer:
         queue: deque[tuple[Position, list[Position]]] = deque([(start, [start])])
         seen: set[tuple[Position, int]] = {(start, 0)}  # (position, step_index)
         reachable = passable | {start, target}
+        max_depth = max(100, len(reachable))
 
         while queue:
             pos, path = queue.popleft()
             depth = len(path) - 1
+
+            if depth > max_depth:
+                continue
 
             for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
                 npos = Position(pos.x + dx, pos.y + dy)
