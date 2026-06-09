@@ -1,7 +1,16 @@
 /**
  * ControlPanel — Start / Stop / Restart + speed slider.
  */
-export default function ControlPanel({ status, onStart, onStop, onRestart, speed, onSpeedChange, disabled }) {
+export default function ControlPanel({
+  status,
+  onStart,
+  onRunLearned,
+  onStop,
+  onRestart,
+  speed,
+  onSpeedChange,
+  disabled,
+}) {
   const isRunning = status === 'running';
   const isIdle = status === 'idle' || status === 'stopped' || status === 'complete';
 
@@ -10,6 +19,11 @@ export default function ControlPanel({ status, onStart, onStop, onRestart, speed
       {isIdle && (
         <button id="btn-start" className="btn btn-primary" onClick={onStart} disabled={disabled}>
           ▶ Start Simulation
+        </button>
+      )}
+      {isIdle && (
+        <button id="btn-run-learned" className="btn" onClick={onRunLearned} disabled={disabled}>
+          Run Learned Policy
         </button>
       )}
       {isRunning && (

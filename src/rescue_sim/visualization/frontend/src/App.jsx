@@ -20,6 +20,7 @@ const DEFAULT_CONFIG = {
   discount_factor: 0.9,
   exploration_rate: 1.0,
   speed_ms: 100,
+  run_mode: 'train',
 };
 
 export default function App() {
@@ -31,7 +32,15 @@ export default function App() {
   const evaluationRefreshKey = isComplete ? sim.episodeMetrics.length : 0;
 
   const handleStart = () => {
-    sim.start({ ...config });
+    const nextConfig = { ...config, run_mode: 'train' };
+    setConfig(nextConfig);
+    sim.start(nextConfig);
+  };
+
+  const handleRunLearned = () => {
+    const nextConfig = { ...config, run_mode: 'evaluate' };
+    setConfig(nextConfig);
+    sim.start(nextConfig);
   };
 
   const handleStop = () => {
@@ -138,6 +147,7 @@ export default function App() {
           <ControlPanel
             status={sim.status}
             onStart={handleStart}
+            onRunLearned={handleRunLearned}
             onStop={handleStop}
             onRestart={handleRestart}
             speed={config.speed_ms}

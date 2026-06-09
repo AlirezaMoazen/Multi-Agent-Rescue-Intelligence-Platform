@@ -72,10 +72,12 @@ class SimConfig(BaseModel):
     discount_factor: float = 0.9
     exploration_rate: float = 1.0
     speed_ms: int = 100  # delay between steps in ms
+    run_mode: str = "train"  # train | evaluate
 
 
 # ── Global state ────────────────────────────────────────────────────────────
 current_config = SimConfig()
+trained_visual_learner: QLearningAgent | None = None
 
 
 # ── REST endpoints ──────────────────────────────────────────────────────────
@@ -139,7 +141,7 @@ def _evaluation_scenarios_from_config(config: SimConfig) -> list[EvaluationScena
 @app.websocket("/ws/simulation")
 async def simulation_ws(websocket: WebSocket):
     await websocket.accept()
-    global current_config
+    global current_config, trained_visual_learner
 
     try:
         while True:
@@ -158,6 +160,7 @@ async def simulation_ws(websocket: WebSocket):
                 continue
 
             config = current_config
+            run_mode = config.run_mode if config.run_mode in {"train", "evaluate"} else "train"
 
             # ── Validation ────────────────────────────────────────────────
             if (
@@ -193,12 +196,24 @@ async def simulation_ws(websocket: WebSocket):
             episode_metrics: list[dict] = []
             should_stop = False
             scenario_seed = random.randint(0, 999999)
-            learner = QLearningAgent(
-                learning_rate=config.learning_rate,
-                discount_factor=config.discount_factor,
-                epsilon=config.exploration_rate,
-                rng=random.Random(0),
-            )
+            if run_mode == "evaluate":
+                if trained_visual_learner is None:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "message": "No trained policy is available yet. Run Train first.",
+                        }
+                    )
+                    continue
+                learner = trained_visual_learner
+                learner.epsilon = 0.0
+            else:
+                learner = QLearningAgent(
+                    learning_rate=config.learning_rate,
+                    discount_factor=config.discount_factor,
+                    epsilon=config.exploration_rate,
+                    rng=random.Random(0),
+                )
 
             for episode in range(config.num_episodes):
                 if should_stop:
@@ -353,13 +368,14 @@ async def simulation_ws(websocket: WebSocket):
                     next_valid_actions = _movement_actions_first(next_valid_actions)
                     if not next_valid_actions:
                         next_valid_actions = (Action.WAIT,)
-                    learner.update_q_value(
-                        state=state,
-                        action=action,
-                        reward=reward,
-                        next_state=next_state,
-                        next_valid_actions=next_valid_actions,
-                    )
+                    if run_mode == "train":
+                        learner.update_q_value(
+                            state=state,
+                            action=action,
+                            reward=reward,
+                            next_state=next_state,
+                            next_valid_actions=next_valid_actions,
+                        )
 
                     position = next_position
                     observation = next_observation
@@ -400,7 +416,8 @@ async def simulation_ws(websocket: WebSocket):
                     "exploration_rate": round(learner.epsilon, 4),
                 }
                 episode_metrics.append(metric)
-                learner.epsilon = max(0.05, learner.epsilon * 0.85)
+                if run_mode == "train":
+                    learner.epsilon = max(0.05, learner.epsilon * 0.85)
 
                 success_rate = sum(
                     1 for m in episode_metrics if m["success"]
@@ -420,6 +437,8 @@ async def simulation_ws(websocket: WebSocket):
                 )
 
             if not should_stop:
+                if run_mode == "train":
+                    trained_visual_learner = learner
                 await websocket.send_json(
                     {
                         "type": "training_complete",
