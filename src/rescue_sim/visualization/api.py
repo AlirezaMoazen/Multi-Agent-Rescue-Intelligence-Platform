@@ -31,7 +31,7 @@ from rescue_sim.environment.generator import generate_grid
 from rescue_sim.environment.grid import Position
 from rescue_sim.environment.movement import MovementModel
 from rescue_sim.environment.sensors import CentralSensor
-from rescue_sim.learning.baseline import BaselineExplorer, DFSExplorer
+from rescue_sim.learning.baseline import BaselineExplorer, DFSExplorer, PrioritizedPlanningExplorer
 from rescue_sim.learning.q_learning import QLearningAgent
 from rescue_sim.shared import (
     Action,
@@ -530,6 +530,13 @@ def _build_run_comparison_report(
         strategy=DFSExplorer(seed=0),
         agent_name="baseline / BFS",
     )
+    prioritized = _run_baseline_on_visual_grid(
+        grid=grid,
+        start=start,
+        config=config,
+        strategy=PrioritizedPlanningExplorer(seed=0),
+        agent_name="baseline / prioritized planning",
+    )
     trained = _metric_to_comparison_row(
         agent_name="trained",
         metric=trained_metric,
@@ -538,7 +545,7 @@ def _build_run_comparison_report(
     )
 
     return {
-        "aggregates": [frontier, bfs, trained],
+        "aggregates": [frontier, bfs, prioritized, trained],
         "sprint_demo_summary": (
             "Baseline comparison for the latest Run Learned Policy execution.\n"
             f"frontier: success_rate={frontier['success_rate']:.2f}, "
@@ -553,6 +560,12 @@ def _build_run_comparison_report(
             f"rescued_targets={bfs['average_rescued_targets']:.1f}, "
             f"explored_area={bfs['average_explored_area_percentage']:.1f}%, "
             f"num_agents={bfs['num_agents']}\n"
+            f"prioritized: success_rate={prioritized['success_rate']:.2f}, "
+            f"steps={prioritized['average_steps']:.1f}, "
+            f"reward={prioritized['average_accumulated_reward']:.1f}, "
+            f"rescued_targets={prioritized['average_rescued_targets']:.1f}, "
+            f"explored_area={prioritized['average_explored_area_percentage']:.1f}%, "
+            f"num_agents={prioritized['num_agents']}\n"
             f"trained: success_rate={trained['success_rate']:.2f}, "
             f"steps={trained['average_steps']:.1f}, "
             f"reward={trained['average_accumulated_reward']:.1f}, "

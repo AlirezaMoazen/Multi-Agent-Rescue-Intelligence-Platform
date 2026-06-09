@@ -454,3 +454,185 @@ class DFSExplorer:
         if agent_id not in self._known_obstacles:
             self._known_obstacles[agent_id] = set()
         return self._known_obstacles[agent_id]
+
+
+class PrioritizedPlanningExplorer:
+    """Prioritized Planning explorer implementing StrategyInterface.
+
+    In a multi-agent environment, agents plan paths sequentially based on priority
+    (determined by agent_id). Higher-priority agents reserve their planned positions
+    per timestep in a shared reservation registry. Lower-priority agents treat these
+    reservations as dynamic obstacles when planning their paths using BFS.
+    """
+
+    # Shared class-level registry of reservations: (agent_id) -> list of Positions at each step
+    _shared_reservations: dict[str, list[Position]] = {}
+
+    def __init__(self, seed: int | None = 42) -> None:
+        self._rng = random.Random(seed)
+        self._visited: dict[str, set[Position]] = {}
+        self._path_buffer: dict[str, list[Action]] = {}
+        self._known_obstacles: dict[str, set[Position]] = {}
+
+    @classmethod
+    def clear_reservations(cls) -> None:
+        cls._shared_reservations.clear()
+
+    def select_action(
+        self,
+        agent_id: str,
+        state: LearningState,
+        valid_actions: tuple[Action, ...],
+    ) -> Action:
+        """Return the next Prioritized Planning action for *agent_id*."""
+        visited = self._visited_for(agent_id)
+        pos = state.agent_position
+        visited.add(pos)
+
+        obs = self._obstacles_for(agent_id)
+        obs.update(state.visible_obstacles)
+
+        moveable = [a for a in valid_actions if a != Action.WAIT]
+        if not moveable:
+            return Action.WAIT
+
+        buf = self._buffer_for(agent_id)
+
+        # If we have a buffered path, return the next action
+        while buf:
+            action = buf[0]
+            if action in valid_actions:
+                buf.pop(0)
+                return action
+            buf.clear()
+            break
+
+        # Replan: Find nearest target
+        targets = sorted(
+            list(
+                state.visible_target_a_positions
+                | state.visible_target_b_positions
+                | state.remaining_target_a_positions
+                | state.remaining_target_b_positions
+            ),
+            key=lambda t: abs(t.x - pos.x) + abs(t.y - pos.y)
+        )
+
+        path = []
+        passable = set(state.discovered_cells) - obs
+
+        # Prioritized Planning collision avoidance:
+        # Collect reservations from higher-priority agents (lexicographically smaller ids)
+        other_reservations: list[list[Position]] = [
+            res_path
+            for other_id, res_path in self._shared_reservations.items()
+            if other_id < agent_id
+        ]
+
+        for target in targets:
+            path = self._bfs_navigate_prioritized(pos, target, passable, other_reservations)
+            if path:
+                break
+
+        if path:
+            actions = self._path_to_actions(pos, path)
+            if actions:
+                # Save planned positions to shared reservations for priority check
+                self._shared_reservations[agent_id] = path
+                buf.extend(actions[1:])
+                return actions[0]
+
+        # Fallback to random if no target or path is found
+        return self._rng.choice(moveable)
+
+    def update(self, transition: Transition) -> None:
+        """No-op: the prioritized planning baseline never updates from experience."""
+        pass
+
+    def run_episode(
+        self,
+        env: EnvironmentInterface,
+        max_steps: int = 500,
+        total_cells: int | None = None,
+    ) -> BaselineMetrics:
+        """Convenience wrapper around the module-level :func:`run_episode`."""
+        self.clear_reservations()
+        return run_episode(self, env, max_steps, total_cells)
+
+    def _visited_for(self, agent_id: str) -> set[Position]:
+        if agent_id not in self._visited:
+            self._visited[agent_id] = set()
+        return self._visited[agent_id]
+
+    def _buffer_for(self, agent_id: str) -> list[Action]:
+        if agent_id not in self._path_buffer:
+            self._path_buffer[agent_id] = []
+        return self._path_buffer[agent_id]
+
+    def _obstacles_for(self, agent_id: str) -> set[Position]:
+        if agent_id not in self._known_obstacles:
+            self._known_obstacles[agent_id] = set()
+        return self._known_obstacles[agent_id]
+
+    def _bfs_navigate_prioritized(
+        self,
+        start: Position,
+        target: Position,
+        passable: set[Position],
+        other_reservations: list[list[Position]],
+    ) -> list[Position]:
+        """BFS that avoids collision with reserved paths of higher-priority agents."""
+        if start == target:
+            return [start]
+
+        queue: deque[tuple[Position, list[Position]]] = deque([(start, [start])])
+        seen: set[tuple[Position, int]] = {(start, 0)}  # (position, step_index)
+        reachable = passable | {start, target}
+
+        while queue:
+            pos, path = queue.popleft()
+            depth = len(path) - 1
+
+            for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+                npos = Position(pos.x + dx, pos.y + dy)
+                next_depth = depth + 1
+
+                # Check if this position is reserved by a higher priority agent at next_depth
+                reserved = False
+                for res_path in other_reservations:
+                    if next_depth < len(res_path) and res_path[next_depth] == npos:
+                        reserved = True
+                        break
+                    # Avoid swapping positions (edge conflict)
+                    if next_depth < len(res_path) and depth < len(res_path) and res_path[depth] == npos and res_path[next_depth] == pos:
+                        reserved = True
+                        break
+
+                if reserved:
+                    continue
+
+                if npos == target:
+                    return path + [npos]
+
+                if npos in reachable and (npos, next_depth) not in seen:
+                    seen.add((npos, next_depth))
+                    queue.append((npos, path + [npos]))
+
+        return []
+
+    def _path_to_actions(self, start: Position, path: list[Position]) -> list[Action]:
+        actions = []
+        curr = start
+        for next_pos in path[1:]:
+            if next_pos.x > curr.x:
+                actions.append(Action.RIGHT)
+            elif next_pos.y > curr.y:
+                actions.append(Action.DOWN)
+            elif next_pos.x < curr.x:
+                actions.append(Action.LEFT)
+            elif next_pos.y < curr.y:
+                actions.append(Action.UP)
+            else:
+                actions.append(Action.WAIT)
+            curr = next_pos
+        return actions
