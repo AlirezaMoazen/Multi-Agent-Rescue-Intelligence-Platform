@@ -30,6 +30,7 @@ from rescue_sim.environment.generator import generate_grid
 from rescue_sim.environment.grid import Position
 from rescue_sim.environment.movement import MovementModel
 from rescue_sim.environment.sensors import CentralSensor
+from rescue_sim.learning.baseline import BaselineExplorer, DFSExplorer
 from rescue_sim.learning.q_learning import QLearningAgent
 from rescue_sim.shared import (
     Action,
@@ -37,6 +38,7 @@ from rescue_sim.shared import (
     RewardEvent,
     SPRINT3_REWARD_CONFIG,
     TargetType,
+    Transition,
     calculate_reward,
 )
 
@@ -515,7 +517,20 @@ def _build_run_comparison_report(
     trained_metric: dict,
     trained_explored_cells: int,
 ) -> dict:
-    baseline = _run_baseline_on_visual_grid(grid, start, config)
+    frontier = _run_baseline_on_visual_grid(
+        grid=grid,
+        start=start,
+        config=config,
+        strategy=BaselineExplorer(seed=0),
+        agent_name="baseline / frontier",
+    )
+    bfs = _run_baseline_on_visual_grid(
+        grid=grid,
+        start=start,
+        config=config,
+        strategy=DFSExplorer(seed=0),
+        agent_name="baseline / BFS",
+    )
     trained = _metric_to_comparison_row(
         agent_name="trained",
         metric=trained_metric,
@@ -524,15 +539,21 @@ def _build_run_comparison_report(
     )
 
     return {
-        "aggregates": [baseline, trained],
+        "aggregates": [frontier, bfs, trained],
         "sprint_demo_summary": (
             "Baseline comparison for the latest Run Learned Policy execution.\n"
-            f"baseline: success_rate={baseline['success_rate']:.2f}, "
-            f"steps={baseline['average_steps']:.1f}, "
-            f"reward={baseline['average_accumulated_reward']:.1f}, "
-            f"rescued_targets={baseline['average_rescued_targets']:.1f}, "
-            f"explored_area={baseline['average_explored_area_percentage']:.1f}%, "
-            f"num_agents={baseline['num_agents']}\n"
+            f"frontier: success_rate={frontier['success_rate']:.2f}, "
+            f"steps={frontier['average_steps']:.1f}, "
+            f"reward={frontier['average_accumulated_reward']:.1f}, "
+            f"rescued_targets={frontier['average_rescued_targets']:.1f}, "
+            f"explored_area={frontier['average_explored_area_percentage']:.1f}%, "
+            f"num_agents={frontier['num_agents']}\n"
+            f"BFS: success_rate={bfs['success_rate']:.2f}, "
+            f"steps={bfs['average_steps']:.1f}, "
+            f"reward={bfs['average_accumulated_reward']:.1f}, "
+            f"rescued_targets={bfs['average_rescued_targets']:.1f}, "
+            f"explored_area={bfs['average_explored_area_percentage']:.1f}%, "
+            f"num_agents={bfs['num_agents']}\n"
             f"trained: success_rate={trained['success_rate']:.2f}, "
             f"steps={trained['average_steps']:.1f}, "
             f"reward={trained['average_accumulated_reward']:.1f}, "
@@ -543,7 +564,13 @@ def _build_run_comparison_report(
     }
 
 
-def _run_baseline_on_visual_grid(grid: object, start: Position, config: SimConfig) -> dict:
+def _run_baseline_on_visual_grid(
+    grid: object,
+    start: Position,
+    config: SimConfig,
+    strategy: BaselineExplorer | DFSExplorer,
+    agent_name: str,
+) -> dict:
     movement = MovementModel()
     sensor = CentralSensor(grid)
     position = start
@@ -558,7 +585,18 @@ def _run_baseline_on_visual_grid(grid: object, start: Position, config: SimConfi
         if found_targets == all_targets:
             break
 
-        action = _baseline_action(grid, position, visited)
+        state = _baseline_learning_state(
+            observation=observation,
+            grid=grid,
+            discovered_cells=sensor.discovered_cells,
+            found_targets=frozenset(found_targets),
+            steps_taken=step,
+        )
+        valid_actions = tuple(Action(move) for move in movement.allowed_moves(grid, position))
+        if not valid_actions:
+            valid_actions = (Action.WAIT,)
+
+        action = strategy.select_action("baseline", state, valid_actions)
         movement_result = movement.apply(grid, position, action.value)
         next_position = movement_result.end
         next_observation = sensor.observe("baseline", next_position, config.sensor_range)
@@ -575,7 +613,7 @@ def _run_baseline_on_visual_grid(grid: object, start: Position, config: SimConfi
             found_targets.add(next_position)
             rescued_target_type = TargetType(target_type)
 
-        total_reward += calculate_reward(
+        step_reward = calculate_reward(
             RewardEvent(
                 moved=movement_result.moved,
                 move=action.value,
@@ -586,6 +624,26 @@ def _run_baseline_on_visual_grid(grid: object, start: Position, config: SimConfi
                 repeated_cell=repeated_cell,
             ),
             SPRINT3_REWARD_CONFIG,
+        )
+        total_reward += step_reward
+
+        next_state = _baseline_learning_state(
+            observation=next_observation,
+            grid=grid,
+            discovered_cells=sensor.discovered_cells,
+            found_targets=frozenset(found_targets),
+            steps_taken=step + 1,
+        )
+        strategy.update(
+            Transition(
+                state=state,
+                action=action,
+                next_state=next_state,
+                reward=step_reward,
+                done=found_targets == all_targets,
+                movement=movement_result,
+                observation=next_observation,
+            )
         )
 
         position = next_position
@@ -602,11 +660,54 @@ def _run_baseline_on_visual_grid(grid: object, start: Position, config: SimConfi
         "total_reward": round(total_reward, 2),
     }
     return _metric_to_comparison_row(
-        agent_name="baseline",
+        agent_name=agent_name,
         metric=metric,
         explored_cells=len(visited),
         explorable_cells=_explorable_cell_count(grid),
     )
+
+
+def _baseline_learning_state(
+    observation: object,
+    grid: object,
+    discovered_cells: frozenset[Position],
+    found_targets: frozenset[Position],
+    steps_taken: int,
+) -> LearningState:
+    found_target_a = frozenset(
+        position for position in found_targets if position in grid.target_a_positions
+    )
+    found_target_b = frozenset(
+        position for position in found_targets if position in grid.target_b_positions
+    )
+    visible_target_a = frozenset(
+        position
+        for position, target_type in observation.target_types.items()
+        if target_type == "A"
+    )
+    visible_target_b = frozenset(
+        position
+        for position, target_type in observation.target_types.items()
+        if target_type == "B"
+    )
+
+    return LearningState(
+        agent_id=observation.agent_id,
+        agent_position=observation.agent_position,
+        visible_cells=observation.visible_cells,
+        visible_obstacles=observation.obstacles,
+        visible_target_a_positions=visible_target_a,
+        visible_target_b_positions=visible_target_b,
+        discovered_cells=discovered_cells,
+        discovered_target_a_positions=visible_target_a,
+        discovered_target_b_positions=visible_target_b,
+        rescued_target_a_positions=found_target_a,
+        rescued_target_b_positions=found_target_b,
+        remaining_target_a_positions=grid.target_a_positions - found_target_a,
+        remaining_target_b_positions=grid.target_b_positions - found_target_b,
+        steps_taken=steps_taken,
+    )
+
 
 def _metric_to_comparison_row(
     agent_name: str,
