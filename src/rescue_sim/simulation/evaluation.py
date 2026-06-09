@@ -111,6 +111,7 @@ class RunMetrics:
 class EvaluationReport:
     """Full comparison report for visualization, JSON export, or sprint demos."""
 
+    training_scenarios: list[dict]
     scenarios: list[dict]
     runs: list[dict]
     aggregates: list[dict]
@@ -173,15 +174,87 @@ def default_evaluation_scenarios() -> list[EvaluationScenario]:
     ]
 
 
+def default_training_scenarios() -> list[EvaluationScenario]:
+    """Define training-only scenarios so evaluation can test unseen seeds."""
+
+    return [
+        EvaluationScenario(
+            name="train_small_seed_101",
+            grid_settings=GridSettings(
+                width=5,
+                height=5,
+                obstacle_probability=0.05,
+                target_a_count=1,
+                target_b_count=1,
+                random_seed=101,
+            ),
+            max_steps=35,
+            start=Position(1, 1),
+        ),
+        EvaluationScenario(
+            name="train_medium_seed_113",
+            grid_settings=GridSettings(
+                width=8,
+                height=8,
+                obstacle_probability=0.18,
+                target_a_count=2,
+                target_b_count=2,
+                random_seed=113,
+            ),
+            max_steps=80,
+            start=Position(2, 2),
+        ),
+        EvaluationScenario(
+            name="train_large_seed_123",
+            grid_settings=GridSettings(
+                width=10,
+                height=10,
+                obstacle_probability=0.25,
+                target_a_count=3,
+                target_b_count=2,
+                random_seed=123,
+            ),
+            max_steps=130,
+            start=Position(3, 3),
+        ),
+        EvaluationScenario(
+            name="train_wide_seed_131",
+            grid_settings=GridSettings(
+                width=12,
+                height=6,
+                obstacle_probability=0.12,
+                target_a_count=2,
+                target_b_count=3,
+                random_seed=131,
+            ),
+            max_steps=95,
+            start=Position(4, 2),
+        ),
+    ]
+
+
 def evaluate_agents(
     scenarios: Iterable[EvaluationScenario] | None = None,
+    training_scenarios: Iterable[EvaluationScenario] | None = None,
     training_episodes: int = DEFAULT_TRAINING_EPISODES,
 ) -> EvaluationReport:
-    """Train, evaluate, and compare baseline and trained agents under identical conditions."""
+    """Train on training seeds, then compare baseline and trained agents on test seeds."""
 
     selected_scenarios = list(scenarios or default_evaluation_scenarios())
+    selected_training_scenarios = list(
+        training_scenarios
+        if training_scenarios is not None
+        else (selected_scenarios if scenarios is not None else default_training_scenarios())
+    )
     runs: list[RunMetrics] = []
     learning_feedback: list[LearningFeedback] = []
+    learner = TrainableSingleAgent(seed=10_000)
+
+    for training_scenario in selected_training_scenarios:
+        training_grid = generate_grid(training_scenario.grid_settings, start=training_scenario.start)
+        learning_feedback.append(
+            train_single_agent(learner, training_scenario, training_grid, training_episodes)
+        )
 
     for scenario in selected_scenarios:
         grid = generate_grid(scenario.grid_settings, start=scenario.start)
@@ -194,8 +267,6 @@ def evaluate_agents(
         )
         runs.append(calculate_run_metrics(baseline_trace))
 
-        learner = TrainableSingleAgent(seed=_policy_seed(scenario.grid_settings.random_seed, "trained"))
-        learning_feedback.append(train_single_agent(learner, scenario, grid, training_episodes))
         trained_trace = run_trained_agent_on_grid(
             scenario=scenario,
             grid=grid,
@@ -207,6 +278,9 @@ def evaluate_agents(
     aggregate_dicts = _aggregate_by_agent(runs)
 
     return EvaluationReport(
+        training_scenarios=[
+            _scenario_to_dict(scenario, split="train") for scenario in selected_training_scenarios
+        ],
         scenarios=[_scenario_to_dict(scenario) for scenario in selected_scenarios],
         runs=run_dicts,
         aggregates=aggregate_dicts,
@@ -705,9 +779,10 @@ def _average(values: Iterable[float]) -> float:
     return sum(value_list) / len(value_list)
 
 
-def _scenario_to_dict(scenario: EvaluationScenario) -> dict:
+def _scenario_to_dict(scenario: EvaluationScenario, split: str = "test") -> dict:
     return {
         "name": scenario.name,
+        "split": split,
         "grid": asdict(scenario.grid_settings),
         "max_steps": scenario.max_steps,
         "start": asdict(scenario.start),

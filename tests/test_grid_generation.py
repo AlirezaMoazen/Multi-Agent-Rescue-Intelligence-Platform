@@ -221,3 +221,63 @@ def test_generate_grid_allows_zero_targets() -> None:
 
     assert grid.target_a_positions == frozenset()
     assert grid.target_b_positions == frozenset()
+
+
+def test_generated_targets_are_reachable_from_start() -> None:
+    start = Position(2, 2)
+    grid = generate_grid(
+        GridSettings(
+            width=8,
+            height=8,
+            obstacle_probability=0.35,
+            target_a_count=2,
+            target_b_count=2,
+            random_seed=19,
+        ),
+        start=start,
+    )
+
+    reachable = _reachable_positions(grid, start)
+
+    assert (grid.target_a_positions | grid.target_b_positions).issubset(reachable)
+
+
+def test_generate_grid_rejects_unreachable_settings() -> None:
+    start = Position(0, 0)
+
+    try:
+        generate_grid(
+            GridSettings(
+                width=3,
+                height=3,
+                obstacle_probability=1.0,
+                target_a_count=1,
+                target_b_count=0,
+                random_seed=20,
+            ),
+            start=start,
+        )
+    except ValueError as error:
+        assert str(error) == "could not generate a reachable grid with the given settings"
+    else:
+        raise AssertionError("Expected ValueError for unreachable generated grid")
+
+
+def _reachable_positions(grid: Grid, start: Position) -> set[Position]:
+    queue = [start]
+    seen = {start}
+
+    while queue:
+        current = queue.pop(0)
+        for neighbor in (
+            Position(current.x + 1, current.y),
+            Position(current.x, current.y + 1),
+            Position(current.x - 1, current.y),
+            Position(current.x, current.y - 1),
+        ):
+            if neighbor in seen or not grid.is_valid_position(neighbor):
+                continue
+            seen.add(neighbor)
+            queue.append(neighbor)
+
+    return seen

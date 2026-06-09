@@ -134,3 +134,18 @@ def test_learning_episode_updates_agent_q_values() -> None:
 
     assert trace.episode_steps
     assert learner.q_values
+
+
+def test_default_evaluation_separates_training_and_test_scenarios() -> None:
+    report = evaluate_agents(training_episodes=2)
+
+    training_seeds = {
+        scenario["grid"]["random_seed"] for scenario in report.training_scenarios
+    }
+    test_seeds = {scenario["grid"]["random_seed"] for scenario in report.scenarios}
+
+    assert report.training_scenarios
+    assert report.scenarios
+    assert training_seeds.isdisjoint(test_seeds)
+    assert {scenario["split"] for scenario in report.training_scenarios} == {"train"}
+    assert {scenario["split"] for scenario in report.scenarios} == {"test"}
