@@ -158,6 +158,7 @@ async def simulation_ws(websocket: WebSocket):
 
             episode_metrics: list[dict] = []
             should_stop = False
+            scenario_seed = random.randint(0, 999999)
             learner = QLearningAgent(
                 learning_rate=config.learning_rate,
                 discount_factor=config.discount_factor,
@@ -169,7 +170,7 @@ async def simulation_ws(websocket: WebSocket):
                 if should_stop:
                     break
 
-                seed = random.randint(0, 999999)
+                seed = scenario_seed
 
                 # ── Generate grid using environment.generator ─────────────
                 target_a = math.ceil(config.target_count / 2)
