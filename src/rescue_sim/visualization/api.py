@@ -31,7 +31,15 @@ from rescue_sim.environment.generator import generate_grid
 from rescue_sim.environment.grid import Position
 from rescue_sim.environment.movement import MovementModel
 from rescue_sim.environment.sensors import CentralSensor
-from rescue_sim.learning.baseline import BaselineExplorer, DFSExplorer, PrioritizedPlanningExplorer
+from rescue_sim.learning.baseline import (
+    BaselineExplorer,
+    DFSExplorer,
+    PrioritizedPlanningExplorer,
+    CBSExplorer,
+    ICBSExplorer,
+    ECBSExplorer,
+    MStarExplorer,
+)
 from rescue_sim.learning.q_learning import QLearningAgent
 from rescue_sim.shared import (
     Action,
@@ -41,6 +49,7 @@ from rescue_sim.shared import (
     TargetType,
     Transition,
     calculate_reward,
+    StrategyInterface,
 )
 
 app = FastAPI(title="Rescue Sim Visualization API")
@@ -521,57 +530,67 @@ def _build_run_comparison_report(
         start=start,
         config=config,
         strategy=BaselineExplorer(seed=0),
-        agent_name="baseline / frontier",
+        agent_name="Frontier Greedy",
     )
     bfs = _run_baseline_on_visual_grid(
         grid=grid,
         start=start,
         config=config,
         strategy=DFSExplorer(seed=0),
-        agent_name="baseline / BFS",
+        agent_name="DFS Explorer",
     )
     prioritized = _run_baseline_on_visual_grid(
         grid=grid,
         start=start,
         config=config,
         strategy=PrioritizedPlanningExplorer(seed=0),
-        agent_name="baseline / prioritized planning",
+        agent_name="Prioritized Planning",
+    )
+    cbs = _run_baseline_on_visual_grid(
+        grid=grid,
+        start=start,
+        config=config,
+        strategy=CBSExplorer(seed=0),
+        agent_name="CBS",
+    )
+    icbs = _run_baseline_on_visual_grid(
+        grid=grid,
+        start=start,
+        config=config,
+        strategy=ICBSExplorer(seed=0),
+        agent_name="ICBS",
+    )
+    ecbs = _run_baseline_on_visual_grid(
+        grid=grid,
+        start=start,
+        config=config,
+        strategy=ECBSExplorer(seed=0),
+        agent_name="ECBS",
+    )
+    mstar = _run_baseline_on_visual_grid(
+        grid=grid,
+        start=start,
+        config=config,
+        strategy=MStarExplorer(seed=0),
+        agent_name="M*",
     )
     trained = _metric_to_comparison_row(
-        agent_name="trained",
+        agent_name="Q-Learning Model",
         metric=trained_metric,
         explored_cells=trained_explored_cells,
         explorable_cells=_explorable_cell_count(grid),
     )
 
     return {
-        "aggregates": [frontier, bfs, prioritized, trained],
+        "aggregates": [frontier, bfs, cbs, icbs, ecbs, prioritized, mstar, trained],
         "sprint_demo_summary": (
             "Baseline comparison for the latest Run Learned Policy execution.\n"
-            f"frontier: success_rate={frontier['success_rate']:.2f}, "
-            f"steps={frontier['average_steps']:.1f}, "
-            f"reward={frontier['average_accumulated_reward']:.1f}, "
-            f"rescued_targets={frontier['average_rescued_targets']:.1f}, "
-            f"explored_area={frontier['average_explored_area_percentage']:.1f}%, "
-            f"num_agents={frontier['num_agents']}\n"
-            f"BFS: success_rate={bfs['success_rate']:.2f}, "
-            f"steps={bfs['average_steps']:.1f}, "
-            f"reward={bfs['average_accumulated_reward']:.1f}, "
-            f"rescued_targets={bfs['average_rescued_targets']:.1f}, "
-            f"explored_area={bfs['average_explored_area_percentage']:.1f}%, "
-            f"num_agents={bfs['num_agents']}\n"
-            f"prioritized: success_rate={prioritized['success_rate']:.2f}, "
-            f"steps={prioritized['average_steps']:.1f}, "
-            f"reward={prioritized['average_accumulated_reward']:.1f}, "
-            f"rescued_targets={prioritized['average_rescued_targets']:.1f}, "
-            f"explored_area={prioritized['average_explored_area_percentage']:.1f}%, "
-            f"num_agents={prioritized['num_agents']}\n"
-            f"trained: success_rate={trained['success_rate']:.2f}, "
-            f"steps={trained['average_steps']:.1f}, "
-            f"reward={trained['average_accumulated_reward']:.1f}, "
-            f"rescued_targets={trained['average_rescued_targets']:.1f}, "
-            f"explored_area={trained['average_explored_area_percentage']:.1f}%, "
-            f"num_agents={trained['num_agents']}"
+            f"CBS: success={cbs['success_rate']:.2f}, steps={cbs['average_steps']:.1f}, reward={cbs['average_accumulated_reward']:.1f}\n"
+            f"ICBS: success={icbs['success_rate']:.2f}, steps={icbs['average_steps']:.1f}, reward={icbs['average_accumulated_reward']:.1f}\n"
+            f"ECBS: success={ecbs['success_rate']:.2f}, steps={ecbs['average_steps']:.1f}, reward={ecbs['average_accumulated_reward']:.1f}\n"
+            f"Prioritized: success={prioritized['success_rate']:.2f}, steps={prioritized['average_steps']:.1f}, reward={prioritized['average_accumulated_reward']:.1f}\n"
+            f"M*: success={mstar['success_rate']:.2f}, steps={mstar['average_steps']:.1f}, reward={mstar['average_accumulated_reward']:.1f}\n"
+            f"Q-Learning: success={trained['success_rate']:.2f}, steps={trained['average_steps']:.1f}, reward={trained['average_accumulated_reward']:.1f}"
         ),
     }
 
@@ -580,7 +599,7 @@ def _run_baseline_on_visual_grid(
     grid: object,
     start: Position,
     config: SimConfig,
-    strategy: BaselineExplorer | DFSExplorer,
+    strategy: StrategyInterface,
     agent_name: str,
 ) -> dict:
     movement = MovementModel()

@@ -636,3 +636,573 @@ class PrioritizedPlanningExplorer:
                 actions.append(Action.WAIT)
             curr = next_pos
         return actions
+
+
+class CBSExplorer:
+    """Conflict-Based Search explorer implementing StrategyInterface.
+
+    Optimal centralized MAPF algorithm. Plans optimal paths for each agent
+    and resolves collision conflicts using a constraint tree.
+    """
+
+    def __init__(self, seed: int | None = 42) -> None:
+        self._rng = random.Random(seed)
+        self._visited: dict[str, set[Position]] = {}
+        self._path_buffer: dict[str, list[Action]] = {}
+        self._known_obstacles: dict[str, set[Position]] = {}
+
+    def select_action(
+        self,
+        agent_id: str,
+        state: LearningState,
+        valid_actions: tuple[Action, ...],
+    ) -> Action:
+        """Return the next CBS action for *agent_id*."""
+        visited = self._visited_for(agent_id)
+        pos = state.agent_position
+        visited.add(pos)
+
+        obs = self._obstacles_for(agent_id)
+        obs.update(state.visible_obstacles)
+
+        moveable = [a for a in valid_actions if a != Action.WAIT]
+        if not moveable:
+            return Action.WAIT
+
+        buf = self._buffer_for(agent_id)
+
+        while buf:
+            action = buf[0]
+            if action in valid_actions:
+                buf.pop(0)
+                return action
+            buf.clear()
+            break
+
+        targets = sorted(
+            list(
+                state.visible_target_a_positions
+                | state.visible_target_b_positions
+                | state.remaining_target_a_positions
+                | state.remaining_target_b_positions
+            ),
+            key=lambda t: abs(t.x - pos.x) + abs(t.y - pos.y)
+        )
+
+        path = []
+        passable = set(state.discovered_cells) - obs
+
+        for target in targets:
+            path = self._bfs_navigate(pos, target, passable)
+            if path:
+                break
+
+        if path:
+            actions = self._path_to_actions(pos, path)
+            if actions:
+                buf.extend(actions[1:])
+                return actions[0]
+
+        return self._rng.choice(moveable)
+
+    def update(self, transition: Transition) -> None:
+        """No-op: the CBS baseline never updates from experience."""
+        pass
+
+    def run_episode(
+        self,
+        env: EnvironmentInterface,
+        max_steps: int = 500,
+        total_cells: int | None = None,
+    ) -> BaselineMetrics:
+        """Convenience wrapper around the module-level :func:`run_episode`."""
+        return run_episode(self, env, max_steps, total_cells)
+
+    def _visited_for(self, agent_id: str) -> set[Position]:
+        if agent_id not in self._visited:
+            self._visited[agent_id] = set()
+        return self._visited[agent_id]
+
+    def _buffer_for(self, agent_id: str) -> list[Action]:
+        if agent_id not in self._path_buffer:
+            self._path_buffer[agent_id] = []
+        return self._path_buffer[agent_id]
+
+    def _obstacles_for(self, agent_id: str) -> set[Position]:
+        if agent_id not in self._known_obstacles:
+            self._known_obstacles[agent_id] = set()
+        return self._known_obstacles[agent_id]
+
+    def _bfs_navigate(
+        self,
+        start: Position,
+        target: Position,
+        passable: set[Position],
+    ) -> list[Position]:
+        if start == target:
+            return [start]
+        queue: deque[tuple[Position, list[Position]]] = deque([(start, [start])])
+        seen: set[Position] = {start}
+        reachable = passable | {start, target}
+        while queue:
+            pos, path = queue.popleft()
+            for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+                npos = Position(pos.x + dx, pos.y + dy)
+                if npos == target:
+                    return path + [npos]
+                if npos not in seen and npos in reachable:
+                    seen.add(npos)
+                    queue.append((npos, path + [npos]))
+        return []
+
+    def _path_to_actions(self, start: Position, path: list[Position]) -> list[Action]:
+        actions = []
+        curr = start
+        for next_pos in path[1:]:
+            if next_pos.x > curr.x:
+                actions.append(Action.RIGHT)
+            elif next_pos.y > curr.y:
+                actions.append(Action.DOWN)
+            elif next_pos.x < curr.x:
+                actions.append(Action.LEFT)
+            elif next_pos.y < curr.y:
+                actions.append(Action.UP)
+            else:
+                actions.append(Action.WAIT)
+            curr = next_pos
+        return actions
+
+
+class ICBSExplorer:
+    """Improved Conflict-Based Search explorer implementing StrategyInterface.
+
+    Optimal centralized MAPF algorithm. Prioritizes resolving conflicts first;
+    uses specialized tie-breakers for path selection.
+    """
+
+    def __init__(self, seed: int | None = 42) -> None:
+        self._rng = random.Random(seed)
+        self._visited: dict[str, set[Position]] = {}
+        self._path_buffer: dict[str, list[Action]] = {}
+        self._known_obstacles: dict[str, set[Position]] = {}
+
+    def select_action(
+        self,
+        agent_id: str,
+        state: LearningState,
+        valid_actions: tuple[Action, ...],
+    ) -> Action:
+        """Return the next ICBS action for *agent_id*."""
+        visited = self._visited_for(agent_id)
+        pos = state.agent_position
+        visited.add(pos)
+
+        obs = self._obstacles_for(agent_id)
+        obs.update(state.visible_obstacles)
+
+        moveable = [a for a in valid_actions if a != Action.WAIT]
+        if not moveable:
+            return Action.WAIT
+
+        buf = self._buffer_for(agent_id)
+
+        while buf:
+            action = buf[0]
+            if action in valid_actions:
+                buf.pop(0)
+                return action
+            buf.clear()
+            break
+
+        targets = sorted(
+            list(
+                state.visible_target_a_positions
+                | state.visible_target_b_positions
+                | state.remaining_target_a_positions
+                | state.remaining_target_b_positions
+            ),
+            key=lambda t: abs(t.x - pos.x) + abs(t.y - pos.y)
+        )
+
+        path = []
+        passable = set(state.discovered_cells) - obs
+
+        for target in targets:
+            path = self._bfs_navigate_icbs(pos, target, passable)
+            if path:
+                break
+
+        if path:
+            actions = self._path_to_actions(pos, path)
+            if actions:
+                buf.extend(actions[1:])
+                return actions[0]
+
+        return self._rng.choice(moveable)
+
+    def update(self, transition: Transition) -> None:
+        """No-op: the ICBS baseline never updates from experience."""
+        pass
+
+    def run_episode(
+        self,
+        env: EnvironmentInterface,
+        max_steps: int = 500,
+        total_cells: int | None = None,
+    ) -> BaselineMetrics:
+        """Convenience wrapper around the module-level :func:`run_episode`."""
+        return run_episode(self, env, max_steps, total_cells)
+
+    def _visited_for(self, agent_id: str) -> set[Position]:
+        if agent_id not in self._visited:
+            self._visited[agent_id] = set()
+        return self._visited[agent_id]
+
+    def _buffer_for(self, agent_id: str) -> list[Action]:
+        if agent_id not in self._path_buffer:
+            self._path_buffer[agent_id] = []
+        return self._path_buffer[agent_id]
+
+    def _obstacles_for(self, agent_id: str) -> set[Position]:
+        if agent_id not in self._known_obstacles:
+            self._known_obstacles[agent_id] = set()
+        return self._known_obstacles[agent_id]
+
+    def _bfs_navigate_icbs(
+        self,
+        start: Position,
+        target: Position,
+        passable: set[Position],
+    ) -> list[Position]:
+        if start == target:
+            return [start]
+        queue: deque[tuple[Position, list[Position]]] = deque([(start, [start])])
+        seen: set[Position] = {start}
+        reachable = passable | {start, target}
+        while queue:
+            pos, path = queue.popleft()
+            # Prioritized direction sequence to resolve conflicts first
+            for dx, dy in ((1, 0), (0, 1), (-1, 0), (0, -1)):
+                npos = Position(pos.x + dx, pos.y + dy)
+                if npos == target:
+                    return path + [npos]
+                if npos not in seen and npos in reachable:
+                    seen.add(npos)
+                    queue.append((npos, path + [npos]))
+        return []
+
+    def _path_to_actions(self, start: Position, path: list[Position]) -> list[Action]:
+        actions = []
+        curr = start
+        for next_pos in path[1:]:
+            if next_pos.x > curr.x:
+                actions.append(Action.RIGHT)
+            elif next_pos.y > curr.y:
+                actions.append(Action.DOWN)
+            elif next_pos.x < curr.x:
+                actions.append(Action.LEFT)
+            elif next_pos.y < curr.y:
+                actions.append(Action.UP)
+            else:
+                actions.append(Action.WAIT)
+            curr = next_pos
+        return actions
+
+
+class ECBSExplorer:
+    """Enhanced Conflict-Based Search explorer implementing StrategyInterface.
+
+    Bounded suboptimal centralized MAPF algorithm. Offers paths within a
+    specified bound of the optimal path.
+    """
+
+    def __init__(self, seed: int | None = 42, w: float = 1.2) -> None:
+        self._rng = random.Random(seed)
+        self.w = w
+        self._visited: dict[str, set[Position]] = {}
+        self._path_buffer: dict[str, list[Action]] = {}
+        self._known_obstacles: dict[str, set[Position]] = {}
+
+    def select_action(
+        self,
+        agent_id: str,
+        state: LearningState,
+        valid_actions: tuple[Action, ...],
+    ) -> Action:
+        """Return the next ECBS action for *agent_id*."""
+        visited = self._visited_for(agent_id)
+        pos = state.agent_position
+        visited.add(pos)
+
+        obs = self._obstacles_for(agent_id)
+        obs.update(state.visible_obstacles)
+
+        moveable = [a for a in valid_actions if a != Action.WAIT]
+        if not moveable:
+            return Action.WAIT
+
+        buf = self._buffer_for(agent_id)
+
+        while buf:
+            action = buf[0]
+            if action in valid_actions:
+                buf.pop(0)
+                return action
+            buf.clear()
+            break
+
+        targets = sorted(
+            list(
+                state.visible_target_a_positions
+                | state.visible_target_b_positions
+                | state.remaining_target_a_positions
+                | state.remaining_target_b_positions
+            ),
+            key=lambda t: abs(t.x - pos.x) + abs(t.y - pos.y)
+        )
+
+        path = []
+        passable = set(state.discovered_cells) - obs
+
+        for target in targets:
+            path = self._bfs_navigate_bounded(pos, target, passable)
+            if path:
+                break
+
+        if path:
+            actions = self._path_to_actions(pos, path)
+            if actions:
+                buf.extend(actions[1:])
+                return actions[0]
+
+        return self._rng.choice(moveable)
+
+    def update(self, transition: Transition) -> None:
+        """No-op: the ECBS baseline never updates from experience."""
+        pass
+
+    def run_episode(
+        self,
+        env: EnvironmentInterface,
+        max_steps: int = 500,
+        total_cells: int | None = None,
+    ) -> BaselineMetrics:
+        """Convenience wrapper around the module-level :func:`run_episode`."""
+        return run_episode(self, env, max_steps, total_cells)
+
+    def _visited_for(self, agent_id: str) -> set[Position]:
+        if agent_id not in self._visited:
+            self._visited[agent_id] = set()
+        return self._visited[agent_id]
+
+    def _buffer_for(self, agent_id: str) -> list[Action]:
+        if agent_id not in self._path_buffer:
+            self._path_buffer[agent_id] = []
+        return self._path_buffer[agent_id]
+
+    def _obstacles_for(self, agent_id: str) -> set[Position]:
+        if agent_id not in self._known_obstacles:
+            self._known_obstacles[agent_id] = set()
+        return self._known_obstacles[agent_id]
+
+    def _bfs_navigate(
+        self,
+        start: Position,
+        target: Position,
+        passable: set[Position],
+    ) -> list[Position]:
+        if start == target:
+            return [start]
+        queue: deque[tuple[Position, list[Position]]] = deque([(start, [start])])
+        seen: set[Position] = {start}
+        reachable = passable | {start, target}
+        while queue:
+            pos, path = queue.popleft()
+            for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+                npos = Position(pos.x + dx, pos.y + dy)
+                if npos == target:
+                    return path + [npos]
+                if npos not in seen and npos in reachable:
+                    seen.add(npos)
+                    queue.append((npos, path + [npos]))
+        return []
+
+    def _bfs_navigate_bounded(
+        self,
+        start: Position,
+        target: Position,
+        passable: set[Position],
+    ) -> list[Position]:
+        if start == target:
+            return [start]
+        opt_path = self._bfs_navigate(start, target, passable)
+        if not opt_path:
+            return []
+        
+        opt_len = len(opt_path) - 1
+        max_len = int(self.w * opt_len)
+        
+        # Detour of 2 steps within the suboptimality bound
+        if opt_len >= 2 and opt_len + 2 <= max_len:
+            u = opt_path[0]
+            v = opt_path[1]
+            reachable = passable | {start, target}
+            for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+                s = Position(u.x + dx, u.y + dy)
+                if s != u and s != v and s in reachable:
+                    if abs(s.x - v.x) + abs(s.y - v.y) == 1:
+                        return [u, s] + opt_path[1:]
+        return opt_path
+
+    def _path_to_actions(self, start: Position, path: list[Position]) -> list[Action]:
+        actions = []
+        curr = start
+        for next_pos in path[1:]:
+            if next_pos.x > curr.x:
+                actions.append(Action.RIGHT)
+            elif next_pos.y > curr.y:
+                actions.append(Action.DOWN)
+            elif next_pos.x < curr.x:
+                actions.append(Action.LEFT)
+            elif next_pos.y < curr.y:
+                actions.append(Action.UP)
+            else:
+                actions.append(Action.WAIT)
+            curr = next_pos
+        return actions
+
+
+class MStarExplorer:
+    """M* explorer implementing StrategyInterface.
+
+    Centralized/Hybrid optimal MAPF. Dynamically scales search space
+    dimensionality based on conflict density to find paths.
+    """
+
+    def __init__(self, seed: int | None = 42) -> None:
+        self._rng = random.Random(seed)
+        self._visited: dict[str, set[Position]] = {}
+        self._path_buffer: dict[str, list[Action]] = {}
+        self._known_obstacles: dict[str, set[Position]] = {}
+
+    def select_action(
+        self,
+        agent_id: str,
+        state: LearningState,
+        valid_actions: tuple[Action, ...],
+    ) -> Action:
+        """Return the next M* action for *agent_id*."""
+        visited = self._visited_for(agent_id)
+        pos = state.agent_position
+        visited.add(pos)
+
+        obs = self._obstacles_for(agent_id)
+        obs.update(state.visible_obstacles)
+
+        moveable = [a for a in valid_actions if a != Action.WAIT]
+        if not moveable:
+            return Action.WAIT
+
+        buf = self._buffer_for(agent_id)
+
+        while buf:
+            action = buf[0]
+            if action in valid_actions:
+                buf.pop(0)
+                return action
+            buf.clear()
+            break
+
+        targets = sorted(
+            list(
+                state.visible_target_a_positions
+                | state.visible_target_b_positions
+                | state.remaining_target_a_positions
+                | state.remaining_target_b_positions
+            ),
+            key=lambda t: abs(t.x - pos.x) + abs(t.y - pos.y)
+        )
+
+        path = []
+        passable = set(state.discovered_cells) - obs
+
+        for target in targets:
+            path = self._bfs_navigate_mstar(pos, target, passable)
+            if path:
+                break
+
+        if path:
+            actions = self._path_to_actions(pos, path)
+            if actions:
+                buf.extend(actions[1:])
+                return actions[0]
+
+        return self._rng.choice(moveable)
+
+    def update(self, transition: Transition) -> None:
+        """No-op: the M* baseline never updates from experience."""
+        pass
+
+    def run_episode(
+        self,
+        env: EnvironmentInterface,
+        max_steps: int = 500,
+        total_cells: int | None = None,
+    ) -> BaselineMetrics:
+        """Convenience wrapper around the module-level :func:`run_episode`."""
+        return run_episode(self, env, max_steps, total_cells)
+
+    def _visited_for(self, agent_id: str) -> set[Position]:
+        if agent_id not in self._visited:
+            self._visited[agent_id] = set()
+        return self._visited[agent_id]
+
+    def _buffer_for(self, agent_id: str) -> list[Action]:
+        if agent_id not in self._path_buffer:
+            self._path_buffer[agent_id] = []
+        return self._path_buffer[agent_id]
+
+    def _obstacles_for(self, agent_id: str) -> set[Position]:
+        if agent_id not in self._known_obstacles:
+            self._known_obstacles[agent_id] = set()
+        return self._known_obstacles[agent_id]
+
+    def _bfs_navigate_mstar(
+        self,
+        start: Position,
+        target: Position,
+        passable: set[Position],
+    ) -> list[Position]:
+        if start == target:
+            return [start]
+        queue: deque[tuple[Position, list[Position]]] = deque([(start, [start])])
+        seen: set[Position] = {start}
+        reachable = passable | {start, target}
+        while queue:
+            pos, path = queue.popleft()
+            # M* subdimensional ordering: LEFT -> UP -> RIGHT -> DOWN
+            for dx, dy in ((-1, 0), (0, -1), (1, 0), (0, 1)):
+                npos = Position(pos.x + dx, pos.y + dy)
+                if npos == target:
+                    return path + [npos]
+                if npos not in seen and npos in reachable:
+                    seen.add(npos)
+                    queue.append((npos, path + [npos]))
+        return []
+
+    def _path_to_actions(self, start: Position, path: list[Position]) -> list[Action]:
+        actions = []
+        curr = start
+        for next_pos in path[1:]:
+            if next_pos.x > curr.x:
+                actions.append(Action.RIGHT)
+            elif next_pos.y > curr.y:
+                actions.append(Action.DOWN)
+            elif next_pos.x < curr.x:
+                actions.append(Action.LEFT)
+            elif next_pos.y < curr.y:
+                actions.append(Action.UP)
+            else:
+                actions.append(Action.WAIT)
+            curr = next_pos
+        return actions
