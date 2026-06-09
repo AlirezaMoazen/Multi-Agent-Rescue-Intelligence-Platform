@@ -39,6 +39,7 @@ export default function useSimulation() {
   const [avgSteps, setAvgSteps] = useState(0);
   const [totalReward, setTotalReward] = useState(0);
   const [explorationRate, setExplorationRate] = useState(1.0);
+  const [baselineComparison, setBaselineComparison] = useState(null);
 
   const connectFn = useRef(null);
 
@@ -146,6 +147,10 @@ export default function useSimulation() {
           setStatus('complete');
           break;
 
+        case 'baseline_comparison':
+          setBaselineComparison(msg.report);
+          break;
+
         case 'stopped':
           setStatus('stopped');
           break;
@@ -201,6 +206,7 @@ export default function useSimulation() {
     setActiveTargets(0);
     setError(null);
     setTrails({});
+    setBaselineComparison(null);
     setStatus('running');
     if (config) {
       send({ type: 'config', data: config });
@@ -234,6 +240,7 @@ export default function useSimulation() {
     avgSteps,
     totalReward,
     explorationRate,
+    baselineComparison,
     trails,
     error,
     start,

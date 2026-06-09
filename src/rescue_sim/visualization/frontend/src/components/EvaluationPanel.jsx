@@ -1,12 +1,3 @@
-import { useEffect, useState } from 'react';
-
-function getApiBaseUrl() {
-  const proto = window.location.protocol;
-  const host = window.location.hostname;
-  const port = import.meta.env.DEV ? '8000' : window.location.port || '8000';
-  return `${proto}//${host}:${port}`;
-}
-
 function formatPercent(value) {
   return `${(value * 100).toFixed(1)}%`;
 }
@@ -15,49 +6,16 @@ function formatNumber(value, digits = 1) {
   return Number(value ?? 0).toFixed(digits);
 }
 
-export default function EvaluationPanel({ refreshKey }) {
-  const [report, setReport] = useState(null);
-  const [error, setError] = useState(null);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    fetch(`${getApiBaseUrl()}/api/evaluation?refresh=${refreshKey}`)
-      .then((response) => {
-        if (!response.ok) {
-          throw new Error(`Evaluation request failed (${response.status})`);
-        }
-        return response.json();
-      })
-      .then((data) => {
-        if (!cancelled) {
-          setReport(data);
-          setError(null);
-        }
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          setError(err.message);
-        }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setLoading(false);
-        }
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [refreshKey]);
-
+export default function EvaluationPanel({ report }) {
   return (
     <div className="card">
       <div className="card-title">Baseline Comparison</div>
 
-      {loading && <div className="evaluation-empty">Loading evaluation...</div>}
-      {error && <div className="evaluation-empty">Evaluation unavailable</div>}
+      {!report && (
+        <div className="evaluation-empty">
+          Run Learned Policy to compare the learned agent against the baseline.
+        </div>
+      )}
 
       {report && (
         <>

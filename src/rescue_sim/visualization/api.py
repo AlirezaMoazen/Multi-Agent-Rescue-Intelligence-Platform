@@ -13,7 +13,7 @@ environment layer and streams the state to the frontend over WebSocket.
 """
 
 import asyncio
-from dataclasses import asdict, replace
+from dataclasses import replace
 import json
 import math
 import random
@@ -31,8 +31,14 @@ from rescue_sim.environment.grid import Position
 from rescue_sim.environment.movement import MovementModel
 from rescue_sim.environment.sensors import CentralSensor
 from rescue_sim.learning.q_learning import QLearningAgent
-from rescue_sim.simulation.evaluation import EvaluationScenario, evaluate_agents
-from rescue_sim.shared import Action, LearningState, RewardEvent, TargetType, calculate_reward
+from rescue_sim.shared import (
+    Action,
+    LearningState,
+    RewardEvent,
+    SPRINT3_REWARD_CONFIG,
+    TargetType,
+    calculate_reward,
+)
 
 app = FastAPI(title="Rescue Sim Visualization API")
 
@@ -104,63 +110,6 @@ async def set_config(config: SimConfig):
 async def health():
     """Health check endpoint for Docker."""
     return {"status": "ok"}
-
-
-@app.get("/api/evaluation")
-async def get_evaluation():
-    """Return baseline vs trained-agent metrics for the visualization dashboard."""
-
-    scenarios = _evaluation_scenarios_from_config(current_config)
-    training_scenarios = _training_scenarios_from_config(current_config)
-    return asdict(evaluate_agents(scenarios=scenarios, training_scenarios=training_scenarios))
-
-
-def _evaluation_scenarios_from_config(config: SimConfig) -> list[EvaluationScenario]:
-    """Build fresh same-config scenarios so dashboard metrics reflect current runs."""
-
-    target_a = math.ceil(config.target_count / 2)
-    target_b = config.target_count - target_a
-    seeds = [random.randint(0, 999999) for _ in range(4)]
-
-    return [
-        EvaluationScenario(
-            name=f"current_config_seed_{seed}",
-            grid_settings=GridSettings(
-                width=config.grid_width,
-                height=config.grid_height,
-                obstacle_probability=config.obstacle_probability,
-                target_a_count=target_a,
-                target_b_count=target_b,
-                random_seed=seed,
-            ),
-            max_steps=config.max_steps,
-            start=_random_start_from_seed(config, seed),
-        )
-        for seed in seeds
-    ]
-
-
-def _training_scenarios_from_config(config: SimConfig) -> list[EvaluationScenario]:
-    target_a = math.ceil(config.target_count / 2)
-    target_b = config.target_count - target_a
-    seeds = [random.randint(0, 999999) for _ in range(4)]
-
-    return [
-        EvaluationScenario(
-            name=f"train_current_config_seed_{seed}",
-            grid_settings=GridSettings(
-                width=config.grid_width,
-                height=config.grid_height,
-                obstacle_probability=config.obstacle_probability,
-                target_a_count=target_a,
-                target_b_count=target_b,
-                random_seed=seed,
-            ),
-            max_steps=config.max_steps,
-            start=_random_start_from_seed(config, seed),
-        )
-        for seed in seeds
-    ]
 
 
 def _random_start_from_seed(config: SimConfig, seed: int) -> Position:
@@ -250,7 +199,8 @@ async def simulation_ws(websocket: WebSocket):
                     rng=random.Random(0),
                 )
 
-            for episode in range(config.num_episodes):
+            total_episodes = 1 if run_mode == "evaluate" else config.num_episodes
+            for episode in range(total_episodes):
                 if should_stop:
                     break
 
@@ -492,6 +442,19 @@ async def simulation_ws(websocket: WebSocket):
                 if run_mode == "train":
                     trained_visual_learner = learner
                     trained_visual_seed = scenario_seed
+                if run_mode == "evaluate" and episode_metrics:
+                    await websocket.send_json(
+                        {
+                            "type": "baseline_comparison",
+                            "report": _build_run_comparison_report(
+                                grid=grid,
+                                start=start_pos,
+                                config=config,
+                                trained_metric=episode_metrics[-1],
+                                trained_explored_cells=len(visited_positions),
+                            ),
+                        }
+                    )
                 await websocket.send_json(
                     {
                         "type": "training_complete",
@@ -543,6 +506,143 @@ def _movement_actions_first(actions: tuple[Action, ...]) -> tuple[Action, ...]:
 
     moving_actions = tuple(action for action in actions if action != Action.WAIT)
     return moving_actions or actions
+
+
+def _build_run_comparison_report(
+    grid: object,
+    start: Position,
+    config: SimConfig,
+    trained_metric: dict,
+    trained_explored_cells: int,
+) -> dict:
+    baseline = _run_baseline_on_visual_grid(grid, start, config)
+    trained = _metric_to_comparison_row(
+        agent_name="trained",
+        metric=trained_metric,
+        explored_cells=trained_explored_cells,
+        explorable_cells=_explorable_cell_count(grid),
+    )
+
+    return {
+        "aggregates": [baseline, trained],
+        "sprint_demo_summary": (
+            "Baseline comparison for the latest Run Learned Policy execution.\n"
+            f"baseline: success_rate={baseline['success_rate']:.2f}, "
+            f"steps={baseline['average_steps']:.1f}, "
+            f"reward={baseline['average_accumulated_reward']:.1f}, "
+            f"rescued_targets={baseline['average_rescued_targets']:.1f}, "
+            f"explored_area={baseline['average_explored_area_percentage']:.1f}%, "
+            f"num_agents={baseline['num_agents']}\n"
+            f"trained: success_rate={trained['success_rate']:.2f}, "
+            f"steps={trained['average_steps']:.1f}, "
+            f"reward={trained['average_accumulated_reward']:.1f}, "
+            f"rescued_targets={trained['average_rescued_targets']:.1f}, "
+            f"explored_area={trained['average_explored_area_percentage']:.1f}%, "
+            f"num_agents={trained['num_agents']}"
+        ),
+    }
+
+
+def _run_baseline_on_visual_grid(grid: object, start: Position, config: SimConfig) -> dict:
+    movement = MovementModel()
+    sensor = CentralSensor(grid)
+    position = start
+    visited = {start}
+    found_targets: set[Position] = set()
+    all_targets = set(grid.target_a_positions) | set(grid.target_b_positions)
+    total_reward = 0.0
+    steps = 0
+    observation = sensor.observe("baseline", position, config.sensor_range)
+
+    for step in range(config.max_steps):
+        if found_targets == all_targets:
+            break
+
+        action = _baseline_action(grid, position, visited)
+        movement_result = movement.apply(grid, position, action.value)
+        next_position = movement_result.end
+        next_observation = sensor.observe("baseline", next_position, config.sensor_range)
+
+        repeated_cell = next_position in visited
+        newly_discovered_cells = 0
+        if next_position not in visited:
+            visited.add(next_position)
+            newly_discovered_cells = 1
+
+        rescued_target_type = None
+        target_type = grid.target_type_at(next_position)
+        if target_type is not None and next_position not in found_targets:
+            found_targets.add(next_position)
+            rescued_target_type = TargetType(target_type)
+
+        total_reward += calculate_reward(
+            RewardEvent(
+                moved=movement_result.moved,
+                move=action.value,
+                newly_discovered_cells=len(next_observation.newly_discovered_cells)
+                or newly_discovered_cells,
+                rescued_target_type=rescued_target_type,
+                completed_episode=found_targets == all_targets,
+                repeated_cell=repeated_cell,
+            ),
+            SPRINT3_REWARD_CONFIG,
+        )
+
+        position = next_position
+        observation = next_observation
+        steps = step + 1
+
+    del observation
+    success = found_targets == all_targets
+    metric = {
+        "success": success,
+        "steps": steps,
+        "rescued_count": len(found_targets),
+        "target_count": len(all_targets),
+        "total_reward": round(total_reward, 2),
+    }
+    return _metric_to_comparison_row(
+        agent_name="baseline",
+        metric=metric,
+        explored_cells=len(visited),
+        explorable_cells=_explorable_cell_count(grid),
+    )
+
+def _metric_to_comparison_row(
+    agent_name: str,
+    metric: dict,
+    explored_cells: int,
+    explorable_cells: int,
+) -> dict:
+    explored = explored_cells / explorable_cells * 100 if explorable_cells else 0.0
+    success = 1.0 if metric["success"] else 0.0
+    return {
+        "agent_name": agent_name,
+        "num_agents": 1,
+        "scenario_count": 1,
+        "success_rate": round(success, 4),
+        "average_steps": float(metric["steps"]),
+        "average_accumulated_reward": float(metric["total_reward"]),
+        "average_rescued_targets": float(metric["rescued_count"]),
+        "average_explored_area_percentage": round(explored, 4),
+    }
+
+
+def _baseline_action(grid: object, position: Position, visited: set[Position]) -> Action:
+    for action in (Action.RIGHT, Action.DOWN, Action.LEFT, Action.UP):
+        next_position = _next_position(position, action)
+        if grid.is_valid_position(next_position) and next_position not in visited:
+            return action
+
+    for action in (Action.RIGHT, Action.DOWN, Action.LEFT, Action.UP):
+        if grid.is_valid_position(_next_position(position, action)):
+            return action
+
+    return Action.WAIT
+
+
+def _explorable_cell_count(grid: object) -> int:
+    return grid.width * grid.height - len(grid.obstacles)
 
 
 def _would_repeat_cell(

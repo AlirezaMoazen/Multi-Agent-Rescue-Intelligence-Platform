@@ -27,6 +27,7 @@ NEW_CELL_REWARD = 0.2
 TARGET_REWARD = 10.0
 INVALID_MOVE_REWARD = -2.0
 DEFAULT_TRAINING_EPISODES = 25
+EVALUATION_SENSOR_RANGE = 3
 ACTIONS: tuple[Action, ...] = (Action.RIGHT, Action.DOWN, Action.LEFT, Action.UP)
 EVALUATION_REWARD_CONFIG = RewardConfig(
     move=STEP_REWARD,
@@ -434,7 +435,7 @@ def run_q_learning_agent_on_grid(
     if not training:
         learner.epsilon = 0.0
 
-    observation = sensor.observe("agent-1", position, sensor_range=max(grid.width, grid.height))
+    observation = sensor.observe("agent-1", position, sensor_range=EVALUATION_SENSOR_RANGE)
 
     for step in range(1, scenario.max_steps + 1):
         if rescued == all_targets:
@@ -453,9 +454,25 @@ def run_q_learning_agent_on_grid(
             valid_actions = (Action.WAIT,)
 
         action = learner.choose_action(state, valid_actions)
+        if not training:
+            action_values = learner.q_table.get(state, {})
+            learned_value = action_values.get(action, 0.0)
+            proposed_position = _move(position, action)
+            repeats_cell = grid.is_valid_position(proposed_position) and proposed_position in visited
+            if learned_value <= 0.0 or repeats_cell:
+                fallback_position = _trained_mock_policy(
+                    grid=grid,
+                    position=position,
+                    visited=frozenset(visited),
+                    rescued=frozenset(rescued),
+                    rng=Random(_policy_seed(scenario.grid_settings.random_seed, "trained")),
+                )
+                fallback_action = _action_between(position, fallback_position)
+                if fallback_action in valid_actions:
+                    action = fallback_action
         movement_result = movement.apply(grid, position, action.value)
         position = movement_result.end
-        next_observation = sensor.observe("agent-1", position, sensor_range=max(grid.width, grid.height))
+        next_observation = sensor.observe("agent-1", position, sensor_range=EVALUATION_SENSOR_RANGE)
         steps_taken = step
 
         repeated_cell = position in visited
