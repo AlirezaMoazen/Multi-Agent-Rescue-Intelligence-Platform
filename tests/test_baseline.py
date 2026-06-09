@@ -140,9 +140,13 @@ class _SimpleEnv:
 
         reward = -0.1 if result.moved else -1.0
         if self._pos in self._active_a:
-            self._active_a.discard(self._pos); self._rescued_a.add(self._pos); reward = 10.0
+            self._active_a.discard(self._pos)
+            self._rescued_a.add(self._pos)
+            reward = 10.0
         elif self._pos in self._active_b:
-            self._active_b.discard(self._pos); self._rescued_b.add(self._pos); reward = 10.0
+            self._active_b.discard(self._pos)
+            self._rescued_b.add(self._pos)
+            reward = 10.0
 
         self._steps += 1
         done = (not self._active_a and not self._active_b) or self._steps >= self.ep_max
