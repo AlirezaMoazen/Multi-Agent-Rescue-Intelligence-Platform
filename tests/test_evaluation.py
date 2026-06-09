@@ -1,16 +1,20 @@
-from rescue_sim.config.settings import GridSettings
+from random import Random
+
 from rescue_sim.environment.grid import Position
+from rescue_sim.environment.generator import generate_grid
+from rescue_sim.learning.q_learning import QLearningAgent
 from rescue_sim.simulation.evaluation import (
+    ACTIONS,
+    EVALUATION_REWARD_CONFIG,
     EvaluationScenario,
     RunTrace,
-    TrainableSingleAgent,
     calculate_run_metrics,
     evaluate_agents,
-    run_learning_episode,
     report_to_csv,
     report_to_json,
+    train_q_learning_agent,
 )
-from rescue_sim.environment.generator import generate_grid
+from rescue_sim.shared import GridSettings
 
 
 def test_calculate_run_metrics_reports_success_and_exploration() -> None:
@@ -128,12 +132,22 @@ def test_learning_episode_updates_agent_q_values() -> None:
         max_steps=20,
     )
     grid = generate_grid(scenario.grid_settings, start=scenario.start)
-    learner = TrainableSingleAgent(seed=9)
+    learner = QLearningAgent(
+        actions=ACTIONS,
+        epsilon=0.2,
+        reward_config=EVALUATION_REWARD_CONFIG,
+        rng=Random(9),
+    )
 
-    trace = run_learning_episode(scenario=scenario, grid=grid, learner=learner)
+    feedback = train_q_learning_agent(
+        learner=learner,
+        scenario=scenario,
+        grid=grid,
+        training_episodes=2,
+    )
 
-    assert trace.episode_steps
-    assert learner.q_values
+    assert feedback.learned_state_actions > 0
+    assert learner.q_table
 
 
 def test_default_evaluation_separates_training_and_test_scenarios() -> None:

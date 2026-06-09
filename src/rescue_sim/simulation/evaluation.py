@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import asdict, dataclass
 import csv
 import io
@@ -10,13 +9,12 @@ import json
 from random import Random
 from typing import Callable, Iterable, Literal
 
-from rescue_sim.config.settings import GridSettings
 from rescue_sim.environment.generator import generate_grid
 from rescue_sim.environment.grid import Grid, Position
 from rescue_sim.environment.movement import MovementModel
 from rescue_sim.environment.sensors import CentralSensor
 from rescue_sim.learning.q_learning import QLearningAgent
-from rescue_sim.shared import Action, RewardConfig, RewardEvent, TargetType, calculate_reward
+from rescue_sim.shared import Action, GridSettings, RewardConfig, RewardEvent, TargetType, calculate_reward
 
 AgentName = Literal["baseline", "trained"]
 Policy = Callable[[Grid, Position, frozenset[Position], frozenset[Position], Random], Position]
@@ -454,22 +452,6 @@ def run_q_learning_agent_on_grid(
             valid_actions = (Action.WAIT,)
 
         action = learner.choose_action(state, valid_actions)
-        if not training:
-            action_values = learner.q_table.get(state, {})
-            learned_value = action_values.get(action, 0.0)
-            proposed_position = _move(position, action)
-            repeats_cell = grid.is_valid_position(proposed_position) and proposed_position in visited
-            if learned_value <= 0.0 or repeats_cell:
-                fallback_position = _trained_mock_policy(
-                    grid=grid,
-                    position=position,
-                    visited=frozenset(visited),
-                    rescued=frozenset(rescued),
-                    rng=Random(_policy_seed(scenario.grid_settings.random_seed, "trained")),
-                )
-                fallback_action = _action_between(position, fallback_position)
-                if fallback_action in valid_actions:
-                    action = fallback_action
         movement_result = movement.apply(grid, position, action.value)
         position = movement_result.end
         next_observation = sensor.observe("agent-1", position, sensor_range=EVALUATION_SENSOR_RANGE)
@@ -553,144 +535,6 @@ def run_q_learning_agent_on_grid(
     )
 
 
-def train_single_agent(
-    learner: "TrainableSingleAgent",
-    scenario: EvaluationScenario,
-    grid: Grid,
-    training_episodes: int,
-) -> LearningFeedback:
-    """Feed repeated scenario experience to the trainable agent before evaluation."""
-
-    episode_traces: list[RunTrace] = []
-
-    for episode_number in range(training_episodes):
-        learner.start_episode(episode_number)
-        trace = run_learning_episode(scenario=scenario, grid=grid, learner=learner)
-        episode_traces.append(trace)
-
-    first_trace = episode_traces[0]
-    last_trace = episode_traces[-1]
-    return LearningFeedback(
-        scenario_name=scenario.name,
-        training_episodes=training_episodes,
-        first_episode_steps=first_trace.steps_taken,
-        last_episode_steps=last_trace.steps_taken,
-        first_episode_reward=first_trace.total_reward,
-        last_episode_reward=last_trace.total_reward,
-        learned_state_actions=len(learner.q_values),
-    )
-
-
-def run_learning_episode(
-    scenario: EvaluationScenario,
-    grid: Grid,
-    learner: "TrainableSingleAgent",
-) -> RunTrace:
-    """Run one training episode and pass each reward back to the learner."""
-
-    position = scenario.start
-    visited = {position}
-    rescued: set[Position] = set()
-    all_targets = grid.target_a_positions | grid.target_b_positions
-    total_reward = 0.0
-    episode_steps: list[EpisodeStep] = []
-    steps_taken = 0
-
-    for step in range(1, scenario.max_steps + 1):
-        if rescued == all_targets:
-            break
-
-        previous_position = position
-        action = learner.choose_action(position, training=True)
-        proposed_position = _move(position, action)
-        steps_taken = step
-        moved = False
-
-        if grid.is_valid_position(proposed_position):
-            position = proposed_position
-            moved = position != previous_position
-
-        newly_discovered_cells = 0
-        if position not in visited:
-            visited.add(position)
-            newly_discovered_cells = 1
-
-        rescued_target_type = None
-        if position in all_targets and position not in rescued:
-            rescued.add(position)
-            rescued_target_type = _target_type_enum(grid, position)
-
-        done = rescued == all_targets
-        step_reward = calculate_reward(
-            RewardEvent(
-                moved=moved,
-                move=action.value,
-                newly_discovered_cells=newly_discovered_cells,
-                rescued_target_type=rescued_target_type,
-                completed_episode=done,
-            ),
-            EVALUATION_REWARD_CONFIG,
-        )
-        learner.learn(previous_position, action, step_reward, position, done)
-        total_reward += step_reward
-        episode_steps.append(
-            EpisodeStep(
-                state=previous_position,
-                action=action,
-                reward=round(step_reward, 4),
-                next_state=position,
-                rescued_targets=len(rescued),
-                explored_cells=len(visited),
-            )
-        )
-
-    return RunTrace(
-        scenario_name=scenario.name,
-        agent_name="trained",
-        seed=scenario.grid_settings.random_seed,
-        num_agents=NUM_AGENTS,
-        steps_taken=steps_taken,
-        max_steps=scenario.max_steps,
-        total_reward=round(total_reward, 4),
-        rescued_targets=len(rescued),
-        total_targets=len(all_targets),
-        explored_cells=len(visited),
-        explorable_cells=_explorable_cell_count(grid),
-        episode_steps=tuple(episode_steps),
-    )
-
-
-def run_trained_agent_on_grid(
-    scenario: EvaluationScenario,
-    grid: Grid,
-    learner: "TrainableSingleAgent",
-) -> RunTrace:
-    """Evaluate a trained learner without exploration noise."""
-
-    def learned_policy(
-        grid: Grid,
-        position: Position,
-        visited: frozenset[Position],
-        rescued: frozenset[Position],
-        rng: Random,
-    ) -> Position:
-        action = learner.choose_action(position, training=False)
-        learned_value = learner.q_values.get((position, action), 0.0)
-        learned_position = _move(position, action)
-
-        if learned_value > 0.0 and grid.is_valid_position(learned_position):
-            return learned_position
-
-        return _trained_mock_policy(grid, position, visited, rescued, rng)
-
-    return run_agent_on_grid(
-        scenario=scenario,
-        grid=grid,
-        agent_name="trained",
-        policy=learned_policy,
-    )
-
-
 def calculate_run_metrics(trace: RunTrace) -> RunMetrics:
     """Convert raw trace data into normalized evaluation metrics."""
 
@@ -714,57 +558,6 @@ def calculate_run_metrics(trace: RunTrace) -> RunMetrics:
         total_targets=trace.total_targets,
         explored_area_percentage=round(explored_percentage, 2),
     )
-
-
-class TrainableSingleAgent:
-    """Small Q-learning agent used until the real trained branch is integrated."""
-
-    def __init__(
-        self,
-        seed: int,
-        learning_rate: float = 0.4,
-        discount_factor: float = 0.9,
-        exploration_rate: float = 0.25,
-    ) -> None:
-        self.learning_rate = learning_rate
-        self.discount_factor = discount_factor
-        self.exploration_rate = exploration_rate
-        self.rng = Random(seed)
-        self.q_values: dict[tuple[Position, Action], float] = {}
-
-    def start_episode(self, episode_number: int) -> None:
-        """Reduce exploration over time so later episodes exploit more learned paths."""
-
-        self.exploration_rate = max(0.05, self.exploration_rate * (0.96**episode_number))
-
-    def choose_action(self, position: Position, training: bool) -> Action:
-        if training and self.rng.random() < self.exploration_rate:
-            return self.rng.choice(ACTIONS)
-
-        return max(
-            ACTIONS,
-            key=lambda action: (
-                self.q_values.get((position, action), 0.0),
-                -ACTIONS.index(action),
-            ),
-        )
-
-    def learn(
-        self,
-        state: Position,
-        action: Action,
-        reward: float,
-        next_state: Position,
-        done: bool,
-    ) -> None:
-        current_value = self.q_values.get((state, action), 0.0)
-        future_value = 0.0 if done else max(
-            self.q_values.get((next_state, next_action), 0.0) for next_action in ACTIONS
-        )
-        updated_value = current_value + self.learning_rate * (
-            reward + self.discount_factor * future_value - current_value
-        )
-        self.q_values[(state, action)] = round(updated_value, 6)
 
 
 def report_to_json(report: EvaluationReport) -> str:
@@ -805,13 +598,6 @@ def build_sprint_demo_summary(aggregates: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _default_policies() -> dict[AgentName, Policy]:
-    return {
-        "baseline": _baseline_policy,
-        "trained": _trained_mock_policy,
-    }
-
-
 def _baseline_policy(
     grid: Grid,
     position: Position,
@@ -829,54 +615,6 @@ def _baseline_policy(
     return valid_neighbors[0] if valid_neighbors else position
 
 
-def _trained_mock_policy(
-    grid: Grid,
-    position: Position,
-    visited: frozenset[Position],
-    rescued: frozenset[Position],
-    rng: Random,
-) -> Position:
-    del rng
-
-    remaining_targets = (grid.target_a_positions | grid.target_b_positions) - rescued
-    next_step = _next_step_towards_any(grid, position, remaining_targets)
-    if next_step is not None:
-        return next_step
-
-    unvisited = frozenset(_all_free_positions(grid)) - visited
-    next_step = _next_step_towards_any(grid, position, unvisited)
-    if next_step is not None:
-        return next_step
-
-    valid_neighbors = [neighbor for neighbor in _neighbors(position) if grid.is_valid_position(neighbor)]
-    return valid_neighbors[0] if valid_neighbors else position
-
-
-def _next_step_towards_any(
-    grid: Grid,
-    start: Position,
-    goals: frozenset[Position],
-) -> Position | None:
-    if not goals:
-        return None
-
-    queue: deque[tuple[Position, Position | None]] = deque([(start, None)])
-    seen = {start}
-
-    while queue:
-        current, first_step = queue.popleft()
-        if current in goals:
-            return first_step
-
-        for neighbor in _neighbors(current):
-            if neighbor in seen or not grid.is_valid_position(neighbor):
-                continue
-            seen.add(neighbor)
-            queue.append((neighbor, neighbor if first_step is None else first_step))
-
-    return None
-
-
 def _neighbors(position: Position) -> tuple[Position, Position, Position, Position]:
     return (
         Position(position.x + 1, position.y),
@@ -884,16 +622,6 @@ def _neighbors(position: Position) -> tuple[Position, Position, Position, Positi
         Position(position.x - 1, position.y),
         Position(position.x, position.y - 1),
     )
-
-
-def _move(position: Position, action: Action) -> Position:
-    if action == Action.RIGHT:
-        return Position(position.x + 1, position.y)
-    if action == Action.DOWN:
-        return Position(position.x, position.y + 1)
-    if action == Action.LEFT:
-        return Position(position.x - 1, position.y)
-    return Position(position.x, position.y - 1)
 
 
 def _action_between(current: Position, next_position: Position) -> Action:
@@ -913,15 +641,6 @@ def _target_type_enum(grid: Grid, position: Position) -> TargetType | None:
     if target_type == "B":
         return TargetType.B
     return None
-
-
-def _all_free_positions(grid: Grid) -> list[Position]:
-    return [
-        Position(x, y)
-        for y in range(grid.height)
-        for x in range(grid.width)
-        if grid.is_valid_position(Position(x, y))
-    ]
 
 
 def _explorable_cell_count(grid: Grid) -> int:
