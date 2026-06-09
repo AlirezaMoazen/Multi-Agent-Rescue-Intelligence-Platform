@@ -33,13 +33,17 @@ COPY src/rescue_sim/visualization/frontend/package.json \
 RUN cd /app/src/rescue_sim/visualization/frontend && npm ci --ignore-scripts 2>/dev/null || npm install
 
 COPY src/rescue_sim/visualization/frontend/ /app/src/rescue_sim/visualization/frontend/
-RUN cd /app/src/rescue_sim/visualization/frontend && npm run build
+RUN cd /app/src/rescue_sim/visualization/frontend && npm run build && \
+    mkdir -p /app/frontend_dist && \
+    cp -r dist/* /app/frontend_dist/
 
 # ── Copy all project files ──────────────────────────────────────────────
 COPY . .
 
 # Re-install the project in editable mode now that all source is available
 RUN pip install -e ".[dev]" 2>/dev/null || true
+
+ENV FRONTEND_DIST_DIR=/app/frontend_dist
 
 EXPOSE 8000
 

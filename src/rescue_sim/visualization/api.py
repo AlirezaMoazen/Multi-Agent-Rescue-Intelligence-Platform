@@ -16,6 +16,7 @@ import asyncio
 from dataclasses import replace
 import json
 import math
+import os
 import random
 from pathlib import Path
 
@@ -54,9 +55,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # Serve the built frontend if it exists (for Docker production mode)
-_THIS_DIR = Path(__file__).resolve().parent
-_FRONTEND_DIST = _THIS_DIR / "frontend" / "dist"
+_FRONTEND_DIST_ENV = os.environ.get("FRONTEND_DIST_DIR")
+if _FRONTEND_DIST_ENV:
+    _FRONTEND_DIST = Path(_FRONTEND_DIST_ENV)
+else:
+    _THIS_DIR = Path(__file__).resolve().parent
+    _FRONTEND_DIST = _THIS_DIR / "frontend" / "dist"
+
 if _FRONTEND_DIST.is_dir():
     app.mount(
         "/app",

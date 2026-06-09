@@ -171,4 +171,36 @@ CI installs the package with:
 python -m pip install -e ".[dev]"
 ```
 
+## Docker Support
+
+The project is fully containerized using **Docker** and **Docker Compose**. The Docker configuration automatically builds and serves the updated React frontend assets while hot-reloading backend Python files when you make local edits.
+
+### Requirements
+Ensure you have Docker and Docker Compose installed.
+
+### Quick Start
+To build the image and start the visualization dashboard on port `8000`:
+```bash
+docker compose up --build viz
+```
+Open [http://localhost:8000/app](http://localhost:8000/app) in your browser.
+
+### Interactive Development Shell
+To open a bash shell inside the container:
+```bash
+docker compose run --rm dev
+```
+
+### Running Tests inside Docker
+To execute the test suite in the containerized environment:
+```bash
+docker compose run --rm test
+```
+
+### Running Linting inside Docker
+To check the codebase with Ruff:
+```bash
+docker compose run --rm lint
+```
+
 
