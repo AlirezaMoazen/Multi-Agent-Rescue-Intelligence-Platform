@@ -8,18 +8,18 @@ import MetricsChart from './components/MetricsChart';
 import EvaluationPanel from './components/EvaluationPanel';
 
 const DEFAULT_CONFIG = {
-  grid_width: 8,
-  grid_height: 8,
-  obstacle_probability: 0.1,
-  target_count: 2,
+  grid_width: 20,
+  grid_height: 20,
+  obstacle_probability: 0.15,
+  target_count: 4,
   num_agents: 1,
   sensor_range: 3,
   max_steps: 500,
-  num_episodes: 60,
-  learning_rate: 0.5,
+  num_episodes: 50,
+  learning_rate: 0.1,
   discount_factor: 0.9,
-  exploration_rate: 0.8,
-  speed_ms: 30,
+  exploration_rate: 1.0,
+  speed_ms: 100,
   run_mode: 'train',
 };
 

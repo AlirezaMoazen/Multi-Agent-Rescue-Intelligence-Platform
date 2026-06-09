@@ -75,18 +75,18 @@ if _FRONTEND_DIST.is_dir():
 
 # ── Pydantic models for config ─────────────────────────────────────────────
 class SimConfig(BaseModel):
-    grid_width: int = 8
-    grid_height: int = 8
-    obstacle_probability: float = 0.1
-    target_count: int = 2
+    grid_width: int = 20
+    grid_height: int = 20
+    obstacle_probability: float = 0.15
+    target_count: int = 4
     num_agents: int = 1
     sensor_range: int = 3
     max_steps: int = 500
-    num_episodes: int = 60
-    learning_rate: float = 0.5
+    num_episodes: int = 50
+    learning_rate: float = 0.1
     discount_factor: float = 0.9
-    exploration_rate: float = 0.8
-    speed_ms: int = 30  # delay between steps in ms
+    exploration_rate: float = 1.0
+    speed_ms: int = 100  # delay between steps in ms
     run_mode: str = "train"  # train | evaluate | instant_train
 
 
