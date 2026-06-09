@@ -78,6 +78,7 @@ class SimConfig(BaseModel):
 # ── Global state ────────────────────────────────────────────────────────────
 current_config = SimConfig()
 trained_visual_learner: QLearningAgent | None = None
+trained_visual_seed: int | None = None
 
 
 # ── REST endpoints ──────────────────────────────────────────────────────────
@@ -141,7 +142,7 @@ def _evaluation_scenarios_from_config(config: SimConfig) -> list[EvaluationScena
 @app.websocket("/ws/simulation")
 async def simulation_ws(websocket: WebSocket):
     await websocket.accept()
-    global current_config, trained_visual_learner
+    global current_config, trained_visual_learner, trained_visual_seed
 
     try:
         while True:
@@ -197,7 +198,7 @@ async def simulation_ws(websocket: WebSocket):
             should_stop = False
             scenario_seed = random.randint(0, 999999)
             if run_mode == "evaluate":
-                if trained_visual_learner is None:
+                if trained_visual_learner is None or trained_visual_seed is None:
                     await websocket.send_json(
                         {
                             "type": "error",
@@ -205,6 +206,7 @@ async def simulation_ws(websocket: WebSocket):
                         }
                     )
                     continue
+                scenario_seed = trained_visual_seed
                 learner = trained_visual_learner
                 learner.epsilon = 0.0
             else:
@@ -439,6 +441,7 @@ async def simulation_ws(websocket: WebSocket):
             if not should_stop:
                 if run_mode == "train":
                     trained_visual_learner = learner
+                    trained_visual_seed = scenario_seed
                 await websocket.send_json(
                     {
                         "type": "training_complete",
