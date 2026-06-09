@@ -5,13 +5,14 @@ import GridCanvas from './components/GridCanvas';
 import ControlPanel from './components/ControlPanel';
 import ParameterPanel from './components/ParameterPanel';
 import MetricsChart from './components/MetricsChart';
+import EvaluationPanel from './components/EvaluationPanel';
 
 const DEFAULT_CONFIG = {
   grid_width: 20,
   grid_height: 20,
   obstacle_probability: 0.15,
   target_count: 4,
-  num_agents: 2,
+  num_agents: 1,
   sensor_range: 3,
   max_steps: 500,
   num_episodes: 50,
@@ -19,6 +20,7 @@ const DEFAULT_CONFIG = {
   discount_factor: 0.9,
   exploration_rate: 1.0,
   speed_ms: 100,
+  run_mode: 'train',
 };
 
 export default function App() {
@@ -29,7 +31,15 @@ export default function App() {
   const isComplete = sim.status === 'complete';
 
   const handleStart = () => {
-    sim.start({ ...config });
+    const nextConfig = { ...config, run_mode: 'train' };
+    setConfig(nextConfig);
+    sim.start(nextConfig);
+  };
+
+  const handleRunLearned = () => {
+    const nextConfig = { ...config, run_mode: 'evaluate' };
+    setConfig(nextConfig);
+    sim.start(nextConfig);
   };
 
   const handleStop = () => {
@@ -136,6 +146,7 @@ export default function App() {
           <ControlPanel
             status={sim.status}
             onStart={handleStart}
+            onRunLearned={handleRunLearned}
             onStop={handleStop}
             onRestart={handleRestart}
             speed={config.speed_ms}
@@ -148,6 +159,7 @@ export default function App() {
         <div className="side-panel">
           <ParameterPanel config={config} onChange={setConfig} disabled={isRunning} />
           <MetricsChart metrics={sim.episodeMetrics} />
+          <EvaluationPanel report={sim.baselineComparison} />
         </div>
       </main>
     </div>

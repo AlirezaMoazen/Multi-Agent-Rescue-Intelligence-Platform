@@ -396,6 +396,70 @@ body {
   border-radius: var(--radius-sm);
 }
 
+/* Evaluation Panel */
+.evaluation-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+}
+
+.evaluation-agent {
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  background: var(--bg-glass);
+}
+
+.evaluation-agent-name {
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.evaluation-main {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 6px;
+  color: var(--accent-green);
+  font-size: 1.45rem;
+  font-weight: 800;
+}
+
+.evaluation-main span {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  font-weight: 600;
+}
+
+.evaluation-stats {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 5px 10px;
+  margin-top: 10px;
+  font-size: 0.74rem;
+}
+
+.evaluation-stats span {
+  color: var(--text-muted);
+}
+
+.evaluation-stats strong {
+  color: var(--text-primary);
+  font-weight: 700;
+}
+
+.evaluation-summary,
+.evaluation-empty {
+  margin-top: 12px;
+  color: var(--text-secondary);
+  font-size: 0.74rem;
+  line-height: 1.45;
+  white-space: pre-line;
+}
+
 /* ── Connection indicator ────────────────────────────────────────────── */
 .connection-dot {
   width: 8px;

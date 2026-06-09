@@ -13,6 +13,7 @@ environment layer and streams the state to the frontend over WebSocket.
 """
 
 import asyncio
+from dataclasses import replace
 import json
 import math
 import random
@@ -27,7 +28,19 @@ from pydantic import BaseModel
 from rescue_sim.config.settings import GridSettings
 from rescue_sim.environment.generator import generate_grid
 from rescue_sim.environment.grid import Position
-from rescue_sim.environment.helper import EnvironmentHelper
+from rescue_sim.environment.movement import MovementModel
+from rescue_sim.environment.sensors import CentralSensor
+from rescue_sim.learning.baseline import BaselineExplorer, DFSExplorer
+from rescue_sim.learning.q_learning import QLearningAgent
+from rescue_sim.shared import (
+    Action,
+    LearningState,
+    RewardEvent,
+    SPRINT3_REWARD_CONFIG,
+    TargetType,
+    Transition,
+    calculate_reward,
+)
 
 app = FastAPI(title="Rescue Sim Visualization API")
 
@@ -67,10 +80,13 @@ class SimConfig(BaseModel):
     discount_factor: float = 0.9
     exploration_rate: float = 1.0
     speed_ms: int = 100  # delay between steps in ms
+    run_mode: str = "train"  # train | evaluate
 
 
 # ── Global state ────────────────────────────────────────────────────────────
 current_config = SimConfig()
+trained_visual_learner: QLearningAgent | None = None
+trained_visual_seed: int | None = None
 
 
 # ── REST endpoints ──────────────────────────────────────────────────────────
@@ -98,11 +114,19 @@ async def health():
     return {"status": "ok"}
 
 
+def _random_start_from_seed(config: SimConfig, seed: int) -> Position:
+    rng = random.Random(seed + 50_000)
+    return Position(
+        rng.randrange(config.grid_width),
+        rng.randrange(config.grid_height),
+    )
+
+
 # ── WebSocket simulation stream ────────────────────────────────────────────
 @app.websocket("/ws/simulation")
 async def simulation_ws(websocket: WebSocket):
     await websocket.accept()
-    global current_config
+    global current_config, trained_visual_learner, trained_visual_seed
 
     try:
         while True:
@@ -121,6 +145,7 @@ async def simulation_ws(websocket: WebSocket):
                 continue
 
             config = current_config
+            run_mode = config.run_mode if config.run_mode in {"train", "evaluate"} else "train"
 
             # ── Validation ────────────────────────────────────────────────
             if (
@@ -155,12 +180,33 @@ async def simulation_ws(websocket: WebSocket):
 
             episode_metrics: list[dict] = []
             should_stop = False
+            scenario_seed = random.randint(0, 999999)
+            if run_mode == "evaluate":
+                if trained_visual_learner is None or trained_visual_seed is None:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "message": "No trained policy is available yet. Run Train first.",
+                        }
+                    )
+                    continue
+                scenario_seed = trained_visual_seed
+                learner = trained_visual_learner
+                learner.epsilon = 0.0
+            else:
+                learner = QLearningAgent(
+                    learning_rate=config.learning_rate,
+                    discount_factor=config.discount_factor,
+                    epsilon=config.exploration_rate,
+                    rng=random.Random(0),
+                )
 
-            for episode in range(config.num_episodes):
+            total_episodes = 1 if run_mode == "evaluate" else config.num_episodes
+            for episode in range(total_episodes):
                 if should_stop:
                     break
 
-                seed = random.randint(0, 999999)
+                seed = scenario_seed
 
                 # ── Generate grid using environment.generator ─────────────
                 target_a = math.ceil(config.target_count / 2)
@@ -175,7 +221,7 @@ async def simulation_ws(websocket: WebSocket):
                     random_seed=seed,
                 )
 
-                start_pos = Position(0, 0)
+                start_pos = _random_start_from_seed(config, seed)
 
                 try:
                     grid = generate_grid(settings, start_pos)
@@ -200,8 +246,15 @@ async def simulation_ws(websocket: WebSocket):
                 for p in grid.target_b_positions:
                     targets.append({"x": p.x, "y": p.y, "type": "B"})
 
-                # Create our EnvironmentHelper to run sensors, movement, and grid logic
-                helper = EnvironmentHelper(grid, start_pos, config.sensor_range)
+                movement = MovementModel()
+                sensor = CentralSensor(grid)
+                position = start_pos
+                found_targets: set[Position] = set()
+                active_targets = set(grid.target_a_positions) | set(grid.target_b_positions)
+                rescued: list[dict] = []
+                visited_positions = {start_pos}
+                total_reward = 0.0
+                observation = sensor.observe("agent-1", position, config.sensor_range)
 
                 # Send initial state
                 await websocket.send_json(
@@ -223,7 +276,7 @@ async def simulation_ws(websocket: WebSocket):
                 steps = 0
 
                 for step in range(config.max_steps):
-                    if not helper.has_active_targets():
+                    if not active_targets:
                         break
 
                     # Check for cancellation or speed update
@@ -243,8 +296,84 @@ async def simulation_ws(websocket: WebSocket):
                     except asyncio.TimeoutError:
                         pass
 
-                    # Step the environment using the helper
-                    agent_state = helper.step(step)
+                    state = _visual_learning_state(
+                        learner=learner,
+                        observation=observation,
+                        grid=grid,
+                        found_targets=frozenset(found_targets),
+                    )
+                    valid_actions = learner.valid_actions(movement, grid, position)
+                    valid_actions = _movement_actions_first(valid_actions)
+                    if not valid_actions:
+                        valid_actions = (Action.WAIT,)
+
+                    action = learner.choose_action(state, valid_actions)
+                    movement_result = movement.apply(grid, position, action.value)
+                    next_position = movement_result.end
+                    next_observation = sensor.observe(
+                        "agent-1",
+                        next_position,
+                        config.sensor_range,
+                    )
+
+                    target_type = grid.target_type_at(next_position)
+                    rescued_target_type = None
+                    if target_type is not None and next_position not in found_targets:
+                        found_targets.add(next_position)
+                        active_targets.discard(next_position)
+                        rescued_target_type = TargetType(target_type)
+                        rescued.append(
+                            {
+                                "x": next_position.x,
+                                "y": next_position.y,
+                                "step": step,
+                                "type": target_type,
+                            }
+                        )
+
+                    done = not active_targets
+                    reward = calculate_reward(
+                        RewardEvent(
+                            moved=movement_result.moved,
+                            move=action.value,
+                            newly_discovered_cells=len(next_observation.newly_discovered_cells),
+                            rescued_target_type=rescued_target_type,
+                            completed_episode=done,
+                            repeated_cell=next_position in visited_positions,
+                        ),
+                        learner.reward_config,
+                    )
+                    total_reward += reward
+
+                    next_state = _visual_learning_state(
+                        learner=learner,
+                        observation=next_observation,
+                        grid=grid,
+                        found_targets=frozenset(found_targets),
+                    )
+                    next_valid_actions = learner.valid_actions(movement, grid, next_position)
+                    next_valid_actions = _movement_actions_first(next_valid_actions)
+                    if not next_valid_actions:
+                        next_valid_actions = (Action.WAIT,)
+                    if run_mode == "train":
+                        learner.update_q_value(
+                            state=state,
+                            action=action,
+                            reward=reward,
+                            next_state=next_state,
+                            next_valid_actions=next_valid_actions,
+                        )
+
+                    position = next_position
+                    observation = next_observation
+                    visited_positions.add(position)
+                    agent_state = {
+                        "id": 0,
+                        "x": position.x,
+                        "y": position.y,
+                        "action": action.value,
+                        "reward": round(reward, 2),
+                    }
                     steps = step + 1
 
                     await websocket.send_json(
@@ -253,8 +382,8 @@ async def simulation_ws(websocket: WebSocket):
                             "episode": episode,
                             "step": steps,
                             "agents": [agent_state],
-                            "rescued": helper.get_rescued_list(),
-                            "active_targets": helper.get_active_targets_count(),
+                            "rescued": rescued,
+                            "active_targets": len(active_targets),
                         }
                     )
 
@@ -263,17 +392,19 @@ async def simulation_ws(websocket: WebSocket):
                 if should_stop:
                     break
 
-                success = not helper.has_active_targets()
+                success = not active_targets
                 metric = {
                     "episode": episode,
                     "steps": steps,
-                    "rescued_count": len(helper.get_rescued_list()),
+                    "rescued_count": len(rescued),
                     "target_count": config.target_count,
                     "success": success,
-                    "total_reward": helper.get_total_reward(),
-                    "exploration_rate": round(config.exploration_rate, 4),
+                    "total_reward": round(total_reward, 2),
+                    "exploration_rate": round(learner.epsilon, 4),
                 }
                 episode_metrics.append(metric)
+                if run_mode == "train":
+                    learner.epsilon = max(0.05, learner.epsilon * 0.85)
 
                 success_rate = sum(
                     1 for m in episode_metrics if m["success"]
@@ -293,6 +424,22 @@ async def simulation_ws(websocket: WebSocket):
                 )
 
             if not should_stop:
+                if run_mode == "train":
+                    trained_visual_learner = learner
+                    trained_visual_seed = scenario_seed
+                if run_mode == "evaluate" and episode_metrics:
+                    await websocket.send_json(
+                        {
+                            "type": "baseline_comparison",
+                            "report": _build_run_comparison_report(
+                                grid=grid,
+                                start=start_pos,
+                                config=config,
+                                trained_metric=episode_metrics[-1],
+                                trained_explored_cells=len(visited_positions),
+                            ),
+                        }
+                    )
                 await websocket.send_json(
                     {
                         "type": "training_complete",
@@ -314,3 +461,281 @@ async def simulation_ws(websocket: WebSocket):
             await websocket.close()
         except Exception:
             pass
+
+
+def _visual_learning_state(
+    learner: QLearningAgent,
+    observation: object,
+    grid: object,
+    found_targets: frozenset[Position],
+) -> LearningState:
+    """Build a reusable visual-training state for the Q-table.
+
+    The learner's state builder includes ``steps_taken`` for terminal checks in
+    offline training. The live visualization already checks max steps in its
+    loop, so keeping the step count in the Q-table would make the same cell look
+    like a different state at every time step and hide learning across episodes.
+    """
+
+    state = learner.state_from_observation(
+        observation=observation,
+        grid=grid,
+        found_targets=found_targets,
+        steps_taken=0,
+    )
+    return replace(state, steps_taken=0)
+
+
+def _movement_actions_first(actions: tuple[Action, ...]) -> tuple[Action, ...]:
+    """Avoid no-op exploration in the live demo unless the agent is stuck."""
+
+    moving_actions = tuple(action for action in actions if action != Action.WAIT)
+    return moving_actions or actions
+
+
+def _build_run_comparison_report(
+    grid: object,
+    start: Position,
+    config: SimConfig,
+    trained_metric: dict,
+    trained_explored_cells: int,
+) -> dict:
+    frontier = _run_baseline_on_visual_grid(
+        grid=grid,
+        start=start,
+        config=config,
+        strategy=BaselineExplorer(seed=0),
+        agent_name="baseline / frontier",
+    )
+    bfs = _run_baseline_on_visual_grid(
+        grid=grid,
+        start=start,
+        config=config,
+        strategy=DFSExplorer(seed=0),
+        agent_name="baseline / BFS",
+    )
+    trained = _metric_to_comparison_row(
+        agent_name="trained",
+        metric=trained_metric,
+        explored_cells=trained_explored_cells,
+        explorable_cells=_explorable_cell_count(grid),
+    )
+
+    return {
+        "aggregates": [frontier, bfs, trained],
+        "sprint_demo_summary": (
+            "Baseline comparison for the latest Run Learned Policy execution.\n"
+            f"frontier: success_rate={frontier['success_rate']:.2f}, "
+            f"steps={frontier['average_steps']:.1f}, "
+            f"reward={frontier['average_accumulated_reward']:.1f}, "
+            f"rescued_targets={frontier['average_rescued_targets']:.1f}, "
+            f"explored_area={frontier['average_explored_area_percentage']:.1f}%, "
+            f"num_agents={frontier['num_agents']}\n"
+            f"BFS: success_rate={bfs['success_rate']:.2f}, "
+            f"steps={bfs['average_steps']:.1f}, "
+            f"reward={bfs['average_accumulated_reward']:.1f}, "
+            f"rescued_targets={bfs['average_rescued_targets']:.1f}, "
+            f"explored_area={bfs['average_explored_area_percentage']:.1f}%, "
+            f"num_agents={bfs['num_agents']}\n"
+            f"trained: success_rate={trained['success_rate']:.2f}, "
+            f"steps={trained['average_steps']:.1f}, "
+            f"reward={trained['average_accumulated_reward']:.1f}, "
+            f"rescued_targets={trained['average_rescued_targets']:.1f}, "
+            f"explored_area={trained['average_explored_area_percentage']:.1f}%, "
+            f"num_agents={trained['num_agents']}"
+        ),
+    }
+
+
+def _run_baseline_on_visual_grid(
+    grid: object,
+    start: Position,
+    config: SimConfig,
+    strategy: BaselineExplorer | DFSExplorer,
+    agent_name: str,
+) -> dict:
+    movement = MovementModel()
+    sensor = CentralSensor(grid)
+    position = start
+    visited = {start}
+    found_targets: set[Position] = set()
+    all_targets = set(grid.target_a_positions) | set(grid.target_b_positions)
+    total_reward = 0.0
+    steps = 0
+    observation = sensor.observe("baseline", position, config.sensor_range)
+
+    for step in range(config.max_steps):
+        if found_targets == all_targets:
+            break
+
+        state = _baseline_learning_state(
+            observation=observation,
+            grid=grid,
+            discovered_cells=sensor.discovered_cells,
+            found_targets=frozenset(found_targets),
+            steps_taken=step,
+        )
+        valid_actions = tuple(Action(move) for move in movement.allowed_moves(grid, position))
+        if not valid_actions:
+            valid_actions = (Action.WAIT,)
+
+        action = strategy.select_action("baseline", state, valid_actions)
+        movement_result = movement.apply(grid, position, action.value)
+        next_position = movement_result.end
+        next_observation = sensor.observe("baseline", next_position, config.sensor_range)
+
+        repeated_cell = next_position in visited
+        newly_discovered_cells = 0
+        if next_position not in visited:
+            visited.add(next_position)
+            newly_discovered_cells = 1
+
+        rescued_target_type = None
+        target_type = grid.target_type_at(next_position)
+        if target_type is not None and next_position not in found_targets:
+            found_targets.add(next_position)
+            rescued_target_type = TargetType(target_type)
+
+        step_reward = calculate_reward(
+            RewardEvent(
+                moved=movement_result.moved,
+                move=action.value,
+                newly_discovered_cells=len(next_observation.newly_discovered_cells)
+                or newly_discovered_cells,
+                rescued_target_type=rescued_target_type,
+                completed_episode=found_targets == all_targets,
+                repeated_cell=repeated_cell,
+            ),
+            SPRINT3_REWARD_CONFIG,
+        )
+        total_reward += step_reward
+
+        next_state = _baseline_learning_state(
+            observation=next_observation,
+            grid=grid,
+            discovered_cells=sensor.discovered_cells,
+            found_targets=frozenset(found_targets),
+            steps_taken=step + 1,
+        )
+        strategy.update(
+            Transition(
+                state=state,
+                action=action,
+                next_state=next_state,
+                reward=step_reward,
+                done=found_targets == all_targets,
+                movement=movement_result,
+                observation=next_observation,
+            )
+        )
+
+        position = next_position
+        observation = next_observation
+        steps = step + 1
+
+    del observation
+    success = found_targets == all_targets
+    metric = {
+        "success": success,
+        "steps": steps,
+        "rescued_count": len(found_targets),
+        "target_count": len(all_targets),
+        "total_reward": round(total_reward, 2),
+    }
+    return _metric_to_comparison_row(
+        agent_name=agent_name,
+        metric=metric,
+        explored_cells=len(visited),
+        explorable_cells=_explorable_cell_count(grid),
+    )
+
+
+def _baseline_learning_state(
+    observation: object,
+    grid: object,
+    discovered_cells: frozenset[Position],
+    found_targets: frozenset[Position],
+    steps_taken: int,
+) -> LearningState:
+    found_target_a = frozenset(
+        position for position in found_targets if position in grid.target_a_positions
+    )
+    found_target_b = frozenset(
+        position for position in found_targets if position in grid.target_b_positions
+    )
+    visible_target_a = frozenset(
+        position
+        for position, target_type in observation.target_types.items()
+        if target_type == "A"
+    )
+    visible_target_b = frozenset(
+        position
+        for position, target_type in observation.target_types.items()
+        if target_type == "B"
+    )
+
+    return LearningState(
+        agent_id=observation.agent_id,
+        agent_position=observation.agent_position,
+        visible_cells=observation.visible_cells,
+        visible_obstacles=observation.obstacles,
+        visible_target_a_positions=visible_target_a,
+        visible_target_b_positions=visible_target_b,
+        discovered_cells=discovered_cells,
+        discovered_target_a_positions=visible_target_a,
+        discovered_target_b_positions=visible_target_b,
+        rescued_target_a_positions=found_target_a,
+        rescued_target_b_positions=found_target_b,
+        remaining_target_a_positions=grid.target_a_positions - found_target_a,
+        remaining_target_b_positions=grid.target_b_positions - found_target_b,
+        steps_taken=steps_taken,
+    )
+
+
+def _metric_to_comparison_row(
+    agent_name: str,
+    metric: dict,
+    explored_cells: int,
+    explorable_cells: int,
+) -> dict:
+    explored = explored_cells / explorable_cells * 100 if explorable_cells else 0.0
+    success = 1.0 if metric["success"] else 0.0
+    return {
+        "agent_name": agent_name,
+        "num_agents": 1,
+        "scenario_count": 1,
+        "success_rate": round(success, 4),
+        "average_steps": float(metric["steps"]),
+        "average_accumulated_reward": float(metric["total_reward"]),
+        "average_rescued_targets": float(metric["rescued_count"]),
+        "average_explored_area_percentage": round(explored, 4),
+    }
+
+
+def _baseline_action(grid: object, position: Position, visited: set[Position]) -> Action:
+    for action in (Action.RIGHT, Action.DOWN, Action.LEFT, Action.UP):
+        next_position = _next_position(position, action)
+        if grid.is_valid_position(next_position) and next_position not in visited:
+            return action
+
+    for action in (Action.RIGHT, Action.DOWN, Action.LEFT, Action.UP):
+        if grid.is_valid_position(_next_position(position, action)):
+            return action
+
+    return Action.WAIT
+
+
+def _explorable_cell_count(grid: object) -> int:
+    return grid.width * grid.height - len(grid.obstacles)
+
+
+def _next_position(position: Position, action: Action) -> Position:
+    if action == Action.RIGHT:
+        return Position(position.x + 1, position.y)
+    if action == Action.DOWN:
+        return Position(position.x, position.y + 1)
+    if action == Action.LEFT:
+        return Position(position.x - 1, position.y)
+    if action == Action.UP:
+        return Position(position.x, position.y - 1)
+    return position
