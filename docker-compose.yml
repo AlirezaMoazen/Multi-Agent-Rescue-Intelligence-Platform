@@ -50,3 +50,8 @@ services:
   train-mappo:
     <<: *base
     command: python scripts/train_mappo.py --updates 100
+
+  # ── Train QMIX (deep multi-agent RL) ────────────────────────────────
+  train-qmix:
+    <<: *base
+    command: python scripts/train_qmix.py --episodes 200

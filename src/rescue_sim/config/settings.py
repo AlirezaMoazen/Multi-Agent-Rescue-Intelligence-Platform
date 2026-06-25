@@ -71,3 +71,29 @@ class MappoSettings:
     normalize_value: bool = True  # value-target normalization (MAPPO trick #1)
     random_seed: int | None = None
 
+
+@dataclass(frozen=True)
+class QmixSettings:
+    """Hyper-parameters for QMIX (see rescue_sim.QMIX).
+
+    Defaults follow the PyMARL reference for Rashid et al. 2018, "QMIX:
+    Monotonic Value Function Factorisation for Deep Multi-Agent RL".
+    """
+
+    num_agents: int = 4
+    view_radius: int = 2
+    max_steps: int = 200
+    hidden_dim: int = 64           # agent Q-network width
+    mixing_embed_dim: int = 32     # mixing-network hidden width
+    learning_rate: float = 5e-4
+    gamma: float = 0.99
+    epsilon_start: float = 1.0     # exploration annealed linearly to epsilon_end
+    epsilon_end: float = 0.05
+    epsilon_anneal_episodes: int = 100
+    buffer_size: int = 5000        # replay buffer capacity (transitions)
+    batch_size: int = 32
+    target_update_interval: int = 200  # learn steps between hard target syncs
+    max_grad_norm: float = 10.0
+    double_q: bool = True          # Double-DQN target (reduces overestimation)
+    random_seed: int | None = None
+

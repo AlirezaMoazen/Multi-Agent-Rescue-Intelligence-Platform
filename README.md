@@ -81,7 +81,7 @@ Main dependencies are declared in [pyproject.toml](pyproject.toml):
 
 The project compares several learning strategies against two non-learning baselines.
 
-**Status:** ✅ implemented — Q-Learning (single-agent baseline), **Epidemic Hysteretic Q-Learning** (decentralized multi-agent), and **MAPPO** (deep multi-agent, CTDE). 🔜 planned — QMIX, TransfQMix (documented below as the remaining deep-learning roadmap; not yet coded).
+**Status:** ✅ implemented — Q-Learning (single-agent baseline), **Epidemic Hysteretic Q-Learning** (decentralized multi-agent), **MAPPO** (deep, policy-gradient, CTDE), and **QMIX** (deep, value-decomposition, CTDE). 🔜 planned — TransfQMix (documented below as the remaining deep-learning roadmap; not yet coded).
 
 ---
 
@@ -179,10 +179,13 @@ for _ in range(max_steps):
 
 ---
 
-### QMIX (deep, multi-agent, value-based) — 🔜 planned
+### QMIX (deep, multi-agent, value-based) — ✅ implemented
 
-Planned module: `src/rescue_sim/Qlearning/qmix.py` (not yet implemented).
+Implemented in `src/rescue_sim/QMIX/qmix.py` (reuses `RescueEnv` from the MAPPO package).
 Reference: Rashid et al., *QMIX: Monotonic Value Function Factorisation for Deep Multi-Agent RL*, ICML 2018.
+
+Requires the optional torch dependency: `pip install -e ".[qmix]"`. CPU-only —
+trains on a normal laptop in minutes (no GPU needed).
 
 **Core idea — value decomposition under a monotonicity constraint:**
 
@@ -215,14 +218,44 @@ $$\mathcal{L} = \left( Q_{\text{tot}} - \left[ r + \gamma \cdot \bar{Q}_{\text{t
 
 where $\bar{Q}$ is the target network (updated every $N$ steps).
 
-**Observation encoding (MLP input):**
+**Observation encoding (shared `RescueEnv`, same as MAPPO):**
 
 Each agent encodes its local observation as a fixed-size vector:
 
-- Normalised agent position $(x/W,\ y/H)$
-- Step fraction $t / t_{\max}$
-- Fraction of targets found
-- Local grid window $(2r+1)^2 \times 4$ one-hot channels: `[free, obstacle, target-A, target-B]`
+- Egocentric grid window $(2r+1)^2 \times 4$ channels: `[blocked, target-A, target-B, other-agent]`
+- Scalars: normalised position $(x/W,\ y/H)$, step fraction $t/t_{\max}$, fraction of targets remaining
+- One-hot agent id (so the shared network can tell agents apart)
+
+The mixer's global state is all agent observations concatenated.
+
+**Implementation notes:**
+
+- Feed-forward QMIX (no RNN) with a per-transition replay buffer — the smallest
+  variant that trains well on a fully observable grid.
+- Double-DQN target (online net selects the next action, target net evaluates it).
+- Hard target sync every `target_update_interval` learn steps; linear ε-decay.
+- Parameter sharing: one `AgentQNet` for all agents.
+
+**Run it:**
+
+```bash
+pip install -e ".[qmix]"
+python scripts/train_qmix.py --episodes 200 --grid 8 --agents 4
+# or in Docker:  docker compose run --rm train-qmix
+```
+
+```python
+from rescue_sim.config.settings import GridSettings, QmixSettings
+from rescue_sim.MAPPO import RescueEnv
+from rescue_sim.QMIX import QMIX
+
+grid = GridSettings(width=8, height=8, obstacle_probability=0.15,
+                    target_a_count=2, target_b_count=2)
+env = RescueEnv(grid, num_agents=4, max_steps=200, view_radius=2, seed=0)
+trainer = QMIX(env, QmixSettings(num_agents=4, random_seed=0))
+trainer.train(num_episodes=200)
+print(trainer.evaluate(episodes=20))
+```
 
 ---
 
@@ -331,7 +364,7 @@ print(trainer.evaluate(episodes=20))   # greedy success rate / steps
 
 | | Q-Learning | Epidemic Hysteretic Q | QMIX | TransfQMix | MAPPO |
 |---|---|---|---|---|---|
-| Status | ✅ implemented | ✅ implemented | 🔜 planned | 🔜 planned | ✅ implemented |
+| Status | ✅ implemented | ✅ implemented | ✅ implemented | 🔜 planned | ✅ implemented |
 | Family | Value-based | Value-based | Value-based | Value-based | Policy-gradient |
 | Agents | Single | Multi (decentralized) | Multi | Multi | Multi |
 | Function approx. | Tabular | Tabular (dense NumPy) | Deep (MLP) | Deep (Transformer) | Deep (MLP) |
