@@ -28,6 +28,10 @@ RUN pip install --upgrade pip && \
     "fastapi>=0.111" "uvicorn[standard]>=0.30" "websockets>=12.0" \
     "pytest>=8.0" "ruff>=0.5"
 
+# CPU-only PyTorch for MAPPO (deep multi-agent RL). The CPU wheel keeps the
+# image small enough to train on a normal machine; no GPU is required.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
 # ── Frontend build ──────────────────────────────────────────────────────
 COPY src/rescue_sim/visualization/frontend/package.json \
      src/rescue_sim/visualization/frontend/package-lock.json* \

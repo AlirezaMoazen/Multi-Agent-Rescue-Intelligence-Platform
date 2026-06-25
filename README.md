@@ -81,7 +81,7 @@ Main dependencies are declared in [pyproject.toml](pyproject.toml):
 
 The project compares several learning strategies against two non-learning baselines.
 
-**Status:** ✅ implemented — Q-Learning (single-agent baseline) and **Epidemic Hysteretic Q-Learning** (decentralized multi-agent). 🔜 planned — QMIX, TransfQMix, MAPPO (documented below as the deep-learning roadmap; not yet coded).
+**Status:** ✅ implemented — Q-Learning (single-agent baseline), **Epidemic Hysteretic Q-Learning** (decentralized multi-agent), and **MAPPO** (deep multi-agent, CTDE). 🔜 planned — QMIX, TransfQMix (documented below as the remaining deep-learning roadmap; not yet coded).
 
 ---
 
@@ -256,10 +256,13 @@ The CLS token aggregates entity information via multi-head self-attention.
 
 ---
 
-### MAPPO (deep, multi-agent, policy-gradient) — 🔜 planned
+### MAPPO (deep, multi-agent, policy-gradient) — ✅ implemented
 
-Planned module: `src/rescue_sim/Qlearning/mappo.py` (not yet implemented).
+Implemented in `src/rescue_sim/MAPPO/` (`environment.py` + `mappo.py`).
 Reference: Yu et al., *The Surprising Effectiveness of PPO in Cooperative Multi-Agent Games*, NeurIPS 2022.
+
+Requires the optional torch dependency: `pip install -e ".[mappo]"`. CPU-only —
+trains on a normal laptop in minutes (no GPU needed).
 
 **Architecture — Centralised Training, Decentralised Execution (CTDE):**
 
@@ -291,13 +294,44 @@ where $\mathcal{H}[\pi]$ is the policy entropy bonus encouraging exploration.
 
 **Key difference from QMIX:** MAPPO is **on-policy** (no replay buffer); it collects full rollouts, updates parameters, then discards the data. This is slower sample-wise but more stable.
 
+**Implementation details (following the 5 MAPPO tricks from Yu et al.):**
+
+- **Parameter sharing** — one `ActorCritic` network shared by all agents.
+- **Value normalization** — running mean/std on value targets (`RunningMeanStd`).
+- **Centralised value input** — critic sees `[o_1, …, o_n]` concatenated.
+- **Clipping** — both the policy ratio *and* the value update are clipped to `±ε`.
+- Plus GAE, advantage normalization, an entropy bonus, orthogonal init, and
+  gradient clipping. The environment is cooperative (shared team reward) and
+  reuses the existing grid/movement/reward contracts so results are comparable
+  to the Q-learning baselines.
+
+**Run it:**
+
+```bash
+pip install -e ".[mappo]"
+python scripts/train_mappo.py --updates 100 --grid 8 --agents 4
+# or in Docker:  docker compose run --rm train-mappo
+```
+
+```python
+from rescue_sim.config.settings import GridSettings, MappoSettings
+from rescue_sim.MAPPO import MAPPO, RescueEnv
+
+grid = GridSettings(width=8, height=8, obstacle_probability=0.15,
+                    target_a_count=2, target_b_count=2)
+env = RescueEnv(grid, num_agents=4, max_steps=200, view_radius=2, seed=0)
+trainer = MAPPO(env, MappoSettings(num_agents=4, random_seed=0))
+trainer.train(num_updates=100)
+print(trainer.evaluate(episodes=20))   # greedy success rate / steps
+```
+
 ---
 
 ### Algorithm Comparison
 
 | | Q-Learning | Epidemic Hysteretic Q | QMIX | TransfQMix | MAPPO |
 |---|---|---|---|---|---|
-| Status | ✅ implemented | ✅ implemented | 🔜 planned | 🔜 planned | 🔜 planned |
+| Status | ✅ implemented | ✅ implemented | 🔜 planned | 🔜 planned | ✅ implemented |
 | Family | Value-based | Value-based | Value-based | Value-based | Policy-gradient |
 | Agents | Single | Multi (decentralized) | Multi | Multi | Multi |
 | Function approx. | Tabular | Tabular (dense NumPy) | Deep (MLP) | Deep (Transformer) | Deep (MLP) |
