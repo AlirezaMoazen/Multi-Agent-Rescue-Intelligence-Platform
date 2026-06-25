@@ -45,3 +45,8 @@ services:
   run:
     <<: *base
     command: python scripts/run_scenario.py
+
+  # ── Train MAPPO (deep multi-agent RL) ───────────────────────────────
+  train-mappo:
+    <<: *base
+    command: python scripts/train_mappo.py --updates 100

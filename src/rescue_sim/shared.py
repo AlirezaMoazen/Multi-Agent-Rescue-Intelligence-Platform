@@ -597,6 +597,44 @@ class MultiAgentStrategyInterface(Protocol):
 
 
 # ---------------------------------------------------------------------------
+# Decentralized fleet contracts (Epidemic Hysteretic Q-Learning)
+# ---------------------------------------------------------------------------
+
+# Cardinal action order used by the vectorized fleet learner: index 0..3.
+# North = up (y - 1), South = down (y + 1), East = right (x + 1), West = left (x - 1).
+# Kept consistent with MOVE_DELTAS so the rest of the system (MovementModel,
+# visualization) can translate an index back to a move string via ``.value``.
+CARDINAL_ACTIONS: tuple[Action, ...] = (Action.UP, Action.DOWN, Action.RIGHT, Action.LEFT)
+
+
+@dataclass(frozen=True, slots=True)
+class HystereticConfig:
+    """Hysteretic Q-learning hyper-parameters.
+
+    Two learning rates make cooperative agents *optimistic*: a positive TD error
+    is applied with ``alpha`` while a negative TD error is applied with a heavily
+    muted ``beta`` (``beta << alpha``).  This stops a teammate's exploration from
+    erasing an already-good policy. ``beta <= alpha`` is required.
+    """
+
+    alpha: float = 0.5
+    beta: float = 0.1
+    discount_factor: float = 0.95
+    epsilon: float = 0.2
+
+
+@dataclass(frozen=True, slots=True)
+class GossipConfig:
+    """Ad-hoc peer-to-peer epidemic synchronization parameters."""
+
+    comm_radius: float = 3.0          # Euclidean distance that opens a link
+    cooldown: int = 5                 # steps before the same pair may re-sync
+    max_links_per_step: int = 2       # per-agent handshake budget (congestion control)
+    utility_threshold: float = 0.0    # only gossip |Q| at or above this value
+    clear_dirty_on_export: bool = True
+
+
+# ---------------------------------------------------------------------------
 # Legacy structures preserved from the old shared folder for backward compatibility
 # ---------------------------------------------------------------------------
 

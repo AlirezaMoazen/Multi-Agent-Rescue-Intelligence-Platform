@@ -14,7 +14,7 @@ from rescue_sim.environment.grid import Grid, Position
 from rescue_sim.environment.movement import MovementModel
 from rescue_sim.environment.sensors import CentralSensor
 from rescue_sim.environment.sensors import Observation as SensorObservation
-from rescue_sim.learning.baseline import (
+from rescue_sim.Qlearning.baseline import (
     BaselineExplorer,
     BaselineMetrics,
     DFSExplorer,
