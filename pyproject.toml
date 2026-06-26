@@ -20,10 +20,6 @@ dev = [
 visualization = [
     "matplotlib>=3.8",
 ]
-# Deep multi-agent RL (MAPPO). CPU-only torch is enough to train on a laptop.
-mappo = [
-    "torch>=2.0",
-]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

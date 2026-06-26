@@ -34,9 +34,7 @@ lint:
 
 test:
   stage: test
-  # Install CPU-only torch so the MAPPO tests run (they skip if torch is absent).
   script:
-    - python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
     - pytest
 
 # --- Simple MR Approval Workaround --- (DOES NOT WORK!!!)

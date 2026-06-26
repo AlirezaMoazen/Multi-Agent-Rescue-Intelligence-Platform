@@ -46,28 +46,3 @@ class FleetSettings:
     utility_threshold: float = 0.0
     random_seed: int | None = None
 
-
-@dataclass(frozen=True)
-class MappoSettings:
-    """Hyper-parameters for MAPPO (see rescue_sim.MAPPO).
-
-    Defaults follow the recommendations in Yu et al. 2022, "The Surprising
-    Effectiveness of PPO in Cooperative Multi-Agent Games".
-    """
-
-    num_agents: int = 4
-    view_radius: int = 2          # egocentric window radius for the actor
-    max_steps: int = 200
-    hidden_dim: int = 64          # 64x64 MLP per the MAPPO paper
-    learning_rate: float = 7e-4
-    gamma: float = 0.99           # discount factor
-    gae_lambda: float = 0.95      # GAE bias/variance trade-off
-    clip: float = 0.2             # PPO/value clip range
-    value_coef: float = 0.5
-    entropy_coef: float = 0.01
-    epochs: int = 10              # update epochs per rollout
-    rollout_steps: int = 512      # timesteps collected before each update
-    max_grad_norm: float = 0.5
-    normalize_value: bool = True  # value-target normalization (MAPPO trick #1)
-    random_seed: int | None = None
-
