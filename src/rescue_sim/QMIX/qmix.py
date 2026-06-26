@@ -26,8 +26,8 @@ import torch
 from torch import nn
 
 from rescue_sim.config.settings import QmixSettings
-from rescue_sim.marl_common import ReplayBuffer, hard_update
 from rescue_sim.MAPPO.environment import RescueEnv
+from rescue_sim.shared import ReplayBuffer, hard_update
 
 
 class AgentQNet(nn.Module):

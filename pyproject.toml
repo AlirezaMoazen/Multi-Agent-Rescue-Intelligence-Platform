@@ -30,6 +30,9 @@ qmix = [
 transfqmix = [
     "torch>=2.0",
 ]
+ensemble = [
+    "torch>=2.0",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

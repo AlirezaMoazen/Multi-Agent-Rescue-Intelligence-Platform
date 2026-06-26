@@ -21,7 +21,7 @@ from torch import nn
 from torch.distributions import Categorical
 
 from rescue_sim.config.settings import MappoSettings
-from rescue_sim.marl_common import RunningMeanStd, orthogonal_init
+from rescue_sim.shared import RunningMeanStd, orthogonal_init
 from rescue_sim.MAPPO.environment import RescueEnv
 
 

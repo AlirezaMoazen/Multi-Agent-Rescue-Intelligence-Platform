@@ -129,3 +129,20 @@ class TransfQmixSettings:
     double_q: bool = True
     random_seed: int | None = None
 
+
+@dataclass(frozen=True)
+class DistillSettings:
+    """Settings for distilling the QMIX+TransfQMix ensemble into one student.
+
+    The student is a small MLP (same kind as the QMIX agent network) trained by
+    supervised regression to match the ensemble's per-agent Q-values, using only
+    the local observation -- so the final policy is a single deployable network.
+    """
+
+    hidden_dim: int = 64
+    learning_rate: float = 1e-3
+    collect_steps: int = 2000   # teacher-guided states gathered for the dataset
+    epochs: int = 10
+    batch_size: int = 64
+    random_seed: int | None = None
+
