@@ -21,6 +21,8 @@ def test_calculate_run_metrics_reports_success_and_exploration() -> None:
     trace = RunTrace(
         scenario_name="unit",
         agent_name="baseline",
+        algorithm_group="baseline",
+        status="ok",
         seed=1,
         num_agents=1,
         steps_taken=12,
@@ -82,6 +84,7 @@ def test_evaluation_includes_single_agent_count_everywhere() -> None:
                     random_seed=3,
                 ),
                 max_steps=20,
+                num_agents=1,
             )
         ]
     )

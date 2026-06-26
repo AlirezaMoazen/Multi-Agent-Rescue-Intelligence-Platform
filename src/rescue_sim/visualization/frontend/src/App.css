@@ -344,17 +344,21 @@ body {
   border-radius: 2px;
 }
 
+.evaluation-wide {
+  grid-column: 1 / -1;
+}
+
 /* ── Parameter Panel ─────────────────────────────────────────────────── */
 .param-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 10px;
+  gap: 8px;
 }
 
 .param-field {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
 }
 
 .param-field.full {
@@ -362,7 +366,7 @@ body {
 }
 
 .param-field label {
-  font-size: 0.68rem;
+  font-size: 0.64rem;
   font-weight: 600;
   color: var(--text-muted);
   text-transform: uppercase;
@@ -370,13 +374,15 @@ body {
 }
 
 .param-field input {
-  padding: 8px 12px;
+  width: 100%;
+  min-width: 0;
+  padding: 7px 9px;
   border: 1px solid var(--border-glass);
   border-radius: var(--radius-sm);
   background: var(--bg-glass);
   color: var(--text-primary);
   font-family: var(--font-family);
-  font-size: 0.85rem;
+  font-size: 0.8rem;
   font-weight: 500;
   outline: none;
   transition: border-color var(--transition-fast);
@@ -407,10 +413,26 @@ body {
 }
 
 /* Evaluation Panel */
+.evaluation-section {
+  margin-top: 12px;
+}
+
+.evaluation-section:first-of-type {
+  margin-top: 0;
+}
+
+.evaluation-section-title {
+  margin-bottom: 8px;
+  color: var(--text-secondary);
+  font-size: 0.7rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
 .evaluation-grid {
   display: grid;
-  grid-template-columns: 1fr;
-  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
 }
 
 .evaluation-agent {
@@ -424,8 +446,32 @@ body {
   font-size: 0.68rem;
   color: var(--text-muted);
   font-weight: 700;
-  letter-spacing: 0.06em;
   text-transform: uppercase;
+}
+
+.evaluation-agent-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.evaluation-status {
+  border: 1px solid var(--border-glass);
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 0.62rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.evaluation-status.status-ok {
+  color: var(--accent-green);
+}
+
+.evaluation-status.status-unavailable,
+.evaluation-error {
+  color: var(--accent-red);
 }
 
 .evaluation-main {
@@ -461,6 +507,12 @@ body {
   font-weight: 700;
 }
 
+.evaluation-error {
+  margin-top: 8px;
+  font-size: 0.68rem;
+  line-height: 1.35;
+}
+
 .evaluation-summary,
 .evaluation-empty {
   margin-top: 12px;
@@ -468,6 +520,52 @@ body {
   font-size: 0.74rem;
   line-height: 1.45;
   white-space: pre-line;
+}
+
+.evaluation-wide .evaluation-summary,
+.evaluation-wide .evaluation-empty {
+  font-size: 0.8rem;
+}
+
+.evaluation-note {
+  margin-bottom: 10px;
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.evaluation-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-sm);
+}
+
+.evaluation-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 680px;
+  font-size: 0.76rem;
+}
+
+.evaluation-table th,
+.evaluation-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-glass);
+  text-align: left;
+}
+
+.evaluation-table th {
+  color: var(--text-muted);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+}
+
+.evaluation-table td {
+  color: var(--text-primary);
+}
+
+.evaluation-table tr:last-child td {
+  border-bottom: 0;
 }
 
 /* ── Connection indicator ────────────────────────────────────────────── */
