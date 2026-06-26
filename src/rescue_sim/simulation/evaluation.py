@@ -13,7 +13,7 @@ from rescue_sim.environment.generator import generate_grid
 from rescue_sim.environment.grid import Grid, Position
 from rescue_sim.environment.movement import MovementModel
 from rescue_sim.environment.sensors import CentralSensor
-from rescue_sim.Qlearning.q_learning import QLearningAgent
+from rescue_sim.learning.q_learning import QLearningAgent
 from rescue_sim.shared import Action, GridSettings, RewardConfig, RewardEvent, TargetType, calculate_reward
 
 AgentName = Literal["baseline", "trained"]

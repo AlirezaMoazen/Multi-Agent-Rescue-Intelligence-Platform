@@ -3,7 +3,7 @@ from random import Random
 from rescue_sim.config.settings import AgentSettings, GridSettings, SimulationSettings
 from rescue_sim.environment.grid import Grid, Position
 from rescue_sim.environment.sensors import CentralSensor
-from rescue_sim.Qlearning.q_learning import QLearningAgent
+from rescue_sim.learning.q_learning import QLearningAgent
 from rescue_sim.shared import Action, LearningState
 
 

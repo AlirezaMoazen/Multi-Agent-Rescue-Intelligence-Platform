@@ -2,7 +2,7 @@ from random import Random
 
 from rescue_sim.environment.grid import Position
 from rescue_sim.environment.generator import generate_grid
-from rescue_sim.Qlearning.q_learning import QLearningAgent
+from rescue_sim.learning.q_learning import QLearningAgent
 from rescue_sim.simulation.evaluation import (
     ACTIONS,
     EVALUATION_REWARD_CONFIG,
