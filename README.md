@@ -81,7 +81,7 @@ Main dependencies are declared in [pyproject.toml](pyproject.toml):
 
 The project compares several learning strategies against two non-learning baselines.
 
-**Status:** ✅ implemented — Q-Learning (single-agent baseline), **Epidemic Hysteretic Q-Learning** (decentralized multi-agent), **MAPPO** (deep, policy-gradient, CTDE), and **QMIX** (deep, value-decomposition, CTDE). 🔜 planned — TransfQMix (documented below as the remaining deep-learning roadmap; not yet coded).
+**Status:** ✅ all implemented — Q-Learning (single-agent baseline), **Epidemic Hysteretic Q-Learning** (decentralized multi-agent), **MAPPO** (deep, policy-gradient, CTDE), **QMIX** (deep, value-decomposition, CTDE), and **TransfQMix** (deep, transformer-based, CTDE).
 
 ---
 
@@ -259,33 +259,59 @@ print(trainer.evaluate(episodes=20))
 
 ---
 
-### TransfQMix (deep, multi-agent, transformer + value-based) — 🔜 planned
+### TransfQMix (deep, multi-agent, transformer + value-based) — ✅ implemented
 
-Planned module: `src/rescue_sim/Qlearning/transf_qmix.py` (not yet implemented).
-Reference: Marin Bilos et al. / Hu et al., *TransfQMix: Transformers for Leveraging the Graph Structure of MARL Problems*, 2021.
+Implemented in `src/rescue_sim/TransfQMix/transf_qmix.py` (reuses `RescueEnv` and QMIX's replay buffer).
+Reference: Gallici, Martin, Masmitja, *TransfQMix: Transformers for Leveraging the Graph Structure of MARL Problems*, AAMAS 2023.
 
-**Same mixer as QMIX; different agent network.**
+Requires the optional torch dependency: `pip install -e ".[transfqmix]"`. CPU-only
+(transformers are heavier than the MLP methods, so training is slower but still
+runs on a laptop).
 
-Instead of an MLP over a flat observation, each agent encodes its visible environment as a **sequence of entity tokens** fed to a transformer encoder.
+**It is QMIX with transformer networks.** Both the agent network *and* the mixer
+are transformers over a set of entity tokens — so the **same parameters transfer
+to any number of agents/entities** (TransfQMix's headline property).
 
-**Entity tokenisation:**
+**Entity tokenisation.** Each agent's observation is a *set of tokens* — one per
+visible cell plus a self token — instead of a flat vector:
 
-Each visible cell becomes one token $e_i \in \mathbb{R}^{d_e}$:
+$$e_i = \bigl[\mathbb{1}_{\text{blocked}},\ \mathbb{1}_{\text{target-A}},\ \mathbb{1}_{\text{target-B}},\ \mathbb{1}_{\text{other-agent}},\ \tfrac{\Delta x}{r},\ \tfrac{\Delta y}{r},\ \mathbb{1}_{\text{self}},\ \tfrac{t}{t_{\max}},\ \rho_{\text{remaining}}\bigr]$$
 
-$$e_i = \left[\frac{\Delta x}{r},\ \frac{\Delta y}{r},\ \mathbb{1}_{\text{free}},\ \mathbb{1}_{\text{obstacle}},\ \mathbb{1}_{\text{target-A}},\ \mathbb{1}_{\text{target-B}}\right]$$
+**Agent transformer.** A learnable CLS token is prepended; multi-head
+self-attention pools the entities; the CLS output gives the Q-values and a hidden
+embedding:
 
-**Transformer encoder:**
+$$\mathbf{H} = \text{TransformerEncoder}\bigl([\mathbf{z}_{\text{CLS}};\ E W_{\text{in}}]\bigr), \quad Q_i = W_{\text{out}}\,\mathbf{H}[\text{CLS}], \quad h_i = \mathbf{H}[\text{CLS}]$$
 
-$$\mathbf{T} = \bigl[\mathbf{z}_{\text{CLS}};\ E \cdot W_{\text{in}}\bigr]$$
-$$\mathbf{H} = \text{TransformerEncoder}(\mathbf{T})$$
-$$Q_i = W_{\text{out}} \cdot \mathbf{H}[\text{CLS}]$$
+**Transformer mixer.** A second transformer runs over the agent hidden states
+$h_i$ plus a global-state token, and emits **non-negative** mixing weights (via
+$|\cdot|$), so $Q_{\text{tot}}$ stays monotonic in each $Q_i$ — the QMIX
+guarantee, but with transformer-generated weights:
 
-The CLS token aggregates entity information via multi-head self-attention.
+$$Q_{\text{tot}} = \mathbf{w}_2^{\top}\,\text{ELU}\!\Bigl(\textstyle\sum_i Q_i\,\mathbf{w}_{1,i} + \mathbf{b}_1\Bigr) + V(s), \qquad \mathbf{w}_1, \mathbf{w}_2 \ge 0$$
 
-**Advantages over QMIX:**
-- Naturally handles a variable number of visible entities (no padding needed)
-- Attention weights reveal which entities the agent focuses on (interpretability)
-- Generalises to different map sizes and team sizes without retraining
+**Implementation notes:** Double-DQN target, hard target sync, linear ε-decay,
+and parameter sharing — same training loop as QMIX, only the networks differ.
+
+**Run it:**
+
+```bash
+pip install -e ".[transfqmix]"
+python scripts/train_transfqmix.py --episodes 200 --grid 8 --agents 4
+# or in Docker:  docker compose run --rm train-transfqmix
+```
+
+```python
+from rescue_sim.config.settings import GridSettings, TransfQmixSettings
+from rescue_sim.TransfQMix import EntityRescueEnv, TransfQMIX
+
+grid = GridSettings(width=8, height=8, obstacle_probability=0.15,
+                    target_a_count=2, target_b_count=2)
+env = EntityRescueEnv(grid, num_agents=4, max_steps=200, view_radius=2, seed=0)
+trainer = TransfQMIX(env, TransfQmixSettings(num_agents=4, random_seed=0))
+trainer.train(num_episodes=200)
+print(trainer.evaluate(episodes=20))
+```
 
 ---
 
@@ -364,7 +390,7 @@ print(trainer.evaluate(episodes=20))   # greedy success rate / steps
 
 | | Q-Learning | Epidemic Hysteretic Q | QMIX | TransfQMix | MAPPO |
 |---|---|---|---|---|---|
-| Status | ✅ implemented | ✅ implemented | ✅ implemented | 🔜 planned | ✅ implemented |
+| Status | ✅ implemented | ✅ implemented | ✅ implemented | ✅ implemented | ✅ implemented |
 | Family | Value-based | Value-based | Value-based | Value-based | Policy-gradient |
 | Agents | Single | Multi (decentralized) | Multi | Multi | Multi |
 | Function approx. | Tabular | Tabular (dense NumPy) | Deep (MLP) | Deep (Transformer) | Deep (MLP) |
@@ -374,6 +400,65 @@ print(trainer.evaluate(episodes=20))   # greedy success rate / steps
 | Runtime comms | No | Yes (when robots meet) | No | No | No |
 | Key innovation | Baseline RL | Optimistic + epidemic max-sync | Monotonic mixing | Attention over entities | Clipped policy update |
 | PC trainable | Yes | Yes | Yes | Yes | Yes |
+
+---
+
+### Code structure (how the deep methods share code)
+
+The three deep methods are deliberately small because they share their plumbing,
+so each algorithm file tells one clear story:
+
+```text
+src/rescue_sim/
+├── shared.py            # the project contract: Action, CARDINAL_ACTIONS,
+│                        #   RewardConfig/RewardEvent/calculate_reward, Grid, ...
+├── marl_common.py       # shared deep-RL helpers: ReplayBuffer, RunningMeanStd,
+│                        #   orthogonal_init, hard_update
+├── MAPPO/
+│   ├── environment.py   # RescueEnv — the cooperative env (pure NumPy)
+│   └── mappo.py         # policy-gradient trainer
+├── QMIX/qmix.py         # value-decomposition trainer (reuses RescueEnv)
+└── TransfQMix/transf_qmix.py  # transformer trainer (reuses RescueEnv + buffer)
+```
+
+- **One environment.** `RescueEnv` is written once and reused by all three deep
+  methods; TransfQMix extends it (`EntityRescueEnv`) only to add entity tokens.
+- **One set of helpers.** Replay buffer, value normalization, weight init, and
+  target-network sync live in `marl_common.py` — no copy-paste between methods.
+- **One reward/observation contract.** Every method scores moves through
+  `shared.calculate_reward`, so results are directly comparable to the baselines.
+
+### Indicative results (short CPU training runs)
+
+Greedy success rate on freshly generated grids (each episode is a new random map,
+so this measures generalisation, not memorisation):
+
+| Method | Grid | Agents | Episodes/updates | Greedy success |
+|---|---|---|---|---|
+| MAPPO | 6×6 | 3 | 40 updates | ~0.60 |
+| QMIX | 6×6 | 3 | 150 episodes | ~0.65 |
+| TransfQMix | 6×6 | 3 | 150 episodes | ~0.80 |
+
+All trained on CPU in minutes (TransfQMix is slowest — transformers are heavier).
+Numbers are indicative of short runs; longer training improves all three.
+
+### Sources & further reading
+
+- **Q-learning** — Watkins & Dayan, *Q-learning*, Machine Learning 1992.
+- **Hysteretic Q-learning** — Matignon, Laurent & Le Fort-Piat, *Hysteretic
+  Q-Learning: an algorithm for decentralized RL in cooperative multi-agent teams*,
+  IROS 2007.
+- **MAPPO** — Yu et al., *The Surprising Effectiveness of PPO in Cooperative
+  Multi-Agent Games*, NeurIPS 2022 — <https://arxiv.org/abs/2103.01955>
+- **QMIX** — Rashid et al., *QMIX: Monotonic Value Function Factorisation for
+  Deep Multi-Agent RL*, ICML 2018 — <https://arxiv.org/abs/1803.11485>
+- **TransfQMix** — Gallici, Martin & Masmitja, *TransfQMix: Transformers for
+  Leveraging the Graph Structure of MARL Problems*, AAMAS 2023 —
+  <https://arxiv.org/abs/2301.05334> · code: <https://github.com/mttga/pymarl_transformers>
+- **GAE** (used by MAPPO) — Schulman et al., *High-Dimensional Continuous Control
+  Using Generalized Advantage Estimation*, ICLR 2016 — <https://arxiv.org/abs/1506.02438>
+- **CTDE paradigm** — *Centralized Training, Decentralized Execution* survey —
+  <https://arxiv.org/abs/2409.03052>
 
 ---
 

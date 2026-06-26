@@ -19,7 +19,6 @@ Runs on CPU; `torch` is the only extra dependency (`pip install -e ".[qmix]"`).
 
 from __future__ import annotations
 
-from collections import deque
 from random import Random
 
 import numpy as np
@@ -27,6 +26,7 @@ import torch
 from torch import nn
 
 from rescue_sim.config.settings import QmixSettings
+from rescue_sim.marl_common import ReplayBuffer, hard_update
 from rescue_sim.MAPPO.environment import RescueEnv
 
 
@@ -73,35 +73,6 @@ class MixingNetwork(nn.Module):
         return q_tot.view(batch)
 
 
-class ReplayBuffer:
-    """Fixed-size buffer of single-step team transitions."""
-
-    def __init__(self, capacity: int, rng: Random) -> None:
-        self.buffer: deque = deque(maxlen=capacity)
-        self.rng = rng
-
-    def __len__(self) -> int:
-        return len(self.buffer)
-
-    def push(self, transition: dict) -> None:
-        self.buffer.append(transition)
-
-    def sample(self, batch_size: int) -> dict:
-        batch = self.rng.sample(self.buffer, batch_size)
-        stack = lambda key: torch.as_tensor(np.stack([t[key] for t in batch]))  # noqa: E731
-        return {
-            "obs": stack("obs").float(),
-            "state": stack("state").float(),
-            "actions": stack("actions").long(),
-            "avail": stack("avail").bool(),
-            "reward": stack("reward").float(),
-            "next_obs": stack("next_obs").float(),
-            "next_state": stack("next_state").float(),
-            "next_avail": stack("next_avail").bool(),
-            "done": stack("done").float(),
-        }
-
-
 class QMIX:
     """Trains a shared agent Q-network and a monotonic mixer on a RescueEnv."""
 
@@ -143,8 +114,8 @@ class QMIX:
     # -- learning -----------------------------------------------------------
 
     def _sync_targets(self) -> None:
-        self.target_agent.load_state_dict(self.agent.state_dict())
-        self.target_mixer.load_state_dict(self.mixer.state_dict())
+        hard_update(self.target_agent, self.agent)
+        hard_update(self.target_mixer, self.mixer)
 
     def _learn(self) -> float:
         cfg = self.cfg

@@ -21,39 +21,8 @@ from torch import nn
 from torch.distributions import Categorical
 
 from rescue_sim.config.settings import MappoSettings
+from rescue_sim.marl_common import RunningMeanStd, orthogonal_init
 from rescue_sim.MAPPO.environment import RescueEnv
-
-
-def _init(layer: nn.Linear, gain: float = np.sqrt(2)) -> nn.Linear:
-    """Orthogonal weight init -- a standard PPO stability trick."""
-    nn.init.orthogonal_(layer.weight, gain)
-    nn.init.constant_(layer.bias, 0.0)
-    return layer
-
-
-class RunningMeanStd:
-    """Tracks a running mean/variance to normalize value targets (MAPPO trick)."""
-
-    def __init__(self) -> None:
-        self.mean = 0.0
-        self.var = 1.0
-        self.count = 1e-4
-
-    def update(self, x: torch.Tensor) -> None:
-        batch_mean = float(x.mean())
-        batch_var = float(x.var(unbiased=False))
-        batch_count = x.numel()
-        delta = batch_mean - self.mean
-        total = self.count + batch_count
-        self.mean += delta * batch_count / total
-        m_a = self.var * self.count
-        m_b = batch_var * batch_count
-        self.var = (m_a + m_b + delta**2 * self.count * batch_count / total) / total
-        self.count = total
-
-    @property
-    def std(self) -> float:
-        return float(np.sqrt(self.var) + 1e-8)
 
 
 class ActorCritic(nn.Module):
@@ -62,14 +31,14 @@ class ActorCritic(nn.Module):
     def __init__(self, obs_dim: int, state_dim: int, n_actions: int, hidden: int) -> None:
         super().__init__()
         self.actor = nn.Sequential(
-            _init(nn.Linear(obs_dim, hidden)), nn.Tanh(),
-            _init(nn.Linear(hidden, hidden)), nn.Tanh(),
-            _init(nn.Linear(hidden, n_actions), gain=0.01),
+            orthogonal_init(nn.Linear(obs_dim, hidden)), nn.Tanh(),
+            orthogonal_init(nn.Linear(hidden, hidden)), nn.Tanh(),
+            orthogonal_init(nn.Linear(hidden, n_actions), gain=0.01),
         )
         self.critic = nn.Sequential(
-            _init(nn.Linear(state_dim, hidden)), nn.Tanh(),
-            _init(nn.Linear(hidden, hidden)), nn.Tanh(),
-            _init(nn.Linear(hidden, 1), gain=1.0),
+            orthogonal_init(nn.Linear(state_dim, hidden)), nn.Tanh(),
+            orthogonal_init(nn.Linear(hidden, hidden)), nn.Tanh(),
+            orthogonal_init(nn.Linear(hidden, 1), gain=1.0),
         )
 
     def _dist(self, obs: torch.Tensor, mask: torch.Tensor) -> Categorical:

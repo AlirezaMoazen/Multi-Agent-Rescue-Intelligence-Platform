@@ -97,3 +97,35 @@ class QmixSettings:
     double_q: bool = True          # Double-DQN target (reduces overestimation)
     random_seed: int | None = None
 
+
+@dataclass(frozen=True)
+class TransfQmixSettings:
+    """Hyper-parameters for TransfQMix (see rescue_sim.TransfQMix).
+
+    Defaults follow Gallici et al. 2023, "TransfQMix: Transformers for
+    Leveraging the Graph Structure of MARL Problems" (AAMAS). Both the agent
+    network and the mixer are transformers, so the same parameters transfer to
+    any number of agents/entities.
+    """
+
+    num_agents: int = 4
+    view_radius: int = 2
+    max_steps: int = 200
+    d_model: int = 32              # transformer embedding width
+    n_heads: int = 4               # attention heads (d_model must divide by this)
+    n_agent_layers: int = 2        # encoder layers in the agent transformer
+    n_mixer_layers: int = 1        # encoder layers in the mixer transformer
+    ff_dim: int = 64               # feed-forward width inside the transformer
+    mixing_embed_dim: int = 32     # monotonic mixing hidden width
+    learning_rate: float = 5e-4
+    gamma: float = 0.99
+    epsilon_start: float = 1.0
+    epsilon_end: float = 0.05
+    epsilon_anneal_episodes: int = 100
+    buffer_size: int = 5000
+    batch_size: int = 32
+    target_update_interval: int = 200
+    max_grad_norm: float = 10.0
+    double_q: bool = True
+    random_seed: int | None = None
+

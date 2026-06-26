@@ -27,6 +27,9 @@ mappo = [
 qmix = [
     "torch>=2.0",
 ]
+transfqmix = [
+    "torch>=2.0",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
