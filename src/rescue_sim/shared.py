@@ -9,6 +9,7 @@ and evaluation work should follow.
 from __future__ import annotations
 
 import random
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Dict, List, Protocol, Tuple, TypedDict, runtime_checkable
@@ -581,3 +582,91 @@ class RLAgent:
         max_next_q = max(self.q_table[next_state].values())
         new_q = current_q + self.lr * (reward + self.gamma * max_next_q - current_q)
         self.q_table[state][action] = new_q
+
+
+# ---------------------------------------------------------------------------
+# Deep-RL shared utilities (used by MAPPO / QMIX / TransfQMix / Ensemble)
+# ---------------------------------------------------------------------------
+# torch and numpy are imported lazily *inside* the functions below so that this
+# module stays importable without the optional deep-RL extras.  The api,
+# visualization, and baseline code import `shared` but never need torch.
+
+
+def orthogonal_init(layer, gain: float = 2 ** 0.5):
+    """Orthogonal weights + zero bias -- a standard PPO/DQN stability trick."""
+    from torch import nn
+
+    nn.init.orthogonal_(layer.weight, gain)
+    nn.init.constant_(layer.bias, 0.0)
+    return layer
+
+
+def hard_update(target, source) -> None:
+    """Copy every weight from `source` into `target` (target-network sync)."""
+    target.load_state_dict(source.state_dict())
+
+
+class RunningMeanStd:
+    """Running mean/variance to normalize value targets (MAPPO trick #1).
+
+    Welford-style batched update; keeps statistics stable as rewards drift.
+    Works on any object with `.mean()` / `.var()` / `.numel()` (e.g. a tensor),
+    so it needs no torch import of its own.
+    """
+
+    def __init__(self) -> None:
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = 1e-4
+
+    def update(self, x) -> None:
+        batch_mean = float(x.mean())
+        batch_var = float(x.var(unbiased=False))
+        batch_count = x.numel()
+        delta = batch_mean - self.mean
+        total = self.count + batch_count
+        self.mean += delta * batch_count / total
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        self.var = (m_a + m_b + delta**2 * self.count * batch_count / total) / total
+        self.count = total
+
+    @property
+    def std(self) -> float:
+        return self.var**0.5 + 1e-8
+
+
+class ReplayBuffer:
+    """Fixed-size buffer of single-step team transitions (off-policy methods).
+
+    Each transition is a dict of NumPy arrays; `sample` stacks a random batch
+    into torch tensors with the right dtype per field.  Shared by QMIX and
+    TransfQMix.
+    """
+
+    # Field name -> torch dtype name (resolved lazily) for the batched tensor.
+    _DTYPES = {
+        "obs": "float32", "state": "float32", "actions": "long", "avail": "bool",
+        "reward": "float32", "next_obs": "float32", "next_state": "float32",
+        "next_avail": "bool", "done": "float32",
+    }
+
+    def __init__(self, capacity: int, rng) -> None:
+        self.buffer: deque = deque(maxlen=capacity)
+        self.rng = rng
+
+    def __len__(self) -> int:
+        return len(self.buffer)
+
+    def push(self, transition: dict) -> None:
+        self.buffer.append(transition)
+
+    def sample(self, batch_size: int) -> dict:
+        import numpy as np
+        import torch
+
+        batch = self.rng.sample(self.buffer, batch_size)
+        return {
+            key: torch.as_tensor(np.stack([t[key] for t in batch])).to(getattr(torch, dt))
+            for key, dt in self._DTYPES.items()
+        }

@@ -410,23 +410,58 @@ so each algorithm file tells one clear story:
 
 ```text
 src/rescue_sim/
-├── shared.py            # the project contract: Action, CARDINAL_ACTIONS,
-│                        #   RewardConfig/RewardEvent/calculate_reward, Grid, ...
-├── marl_common.py       # shared deep-RL helpers: ReplayBuffer, RunningMeanStd,
-│                        #   orthogonal_init, hard_update
+├── shared.py            # the project contract + shared deep-RL helpers:
+│                        #   Action, CARDINAL_ACTIONS, RewardConfig, Grid, ... AND
+│                        #   ReplayBuffer, RunningMeanStd, orthogonal_init, hard_update
+│                        #   (torch is imported lazily so shared.py stays import-light)
 ├── MAPPO/
-│   ├── environment.py   # RescueEnv — the cooperative env (pure NumPy)
+│   ├── environment.py   # RescueEnv — the cooperative env (pure NumPy, vectorized)
 │   └── mappo.py         # policy-gradient trainer
 ├── QMIX/qmix.py         # value-decomposition trainer (reuses RescueEnv)
-└── TransfQMix/transf_qmix.py  # transformer trainer (reuses RescueEnv + buffer)
+├── TransfQMix/transf_qmix.py  # transformer trainer (reuses RescueEnv + buffer)
+└── Ensemble/
+    ├── ensemble.py      # ValueEnsemble: combine QMIX + TransfQMix at test time
+    └── distill.py       # Distiller: compress the ensemble into one student net
 ```
 
-- **One environment.** `RescueEnv` is written once and reused by all three deep
+- **One environment.** `RescueEnv` is written once and reused by all the deep
   methods; TransfQMix extends it (`EntityRescueEnv`) only to add entity tokens.
 - **One set of helpers.** Replay buffer, value normalization, weight init, and
-  target-network sync live in `marl_common.py` — no copy-paste between methods.
+  target-network sync all live in `shared.py` — no copy-paste between methods.
 - **One reward/observation contract.** Every method scores moves through
   `shared.calculate_reward`, so results are directly comparable to the baselines.
+- **Fast on CPU.** The environment precomputes padded NumPy maps at reset, so an
+  observation is an array *slice* rather than a Python per-cell loop (the obs
+  output is byte-for-byte identical to the simple version — there's a regression
+  test for it).
+
+### Ensemble + distillation (combining the best methods)
+
+QMIX and TransfQMix are both value-based, so their per-agent Q-values are
+comparable and can be combined. Implemented in `src/rescue_sim/Ensemble/`:
+
+- **ValueEnsemble** — averages the two methods' Q-values, weighted by each one's
+  validation success (so the stronger method dominates), and takes the best valid
+  action. No retraining; runs both networks at test time.
+
+  $$a_i = \arg\max_{a\ \text{valid}}\bigl(w_q\,Q^{\text{QMIX}}_i(a) + w_t\,Q^{\text{TransfQMix}}_i(a)\bigr)$$
+
+- **Distiller** — *ensemble policy distillation*: the ensemble is the **teacher**;
+  a single small network (the **student**) is trained by supervised regression to
+  match the teacher's Q-values from the local observation alone. Result:
+  ensemble-level behaviour at **single-network** cost — one deployable policy.
+
+  $$\mathcal{L}_{\text{distill}} = \mathbb{E}\bigl[(Q^{\text{student}}(o) - Q^{\text{ensemble}}(o))^2\bigr]$$
+
+Only QMIX + TransfQMix are combined: the tabular methods know just one grid, and
+MAPPO outputs probabilities (not Q-values), so neither mixes cleanly.
+
+Run the whole pipeline (train all → ensemble → distill → compare):
+
+```bash
+pip install -e ".[ensemble]"
+python scripts/compare_all.py          # or: docker compose run --rm compare-all
+```
 
 ### Indicative results (short CPU training runs)
 

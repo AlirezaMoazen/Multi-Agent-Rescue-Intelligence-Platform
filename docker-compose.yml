@@ -60,3 +60,8 @@ services:
   train-transfqmix:
     <<: *base
     command: python scripts/train_transfqmix.py --episodes 200
+
+  # ── Compare all methods + ensemble + distilled student ──────────────
+  compare-all:
+    <<: *base
+    command: python scripts/compare_all.py

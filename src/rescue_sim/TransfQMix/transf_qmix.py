@@ -29,9 +29,8 @@ import torch
 from torch import nn
 
 from rescue_sim.config.settings import TransfQmixSettings
-from rescue_sim.environment.grid import Position
-from rescue_sim.marl_common import ReplayBuffer, hard_update
 from rescue_sim.MAPPO.environment import RescueEnv
+from rescue_sim.shared import ReplayBuffer, hard_update
 
 # Entity-token features: [blocked, target-A, target-B, other-agent,
 #                         rel_x, rel_y, is_self, step_frac, remaining_frac]
@@ -52,27 +51,23 @@ class EntityRescueEnv(RescueEnv):
 
     def entity_obs(self) -> np.ndarray:
         """Per-agent token sets: shape (num_agents, n_tokens, TOKEN_DIM)."""
+        self._refresh_agent_count()
         return np.stack([self._agent_tokens(i) for i in range(self.num_agents)])
 
     def _agent_tokens(self, index: int) -> np.ndarray:
-        assert self.grid is not None
-        pos = self.positions[index]
-        others = {p for j, p in enumerate(self.positions) if j != index}
-        radius = max(1, self.view_radius)
-        tokens = []
-        for dy in range(-self.view_radius, self.view_radius + 1):
-            for dx in range(-self.view_radius, self.view_radius + 1):
-                cell = Position(pos.x + dx, pos.y + dy)
-                blocked = not self.grid.is_valid_position(cell)
-                ta = cell in self.grid.target_a_positions and cell not in self._rescued
-                tb = cell in self.grid.target_b_positions and cell not in self._rescued
-                tokens.append([float(blocked), float(ta), float(tb), float(cell in others),
-                               dx / radius, dy / radius, 0.0, 0.0, 0.0])
-        total = len(self.grid.target_a_positions | self.grid.target_b_positions)
-        remaining = (total - len(self._rescued)) / total if total else 0.0
-        tokens.append([0.0, 0.0, 0.0, 0.0, pos.x / self.grid.width,
-                       pos.y / self.grid.height, 1.0, self._steps / self.max_steps, remaining])
-        return np.array(tokens, dtype=np.float32)
+        # Reuse the parent's vectorized view channels; add relative offsets so
+        # each visible cell becomes one entity token, then a final self token.
+        blocked, target_a, target_b, other = self._view_channels(index)
+        zeros = np.zeros_like(blocked)
+        window = np.stack(
+            [blocked, target_a, target_b, other, self._rel_x, self._rel_y, zeros, zeros, zeros],
+            axis=-1,
+        ).reshape(self._win * self._win, TOKEN_DIM)
+        sx, sy, step_frac, remaining = self._scalars(index)
+        self_token = np.array(
+            [[0.0, 0.0, 0.0, 0.0, sx, sy, 1.0, step_frac, remaining]], dtype=np.float32
+        )
+        return np.concatenate([window, self_token], axis=0).astype(np.float32)
 
 
 class AgentTransformer(nn.Module):
