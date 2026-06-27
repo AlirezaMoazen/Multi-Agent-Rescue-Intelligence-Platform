@@ -17,29 +17,29 @@ from unittest.mock import MagicMock
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# Stub out rescue_sim.Qlearning.q_learning before importing communications
+# Import GossipMessage — use the real module if available, stub otherwise.
+# This avoids poisoning sys.modules when the real q_learning.py is present.
 # ---------------------------------------------------------------------------
 
+try:
+    from rescue_sim.Qlearning.q_learning import GossipMessage  # type: ignore[attr-defined]
+except ImportError:
+    @dataclass
+    class GossipMessage:  # type: ignore[no-redef]
+        """Minimal replica of the real GossipMessage wire format."""
 
-@dataclass
-class GossipMessage:
-    """Minimal replica of the real GossipMessage wire format."""
+        sender: int
+        indices: np.ndarray
+        values: np.ndarray
 
-    sender: int
-    indices: np.ndarray
-    values: np.ndarray
+        @property
+        def size(self) -> int:
+            return int(self.indices.size)
 
-    @property
-    def size(self) -> int:
-        return int(self.indices.size)
-
-
-_fake_mod = ModuleType("rescue_sim.Qlearning.q_learning")
-_fake_mod.GossipMessage = GossipMessage          # type: ignore[attr-defined]
-_fake_mod.EpidemicHystereticQLearning = MagicMock  # type: ignore[attr-defined]
-
-# Only stub the missing q_learning module; let Python find the real package.
-sys.modules["rescue_sim.Qlearning.q_learning"] = _fake_mod
+    _fake_mod = ModuleType("rescue_sim.Qlearning.q_learning")
+    _fake_mod.GossipMessage = GossipMessage  # type: ignore[attr-defined]
+    _fake_mod.EpidemicHystereticQLearning = MagicMock  # type: ignore[attr-defined]
+    sys.modules["rescue_sim.Qlearning.q_learning"] = _fake_mod
 
 from rescue_sim.Qlearning.communications import (  # noqa: E402
     CommunicationStats,
