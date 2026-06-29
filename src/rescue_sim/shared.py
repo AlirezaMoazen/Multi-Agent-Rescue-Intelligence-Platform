@@ -2,8 +2,9 @@
 
 This file is intentionally self-contained: it does not import or call other
 project modules. The first section mirrors the existing Sprint 2 code. The
-second section defines the new Sprint 3 contract that exploration, learning,
-and evaluation work should follow.
+second section defines the Sprint 3 contract that exploration, learning, and
+evaluation work should follow. The third section defines the minimum Sprint 4
+contract needed for independent multi-agent work.
 """
 
 from __future__ import annotations
@@ -321,6 +322,97 @@ class LearningState:
         return self.remaining_targets == 0 or self.steps_taken >= max_steps
 
 
+# New Sprint 4 multi-agent contracts
+
+
+AgentId = str
+JointAction = dict[AgentId, Action]
+CostByAgent = dict[AgentId, int | float]
+
+
+@dataclass(frozen=True, slots=True)
+class AgentStart:
+    """Configuration for one agent at scenario reset."""
+
+    agent_id: AgentId
+    position: Position
+    sensor_range: int
+
+
+@dataclass(frozen=True, slots=True)
+class MultiAgentSettings:
+    """Scenario-level settings needed by the multi-agent environment task."""
+
+    agents: tuple[AgentStart, ...]
+    communication_range: int = 0
+
+    @property
+    def num_agents(self) -> int:
+        return len(self.agents)
+
+
+@dataclass(frozen=True, slots=True)
+class TargetInfo:
+    """Shared target knowledge used by communication, reward, and evaluation."""
+
+    position: Position
+    target_type: TargetType
+    discovered_by: AgentId | None = None
+    discovered_step: int | None = None
+    rescued_by: AgentId | None = None
+    rescued_step: int | None = None
+    cost_by_agent: CostByAgent | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AgentState:
+    """Runtime state for one rescue agent."""
+
+    agent_id: AgentId
+    position: Position
+    sensor_range: int
+    active: bool = True
+    total_reward: float = 0.0
+    visited_cells: frozenset[Position] = frozenset()
+    last_action: Action | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AgentMessage:
+    """Information sent between nearby agents."""
+
+    sender_id: AgentId
+    receiver_id: AgentId | None
+    step: int
+    sender_position: Position
+    discovered_cells: frozenset[Position] = frozenset()
+    targets: tuple[TargetInfo, ...] = ()
+    target_costs: dict[Position, CostByAgent] | None = None
+    known_agent_positions: dict[AgentId, Position] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MultiAgentState:
+    """Full environment state shared by multi-agent environment and strategies."""
+
+    agents: dict[AgentId, AgentState]
+    shared_discovered_cells: frozenset[Position] = frozenset()
+    shared_obstacles: frozenset[Position] = frozenset()
+    shared_targets: dict[Position, TargetInfo] | None = None
+    rescued_targets: frozenset[Position] = frozenset()
+    remaining_target_a_positions: frozenset[Position] = frozenset()
+    remaining_target_b_positions: frozenset[Position] = frozenset()
+    messages: tuple[AgentMessage, ...] = ()
+    steps_taken: int = 0
+
+    @property
+    def remaining_targets(self) -> int:
+        return len(self.remaining_target_a_positions) + len(self.remaining_target_b_positions)
+
+    def is_terminal(self, max_steps: int) -> bool:
+        return self.remaining_targets == 0 or self.steps_taken >= max_steps
+
+
 @dataclass(frozen=True, slots=True)
 class RewardConfig:
     """Sprint 3 reward values; defaults preserve the current helper behavior."""
@@ -333,6 +425,11 @@ class RewardConfig:
     rescued_target_b: float = 10.0
     completed_episode_bonus: float = 0.0
     repeated_cell: float = 0.0
+    collision: float = 0.0
+    communication_cost: float = 0.0
+    useful_communication_bonus: float = 0.0
+    duplicate_target_penalty: float = 0.0
+    team_target_rescue_bonus: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,10 +438,16 @@ class RewardEvent:
 
     moved: bool
     move: str
+    agent_id: AgentId | None = None
     newly_discovered_cells: int = 0
     rescued_target_type: TargetType | None = None
     completed_episode: bool = False
     repeated_cell: bool = False
+    collision: bool = False
+    communication_sent: bool = False
+    useful_communication: bool = False
+    duplicate_target: bool = False
+    team_target_rescued: bool = False
 
 
 # Standard Sprint 3 reward configuration for Q-learning.
@@ -381,6 +484,21 @@ def calculate_reward(
     
     if event.repeated_cell:
         reward += config.repeated_cell
+
+    if event.collision:
+        reward += config.collision
+
+    if event.communication_sent:
+        reward += config.communication_cost
+
+    if event.useful_communication:
+        reward += config.useful_communication_bonus
+
+    if event.duplicate_target:
+        reward += config.duplicate_target_penalty
+
+    if event.team_target_rescued:
+        reward += config.team_target_rescue_bonus
         
     if event.completed_episode:
         reward += config.completed_episode_bonus
@@ -401,6 +519,21 @@ class Transition:
     observation: Observation
 
 
+@dataclass(frozen=True, slots=True)
+class MultiAgentTransition:
+    """Result expected from a Sprint 4 environment after one joint action."""
+
+    state: MultiAgentState
+    joint_action: JointAction
+    next_state: MultiAgentState
+    rewards: dict[AgentId, float]
+    team_reward: float
+    done: bool
+    movements: dict[AgentId, MovementResult]
+    observations: dict[AgentId, Observation]
+    messages: tuple[AgentMessage, ...] = ()
+
+
 @runtime_checkable
 class EnvironmentInterface(Protocol):
     """Interface that the real environment and temporary test doubles follow."""
@@ -412,6 +545,24 @@ class EnvironmentInterface(Protocol):
         ...
 
     def step(self, action: Action) -> Transition:
+        ...
+
+
+@runtime_checkable
+class MultiAgentEnvironmentInterface(Protocol):
+    """Interface for central or distributed multi-agent environments."""
+
+    def reset(self) -> MultiAgentState:
+        ...
+
+    def get_valid_actions(
+        self,
+        agent_id: AgentId,
+        state: MultiAgentState,
+    ) -> tuple[Action, ...]:
+        ...
+
+    def step(self, joint_action: JointAction) -> MultiAgentTransition:
         ...
 
 
@@ -428,6 +579,21 @@ class StrategyInterface(Protocol):
         ...
 
     def update(self, transition: Transition) -> None:
+        ...
+
+
+@runtime_checkable
+class MultiAgentStrategyInterface(Protocol):
+    """Common API for central and distributed multi-agent strategies."""
+
+    def select_actions(
+        self,
+        state: MultiAgentState,
+        valid_actions: dict[AgentId, tuple[Action, ...]],
+    ) -> JointAction:
+        ...
+
+    def update(self, transition: MultiAgentTransition) -> None:
         ...
 
 

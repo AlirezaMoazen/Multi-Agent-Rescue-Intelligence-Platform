@@ -1,5 +1,13 @@
 from rescue_sim.shared import Action, Grid, LearningState, Position, RewardConfig, RewardEvent
 from rescue_sim.shared import TargetType, calculate_reward, GridState, SPRINT3_REWARD_CONFIG
+from rescue_sim.shared import (
+    AgentMessage,
+    AgentStart,
+    AgentState,
+    MultiAgentSettings,
+    MultiAgentState,
+    TargetInfo,
+)
 
 
 def test_reference_grid_preserves_separate_target_types() -> None:
@@ -202,3 +210,88 @@ def test_sprint3_reward_calculation_behavior() -> None:
     )
     # expected: base (rescued_target_a = 150) + discovered_cell_bonus (2.0) + repeated_cell (-1.5) + completed_episode_bonus (50.0) = 200.5
     assert calculate_reward(event, config) == 200.5
+
+
+def test_multi_agent_settings_define_agent_starts_and_communication_range() -> None:
+    settings = MultiAgentSettings(
+        agents=(
+            AgentStart("agent-0", Position(0, 0), sensor_range=2),
+            AgentStart("agent-1", Position(4, 4), sensor_range=3),
+        ),
+        communication_range=2,
+    )
+
+    assert settings.num_agents == 2
+    assert settings.communication_range == 2
+    assert settings.agents[1].agent_id == "agent-1"
+
+
+def test_agent_message_contains_targets_costs_discovery_and_agent_info() -> None:
+    target = TargetInfo(
+        position=Position(3, 1),
+        target_type=TargetType.A,
+        discovered_by="agent-0",
+        discovered_step=5,
+        cost_by_agent={"agent-0": 4, "agent-1": 7},
+    )
+    message = AgentMessage(
+        sender_id="agent-0",
+        receiver_id="agent-1",
+        step=6,
+        sender_position=Position(1, 1),
+        discovered_cells=frozenset({Position(1, 1), Position(2, 1)}),
+        targets=(target,),
+        target_costs={Position(3, 1): {"agent-0": 4, "agent-1": 7}},
+        known_agent_positions={"agent-0": Position(1, 1), "agent-1": Position(4, 4)},
+    )
+
+    assert message.sender_id == "agent-0"
+    assert message.receiver_id == "agent-1"
+    assert message.targets[0].cost_by_agent == {"agent-0": 4, "agent-1": 7}
+    assert message.known_agent_positions["agent-1"] == Position(4, 4)
+
+
+def test_multi_agent_state_tracks_shared_map_agents_targets_and_conditions() -> None:
+    state = MultiAgentState(
+        agents={
+            "agent-0": AgentState(
+                agent_id="agent-0",
+                position=Position(0, 0),
+                sensor_range=2,
+                visited_cells=frozenset({Position(0, 0)}),
+            )
+        },
+        shared_discovered_cells=frozenset({Position(0, 0), Position(1, 0)}),
+        shared_targets={
+            Position(2, 0): TargetInfo(Position(2, 0), TargetType.B, discovered_by="agent-0")
+        },
+        remaining_target_b_positions=frozenset({Position(2, 0)}),
+        steps_taken=3,
+    )
+
+    assert state.remaining_targets == 1
+    assert state.is_terminal(max_steps=10) is False
+    assert state.agents["agent-0"].visited_cells == frozenset({Position(0, 0)})
+
+
+def test_reward_contract_supports_multi_agent_and_real_world_events() -> None:
+    config = RewardConfig(
+        move=-1.0,
+        collision=-20.0,
+        communication_cost=-0.2,
+        useful_communication_bonus=3.0,
+        duplicate_target_penalty=-5.0,
+        team_target_rescue_bonus=8.0,
+    )
+    event = RewardEvent(
+        moved=True,
+        move="right",
+        agent_id="agent-0",
+        collision=True,
+        communication_sent=True,
+        useful_communication=True,
+        duplicate_target=True,
+        team_target_rescued=True,
+    )
+
+    assert calculate_reward(event, config) == -15.2
