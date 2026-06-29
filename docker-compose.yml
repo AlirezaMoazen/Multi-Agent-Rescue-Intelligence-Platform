@@ -65,3 +65,8 @@ services:
   compare-all:
     <<: *base
     command: python scripts/compare_all.py
+
+  # ── Mixture-of-Experts: deep ensemble vs. adaptive tabular fleet ─────
+  train-moe:
+    <<: *base
+    command: python scripts/train_moe.py

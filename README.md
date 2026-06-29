@@ -8,11 +8,22 @@ improve rescue strategies over time.
 
 ## Project Status
 
-Current sprint: Sprint 2, May 6 - May 27
+The simulator foundation (Sprint 2) is complete, and every planned learning
+strategy is implemented and tested:
 
-Sprint 2 goal: create the first working damaged-area simulator foundation with
-grid environment, Target A/B spawning, valid movement, central sensor
-communication, simple visual output, and basic integration.
+- **Classical baselines** (no learning) — frontier/DFS exploration plus the MAPF
+  planners (prioritized planning, CBS, ICBS, ECBS, M\*), runnable single-agent
+  **and** as a synchronized multi-agent team.
+- **Tabular RL** — single-agent Q-learning and a decentralized
+  **Epidemic Hysteretic Q-Learning** fleet with peer-to-peer gossip.
+- **Deep MARL (CTDE)** — MAPPO, QMIX, and TransfQMix, plus a **ValueEnsemble**
+  and a distilled student that combine the two value methods.
+- **Mixture-of-Experts** — a performance gate that lets the adaptive tabular
+  fleet take over from the frozen deep ensemble once it solves a grid better.
+
+The whole test suite is green and every method trains on a normal CPU. The
+visualization API and React frontend consume these models, but extending those
+is a separate workstream.
 
 Planning documents:
 
@@ -22,22 +33,21 @@ Planning documents:
 
 ## Current Scope
 
-The current implementation focuses on the Sprint 2 damaged-area simulator
-foundation:
+The damaged-area simulator foundation provides:
 
-- generate grid-based rescue scenarios
-- configure grid size, obstacle density, targets, start positions, sensor range, and max steps
-- place obstacles and rescue targets using reproducible random seeds
-- distinguish between Target A and Target B
-- validate movements against walls, blocked cells, and obstacles
-- provide basic sensor observations
-- support basic communication between the agent and sensor model
-- run a simple scenario loop
-- produce basic visual/text feedback and metrics
+- grid-based rescue scenarios with configurable size, obstacle density, targets,
+  start positions, sensor range, and max steps
+- reproducible obstacle/target placement via random seeds, with distinct Target
+  A and Target B
+- movement validation against walls, blocked cells, and obstacles
+- central-sensor observations and a scenario/episode loop
+- text and web (React) visual feedback plus per-episode metrics
 
-Future increments will add autonomous exploration, single-agent learning,
-multi-agent coordination, distributed learning, uncertainty, validation, and
-final graphical/demo improvements.
+On top of that foundation, the project implements and **compares** a ladder of
+rescue strategies — from non-learning baselines, through tabular and
+decentralized RL, up to deep multi-agent RL and a mixture-of-experts gate (see
+[Learning Algorithms](#learning-algorithms)). Every method scores moves through
+the same reward/observation contract, so the comparison is apples-to-apples.
 
 ## Technology
 
@@ -47,52 +57,100 @@ Configuration and machine-readable output should use **YAML**.
 
 Main dependencies are declared in [pyproject.toml](pyproject.toml):
 
-- `numpy`
-- `pydantic`
-- `pyyaml`
-- `pytest` for tests
-- `ruff` for linting
+- `numpy` — all environment/tabular maths (vectorized)
+- `pydantic` — typed API request/response models
+- `pyyaml` — YAML scenario configuration
+- `fastapi` + `uvicorn` + `websockets` — the visualization API/server
+- `pytest` for tests, `ruff` for linting
+- `torch` — **optional**, only for the deep methods (MAPPO/QMIX/TransfQMix/
+  Ensemble/MoE). CPU-only is enough; install via the relevant extra, e.g.
+  `pip install -e ".[ensemble]"`.
 
 ## Project Layout
 
 ```text
 .
-|-- .gitlab-ci.yml             # GitLab CI pipeline
+|-- .gitlab-ci.yml             # GitLab CI pipeline (ruff + pytest)
+|-- Dockerfile                 # Container image (backend + built frontend + CPU torch)
+|-- docker-compose.yml         # viz / dev / test / lint / train-* / compare-all / train-moe
 |-- configs/
 |   `-- default_scenario.yaml  # Example YAML scenario configuration
-|-- docs/
-|   |-- architecture.md        # Architecture overview
-|   |-- product_backlog.md     # Ordered Product Backlog
-|   |-- requirements.yaml      # Project requirements
-|   `-- sprints/               # Sprint Backlogs and sprint planning
+|-- docs/                      # Architecture, backlog, requirements, sprint planning
 |-- scripts/
-|   `-- run_scenario.py        # Scenario runner entry point
+|   |-- run_scenario.py        # Scenario runner entry point
+|   |-- train_mappo.py         # Train MAPPO
+|   |-- train_qmix.py          # Train QMIX
+|   |-- train_transfqmix.py    # Train TransfQMix
+|   |-- compare_all.py         # Train all -> ensemble -> distill -> compare table
+|   `-- train_moe.py           # Mixture-of-Experts: deep ensemble vs. adaptive fleet
 |-- src/rescue_sim/
+|   |-- shared.py              # Project contract + shared deep-RL helpers
 |   |-- agents/                # Single-agent state and policy logic
 |   |-- config/                # YAML loading and typed settings
 |   |-- environment/           # Grid, generation, movement, sensing
-|   |-- learning/              # Baseline strategy and later learning methods
-|   |-- simulation/            # Simulation runner and metrics
-|   `-- visualization/         # Optional rendering helpers
+|   |-- Qlearning/             # Tabular: baselines, single-agent Q, Epidemic fleet,
+|   |                          #   gossip comms, multi-agent baseline adapter
+|   |-- MAPPO/                 # RescueEnv + MAPPO (policy-gradient, CTDE)
+|   |-- QMIX/                  # QMIX (monotonic value decomposition, CTDE)
+|   |-- TransfQMix/            # TransfQMix (transformer value decomposition, CTDE)
+|   |-- Ensemble/              # ValueEnsemble + distillation of QMIX + TransfQMix
+|   |-- MoE/                   # Mixture-of-Experts gate (deep ensemble vs. fleet)
+|   |-- simulation/            # Simulation runner, evaluation, metrics
+|   `-- visualization/         # FastAPI backend + React frontend
 `-- tests/                     # Unit and integration tests
 ```
 
 ## Learning Algorithms
 
-The project compares several learning strategies against two non-learning baselines.
+The project compares a ladder of rescue strategies against non-learning
+baselines. They all share one contract — the same `Action` set, `Grid`,
+observation, and `calculate_reward` — so the numbers are directly comparable.
 
-**Status:** ✅ all implemented — Q-Learning (single-agent baseline), **Epidemic Hysteretic Q-Learning** (decentralized multi-agent), **MAPPO** (deep, policy-gradient, CTDE), **QMIX** (deep, value-decomposition, CTDE), and **TransfQMix** (deep, transformer-based, CTDE).
+**Status:** ✅ all implemented — **Baselines** (frontier/DFS + MAPF planners, single- and multi-agent), **Q-Learning** (single-agent), **Epidemic Hysteretic Q-Learning** (decentralized multi-agent), **MAPPO** (deep, policy-gradient, CTDE), **QMIX** (deep, value-decomposition, CTDE), **TransfQMix** (deep, transformer-based, CTDE), a **ValueEnsemble** + distilled student, and a **Mixture-of-Experts** gate.
+
+> **Reading guide for juniors.** Each section below states *what problem the
+> method solves*, *the key equation in plain symbols*, and *how it differs from
+> its neighbours*. The thread connecting them: a single agent that memorizes
+> (Q-learning) → a decentralized fleet that shares knowledge (Epidemic) → deep
+> nets that generalize across grids (QMIX/TransfQMix/MAPPO) → combining them
+> (Ensemble) → and finally routing between a generalist and a specialist (MoE).
 
 ---
 
 ### Baseline (no learning)
 
-Two deterministic heuristics defined in `src/rescue_sim/Qlearning/baseline.py`:
+Defined in `src/rescue_sim/Qlearning/baseline.py`. None of these use a reward
+signal — they are the **performance floor** every learning method must beat.
 
-- **BaselineExplorer** — frontier-greedy: scores candidate moves by +2 for unvisited cells and +1 for frontier adjacency; always picks the best score.
-- **DFSExplorer** — depth-first search: maintains a LIFO stack of unvisited neighbors; uses BFS over the discovered map to navigate to non-adjacent targets.
+*Exploration heuristics:*
 
-No reward signal is used. These are the performance floor every learning method must beat.
+- **BaselineExplorer** (`frontier`) — frontier-greedy: scores candidate moves +2 for unvisited cells and +1 for frontier adjacency; always picks the best score.
+- **DFSExplorer** (`dfs`) — depth-first search: a LIFO stack of unvisited neighbors, with BFS over the discovered map to reach non-adjacent targets.
+
+*Classical multi-agent path-finding (MAPF) planners:*
+
+- **PrioritizedPlanningExplorer** (`prioritized_planning`) — plans agents one at a time in priority order; each treats higher-priority agents' paths as moving obstacles.
+- **CBSExplorer** / **ICBSExplorer** / **ECBSExplorer** (`cbs`/`icbs`/`ecbs`) — Conflict-Based Search: plan each agent independently, detect the first conflict, branch by adding a constraint to one agent, and re-plan. ICBS improves conflict selection; ECBS is the bounded-suboptimal, faster variant.
+- **MStarExplorer** (`mstar`) — M\*: searches the joint configuration space but only "couples" agents where their individual optimal paths actually collide, keeping the branching factor low.
+
+**Multi-agent runner.** `run_multi_agent_baseline` /
+`compare_multi_agent_baselines` (`src/rescue_sim/Qlearning/multi_agent_baseline.py`)
+run **any** of these strategies as a synchronized team on one shared grid:
+shared sensor memory, deterministic collision resolution (a move into an
+occupied/reserved cell is cancelled and counted), and team-level metrics
+(success, rescued, steps, collisions, per-agent reward). This gives the MARL
+methods a *fair, AI-free multi-agent* comparison point. Run it:
+
+```python
+from rescue_sim.config.settings import GridSettings
+from rescue_sim.Qlearning.multi_agent_baseline import compare_multi_agent_baselines
+
+gs = GridSettings(width=8, height=8, obstacle_probability=0.1,
+                  target_a_count=2, target_b_count=2, random_seed=7)
+results = compare_multi_agent_baselines(gs, num_agents=3, max_steps=200, seed=7)
+for name, m in results.items():
+    print(name, m.success, f"{m.rescued_targets}/{m.total_targets}", m.steps, m.collisions)
+```
 
 ---
 
@@ -158,9 +216,12 @@ When robots cluster, the number of candidate links explodes. Two throttles bound
 
 Slots are pre-allocated to capacity and gated by an `active` mask, so robots can **fail or join mid-operation** in $O(1)$ with no reallocation. A removed robot's Q-table is retained for a possible rejoin (`forget_agent` releases the slot entirely).
 
-**Communication boundary.** The learner owns the *mechanism* (proximity detection, delta export/import, max-merge, throttling). The physical *transport* — line-of-sight, packet loss, latency, bandwidth budgeting — is deliberately left to `src/rescue_sim/communications.py`, which documents the hand-off and ships a working `ProximityGossipBus` reference plus state-of-the-art upgrade suggestions (version-vector anti-entropy, Merkle digests, robust aggregation).
+**Communication boundary.** The learner owns the *mechanism* (proximity detection, delta export/import, max-merge, throttling). The physical *transport* — line-of-sight, packet loss, latency, bandwidth budgeting — lives in `src/rescue_sim/Qlearning/communications.py`, which ships two buses with one `exchange(fleet) -> int` method:
 
-**Step-loop contract** (one timestep): `select_actions` → environment applies the moves → `record_transitions` (hysteretic update) → `gossip` (epidemic max-sync).
+- **`DefaultCommsBus`** — the perfect-channel baseline; delegates straight to `fleet.gossip()`.
+- **`ResilientCommsBus`** — a realistic channel with three independent, configurable impairments: probabilistic **packet loss** (`drop_prob`), a **bandwidth cap** (`max_entries_per_message`, keeps the top-|Q| entries), and **transmission delay** (`delay_steps`, store-and-forward). It also records `CommunicationStats` (syncs, drops, entries sent/improved) so the report can quantify the cost of the channel.
+
+**Step-loop contract** (one timestep): `select_actions` → environment applies the moves → `record_transitions` (hysteretic update) → `bus.exchange(fleet)` (epidemic max-sync over the chosen channel).
 
 ```python
 from rescue_sim.Qlearning.q_learning import EpidemicHystereticQLearning
@@ -170,11 +231,14 @@ fleet = EpidemicHystereticQLearning(grid, HystereticConfig(), GossipConfig(), ma
 fleet.add_agent("r1", start)          # robots may join (or fail via remove_agent) any time
 fleet.add_agent("r2", start2)
 
+from rescue_sim.Qlearning.communications import DefaultCommsBus
+bus = DefaultCommsBus()               # or ResilientCommsBus(drop_prob=0.3, delay_steps=2)
+
 for _ in range(max_steps):
     actions = fleet.select_actions()  # {agent_id: action_index in 0..3 = N,S,E,W}
     rewards, next_positions, dones = environment_step(actions)
     fleet.record_transitions(actions, rewards, next_positions, dones)
-    fleet.gossip()                    # or: ProximityGossipBus(...).exchange(fleet)
+    bus.exchange(fleet)               # epidemic max-sync over the chosen channel
 ```
 
 ---
@@ -403,10 +467,11 @@ print(trainer.evaluate(episodes=20))   # greedy success rate / steps
 
 ---
 
-### Code structure (how the deep methods share code)
+### Code structure (how the methods share code)
 
-The three deep methods are deliberately small because they share their plumbing,
-so each algorithm file tells one clear story:
+The methods are deliberately small because they share their plumbing — one
+environment, one reward/observation contract, one set of helpers — so each
+algorithm file tells one clear story and there is no copy-paste between them:
 
 ```text
 src/rescue_sim/
@@ -414,14 +479,22 @@ src/rescue_sim/
 │                        #   Action, CARDINAL_ACTIONS, RewardConfig, Grid, ... AND
 │                        #   ReplayBuffer, RunningMeanStd, orthogonal_init, hard_update
 │                        #   (torch is imported lazily so shared.py stays import-light)
+├── Qlearning/
+│   ├── baseline.py            # frontier/DFS + MAPF planners (CBS/ICBS/ECBS/M*)
+│   ├── q_learning.py          # single-agent Q + Epidemic Hysteretic fleet
+│   ├── communications.py      # Default/Resilient gossip buses (the channel)
+│   └── multi_agent_baseline.py# run any baseline as a synchronized team
 ├── MAPPO/
 │   ├── environment.py   # RescueEnv — the cooperative env (pure NumPy, vectorized)
 │   └── mappo.py         # policy-gradient trainer
 ├── QMIX/qmix.py         # value-decomposition trainer (reuses RescueEnv)
 ├── TransfQMix/transf_qmix.py  # transformer trainer (reuses RescueEnv + buffer)
-└── Ensemble/
-    ├── ensemble.py      # ValueEnsemble: combine QMIX + TransfQMix at test time
-    └── distill.py       # Distiller: compress the ensemble into one student net
+├── Ensemble/
+│   ├── ensemble.py      # ValueEnsemble: combine QMIX + TransfQMix at test time
+│   └── distill.py       # Distiller: compress the ensemble into one student net
+└── MoE/moe.py           # Mixture-of-Experts gate: frozen ensemble vs. adaptive
+                         #   fleet on one fixed grid (reuses the ensemble, the
+                         #   fleet, the comms bus, and the spread-start placement)
 ```
 
 - **One environment.** `RescueEnv` is written once and reused by all the deep
@@ -463,6 +536,64 @@ pip install -e ".[ensemble]"
 python scripts/compare_all.py          # or: docker compose run --rm compare-all
 ```
 
+### Mixture-of-Experts (generalist deep ensemble vs. specialist fleet) — ✅ implemented
+
+Implemented in `src/rescue_sim/MoE/moe.py`. Where the *Ensemble* combines two
+deep methods that are good at the **same** thing, the **Mixture-of-Experts**
+combines two methods that are good at **different** things and lets a gate pick
+between them:
+
+- **Expert 1 — the generalist.** The frozen `ValueEnsemble` (QMIX + TransfQMix).
+  Trained over many random grids, it acts well on a grid it has never seen, but
+  it never adapts to the grid in front of it.
+- **Expert 2 — the specialist.** `EpidemicHystereticQLearning`, the tabular
+  fleet. It knows nothing about a fresh grid, but on a **fixed** grid it learns
+  a little more every try.
+
+**The gate.** Both experts are scored on the *same fixed grid* with one number:
+
+$$\text{score} = \underbrace{2\cdot\mathbb{1}[\text{success}]}_{\text{rescued all targets?}} \;+\; \underbrace{\tfrac{\text{rescued}}{\text{targets}}}_{\in[0,1]} \;-\; \underbrace{\tfrac{1}{2}\cdot\tfrac{\text{steps}}{\text{steps}_{\max}}}_{\text{tie-break: be quick}}$$
+
+The first term dominates, so a full rescue always beats a partial one; ties are
+broken by speed. The score reads the environment's `success/rescued/steps`
+info — **not** the reward — so the two experts stay comparable even though the
+specialist *trains* on a navigation-focused reward (a tabular cell-state learner
+needs a Markovian reward; the deep nets are frozen, so eval is reward-agnostic).
+
+**The loop.** On every try the fleet plays one learning episode (hysteretic TD
+update + a gossip round), then is scored greedily against the (constant) deep
+score. The behaviour policy is the current leader's: **while the deep expert
+leads it demonstrates** — the fleet learns *off-policy* (Q-learning is
+off-policy) from the generalist's trajectories, which is how a tabular learner
+bootstraps on a grid too large to stumble onto targets by chance — and **once
+the fleet leads it self-plays** with its own ε-greedy policy. The expert leading
+at the start of a try drives that try; the moment the specialist's greedy score
+beats the deep score, it leads from the **next** try on, and keeps learning:
+
+```python
+from rescue_sim.MoE import MixtureOfExperts
+from rescue_sim.config.settings import MoeSettings
+
+moe = MixtureOfExperts(value_ensemble, MoeSettings(num_trials=30))
+report = moe.run()
+print(report.surpassed_at, report.final_leader)   # e.g. 8, "adaptive"
+report.to_dict()                                   # JSON-ready per-try history (API/frontend)
+```
+
+**Why this is the safe way to combine them.** The gate only hands over when the
+specialist is *measurably* better, so the MoE never does worse than the deep
+ensemble. On a grid the specialist can master (navigation-style, few targets) it
+overtakes the generalist — for example a single-target grid where the generalist
+gets stuck while the fleet learns the route. On harder multi-target layouts the
+tabular cell-state (which has no memory of *which* targets remain) can't
+represent the plan, so the gate simply keeps the generalist in charge. This is
+the honest trade-off, and the gate makes it free.
+
+```bash
+pip install -e ".[ensemble]"
+python scripts/train_moe.py            # or: docker compose run --rm train-moe
+```
+
 ### Indicative results (short CPU training runs)
 
 Greedy success rate on freshly generated grids (each episode is a new random map,
@@ -476,6 +607,18 @@ so this measures generalisation, not memorisation):
 
 All trained on CPU in minutes (TransfQMix is slowest — transformers are heavier).
 Numbers are indicative of short runs; longer training improves all three.
+
+**Mixture-of-Experts** is measured differently — on **one fixed grid**, not fresh
+ones, because that is where a specialist can shine:
+
+- On a grid the deep ensemble already solves well (small / few-target), the
+  tabular fleet learns it from the generalist's demonstrations and **matches or
+  overtakes** it on step-efficiency — `train_moe.py` reports the try it took over.
+- On the full 20×20 / 4-target task, the well-trained generalist leads and the
+  fleet is the *adaptive challenger*: it imitates and improves but, being tabular
+  with a memoryless cell-state, does not fully match a strong deep model on a
+  grid that large and sparse. The gate then simply keeps the generalist — so the
+  MoE is always **at least as good as** the deep ensemble, by construction.
 
 ### Sources & further reading
 
@@ -494,6 +637,10 @@ Numbers are indicative of short runs; longer training improves all three.
   Using Generalized Advantage Estimation*, ICLR 2016 — <https://arxiv.org/abs/1506.02438>
 - **CTDE paradigm** — *Centralized Training, Decentralized Execution* survey —
   <https://arxiv.org/abs/2409.03052>
+- **Policy distillation** (used by the Ensemble's `Distiller`) — Rusu et al.,
+  *Policy Distillation*, ICLR 2016 — <https://arxiv.org/abs/1511.06295>
+- **Mixture-of-Experts** (the gating idea behind `MoE/`) — Jacobs et al.,
+  *Adaptive Mixtures of Local Experts*, Neural Computation 1991.
 
 ---
 

@@ -146,3 +146,37 @@ class DistillSettings:
     batch_size: int = 64
     random_seed: int | None = None
 
+
+@dataclass(frozen=True)
+class MoeSettings:
+    """Settings for the Mixture-of-Experts gate (see rescue_sim.MoE).
+
+    The MoE pits a *fixed* deep expert (the trained QMIX+TransfQMix ensemble,
+    which generalizes across grids) against an *adaptive* expert (tabular
+    Epidemic Hysteretic Q-Learning, which specializes on one grid). A
+    performance gate routes each try to whichever currently solves the grid
+    better; the adaptive expert keeps learning every try, so on a fixed grid it
+    eventually overtakes the generalist and takes over.
+
+    The Hysteretic/Gossip fields mirror ``shared.HystereticConfig`` and
+    ``shared.GossipConfig`` exactly; see ``FleetSettings`` for the same group.
+    """
+
+    num_trials: int = 30          # repeated attempts on the same fixed grid
+    # Adaptive (Epidemic Hysteretic Q-Learning) expert.
+    alpha: float = 0.5            # learning rate for positive TD error
+    beta: float = 0.1             # muted learning rate for negative TD error (beta <= alpha)
+    discount_factor: float = 0.95
+    epsilon_start: float = 0.5    # starting exploration for the tabular learner
+    epsilon_decay: float = 0.02   # subtracted from epsilon after every try
+    epsilon_floor: float = 0.02   # exploration never drops below this
+    max_agents: int = 20          # pre-allocated fleet capacity (1 <= N <= 64)
+    # Epidemic gossip channel (shared Q-table deltas between nearby agents).
+    comm_radius: float = 3.0
+    gossip_cooldown: int = 5
+    max_links_per_step: int = 2
+    utility_threshold: float = 0.0
+    # Grid + reproducibility.
+    grid_seed: int = 0            # seed for the one fixed grid the experts compete on
+    random_seed: int | None = 0
+
