@@ -21,9 +21,16 @@ strategy is implemented and tested:
 - **Mixture-of-Experts** — a performance gate that lets the adaptive tabular
   fleet take over from the frozen deep ensemble once it solves a grid better.
 
-The whole test suite is green and every method trains on a normal CPU. The
-visualization API and React frontend consume these models, but extending those
-is a separate workstream.
+The whole test suite is green and every method trains on a normal CPU.
+
+> **Legacy note.** Anything tied to the original *single-agent* flow
+> (`QLearningAgent`, `agents.SingleAgent`, the single-agent evaluation path) is
+> kept but **marked legacy** — superseded by the multi-agent line-up above. The
+> visualization **API and React frontend still drive that legacy single-agent
+> demo**; wiring them to the multi-agent models / the MoE is a separate
+> workstream for the API/frontend developer, so the live UI may not exercise the
+> new methods yet. The Python library, training scripts, and tests are the
+> source of truth for the multi-agent work.
 
 Planning documents:
 

@@ -348,6 +348,9 @@ def train_q_learning_agent(
     grid: Grid,
     training_episodes: int,
 ) -> LearningFeedback:
+    # Legacy single-agent Q-learning path: retained for the visualization API and
+    # the evaluation panel. The multi-agent line-up (Epidemic fleet, QMIX,
+    # TransfQMix, MAPPO, MoE) does not go through here.
     traces = [
         run_q_learning_agent_on_grid(scenario, grid, learner, training=True)
         for _ in range(training_episodes)
