@@ -1,35 +1,35 @@
-"""Mixture-of-Experts (MoE) gate: generalist deep ensemble vs. specialist fleet.
+"""Mixture-of-Experts (MoE) router over every rescue strategy in the project.
 
-Motivation
-----------
-The deep value methods (QMIX, TransfQMix, and their ``ValueEnsemble``) are
-*generalists*: trained over many random grids, they act well on a grid they have
-never seen, but they are frozen at deployment and never adapt to the grid in
-front of them. ``EpidemicHystereticQLearning`` is the opposite -- a tabular
-*specialist* that knows nothing about a fresh grid but can learn that one grid
-very well if it is allowed to try repeatedly.
+This is the project's top-level "use the best method for *this* grid" layer. It
+is a **performance-gated Mixture of Experts**, which is exactly the classical
+**per-instance algorithm-selection / portfolio** problem (Rice 1976; SATzilla,
+Xu et al. 2008) phrased as an MoE with mostly *fixed* experts (Jacobs et al.
+1991): a gate scores each expert on the grid in front of it and routes the fleet
+to whichever solves it best.
 
-This module combines the two with a classic Mixture-of-Experts pattern:
+The expert pool is the whole project:
 
-* **Experts.** Expert 1 is the frozen deep ensemble. Expert 2 is the adaptive
-  tabular fleet.
-* **Gate.** A performance gate scores both experts on the *same* fixed grid and
-  routes the fleet to whichever currently solves it better.
-* **The trick.** The adaptive expert keeps learning on *every* try -- even while
-  the deep expert is the one driving -- so its score climbs try after try. On a
-  fixed grid it eventually beats the generalist; from the next try on it drives
-  the fleet and keeps improving.
+* **Classical (no-AI) experts** -- the 7 baselines (frontier, DFS, prioritized
+  planning, CBS, ICBS, ECBS, M*), run as a synchronized team.
+* **Deep experts (frozen)** -- QMIX, TransfQMix, MAPPO, and their ValueEnsemble.
+* **One adaptive expert** -- the ``EpidemicHystereticQLearning`` fleet, which
+  keeps learning *this* grid on every try.
 
-Everything is comparable because both experts share the project contract:
-``RescueEnv`` actions are indices into ``CARDINAL_ACTIONS`` (N, S, E, W) and both
-experts read the same ``Grid``. The MoE never retrains the deep nets; it only
-runs them greedily and lets the tabular learner catch up.
+The gate is what makes the combination safe: it only ever serves the
+best-scoring expert, so the MoE is **never worse than the strongest single
+method**. The twist over a static portfolio: the adaptive expert improves every
+try (bootstrapping off-policy from the best deep expert's demonstrations while
+it is behind), so on a grid it can master it climbs the leaderboard and takes
+over -- and from then on it self-plays.
 
-Requires torch (the deep expert): ``pip install -e ".[ensemble]"``.
+Everything is comparable because every expert is scored on the same fixed grid
+with the same ``solve_score`` (read from the environment's success/rescued/steps,
+not the reward). Requires torch for the deep experts: ``pip install -e ".[ensemble]"``.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 
 import numpy as np
@@ -37,14 +37,22 @@ import numpy as np
 from rescue_sim.config.settings import GridSettings, MoeSettings
 from rescue_sim.environment.generator import generate_grid
 from rescue_sim.environment.grid import Grid, Position
-from rescue_sim.Ensemble.ensemble import ValueEnsemble
 from rescue_sim.Qlearning.communications import DefaultCommsBus
-from rescue_sim.Qlearning.multi_agent_baseline import default_start_positions
+from rescue_sim.Qlearning.multi_agent_baseline import (
+    DEFAULT_MULTI_AGENT_BASELINES,
+    default_start_positions,
+    run_multi_agent_baseline,
+)
 from rescue_sim.Qlearning.q_learning import EpidemicHystereticQLearning
 from rescue_sim.shared import GossipConfig, HystereticConfig, RewardConfig
 from rescue_sim.TransfQMix.transf_qmix import EntityRescueEnv
 
-# All agents start at the grid origin, matching RescueEnv.reset().
+# A greedy joint-action policy: given the env and its flat observation, return
+# one action index (into CARDINAL_ACTIONS) per agent. This is the uniform
+# interface the gate uses to roll any deep expert out on the fixed grid.
+Policy = Callable[["FixedGridEntityEnv", np.ndarray], np.ndarray]
+
+# All agents start at the grid origin unless spread starts are supplied.
 START = Position(0, 0)
 
 # Reward the adaptive (tabular) expert learns from. Its state is just the grid
@@ -54,9 +62,8 @@ START = Position(0, 0)
 # are not a function of the cell alone, which -- combined with the hysteretic
 # max-only update and the epidemic max-merge -- would inflate every Q-value
 # instead of forming a gradient toward the targets. This only changes what the
-# fleet *learns*: the gate scores both experts from the environment's
-# success/rescued/steps info (not the reward), so the comparison stays fair, and
-# the frozen deep experts are evaluated greedily (reward-independent).
+# fleet *learns*: the gate scores every expert from the environment's
+# success/rescued/steps info (not the reward), so the comparison stays fair.
 ADAPTIVE_REWARD_CONFIG = RewardConfig(
     move=-1.0,
     invalid_move=-5.0,
@@ -69,11 +76,16 @@ ADAPTIVE_REWARD_CONFIG = RewardConfig(
 )
 
 
+# ---------------------------------------------------------------------------
+# Fixed-grid environment
+# ---------------------------------------------------------------------------
+
+
 class FixedGridEntityEnv(EntityRescueEnv):
     """An ``EntityRescueEnv`` pinned to ONE grid (reset reuses it, never regenerates).
 
     The base environment draws a fresh random grid on every ``reset()``. The MoE
-    instead needs both experts to compete on the *same* rescue instance -- that
+    instead needs every expert to compete on the *same* rescue instance -- that
     is what "solve the grid" means here -- so this subclass freezes the grid and
     only resets agent positions and bookkeeping. All observation, stepping,
     reward, and metric logic is inherited unchanged (no duplication).
@@ -107,9 +119,6 @@ class FixedGridEntityEnv(EntityRescueEnv):
             seed=0,
         )
         self._fixed_grid = grid
-        # Spread-out, reachable starts let the memoryless fleet divide several
-        # targets (each agent flows to its nearest); defaults to all-origin to
-        # match the base RescueEnv when no starts are given.
         self._start_positions = list(start_positions) if start_positions else [
             START for _ in range(num_agents)
         ]
@@ -126,6 +135,11 @@ class FixedGridEntityEnv(EntityRescueEnv):
         return self._observations()
 
 
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+
+
 def solve_score(info: dict, max_steps: int) -> float:
     """Scalar "how well was the grid solved" score; higher is better.
 
@@ -137,8 +151,7 @@ def solve_score(info: dict, max_steps: int) -> float:
     * fewer steps is better (``-0.5 * step_frac`` breaks ties between two runs
       that rescued the same number).
 
-    Returning one float keeps the gate trivial to compare and the history easy
-    to plot in the API/frontend.
+    One float keeps the gate trivial to compare and the history easy to plot.
     """
     targets = info.get("targets", 0) or 0
     rescued_frac = info["rescued"] / targets if targets else 1.0
@@ -147,7 +160,7 @@ def solve_score(info: dict, max_steps: int) -> float:
 
 
 def _metrics(info: dict, max_steps: int) -> dict:
-    """Serializable per-expert result for one try (API/frontend friendly)."""
+    """Serializable per-expert result for one grid (API/frontend friendly)."""
     return {
         "success": bool(info["success"]),
         "rescued": int(info["rescued"]),
@@ -157,24 +170,66 @@ def _metrics(info: dict, max_steps: int) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Greedy policy adapters for the deep experts
+# ---------------------------------------------------------------------------
+# Each returns a uniform ``Policy`` so the gate can roll any model out on the
+# fixed grid without knowing its internals.
+
+
+def qmix_policy(qmix) -> Policy:
+    def act(env: FixedGridEntityEnv, flat_obs: np.ndarray) -> np.ndarray:
+        return qmix.select_actions(flat_obs, env.valid_action_mask(), greedy=True)
+
+    return act
+
+
+def transf_policy(transf) -> Policy:
+    def act(env: FixedGridEntityEnv, _flat_obs: np.ndarray) -> np.ndarray:
+        return transf.select_actions(env.entity_obs(), env.valid_action_mask(), greedy=True)
+
+    return act
+
+
+def ensemble_policy(ensemble) -> Policy:
+    def act(env: FixedGridEntityEnv, flat_obs: np.ndarray) -> np.ndarray:
+        return ensemble.select_actions(flat_obs, env.entity_obs(), env.valid_action_mask())
+
+    return act
+
+
+def mappo_policy(mappo) -> Policy:
+    import torch
+
+    def act(env: FixedGridEntityEnv, flat_obs: np.ndarray) -> np.ndarray:
+        mask = torch.as_tensor(env.valid_action_mask())
+        logits = mappo.net.actor(torch.as_tensor(flat_obs).float()).masked_fill(~mask, -1e8)
+        return logits.argmax(dim=-1).numpy()
+
+    return act
+
+
+# ---------------------------------------------------------------------------
+# Report types
+# ---------------------------------------------------------------------------
+
+
 @dataclass(frozen=True, slots=True)
 class MoeTrial:
-    """One try on the fixed grid (one row of the MoE history)."""
+    """One try on the fixed grid: how the adaptive fleet did and who led."""
 
     trial: int
-    leader: str          # expert that drove the fleet THIS try: "deep" | "adaptive"
-    deep: dict           # deep-expert metrics on the grid (constant; it is frozen)
-    adaptive: dict       # adaptive-expert greedy metrics after this try's learning
-    epsilon: float       # adaptive learner's current exploration rate
-    mean_q: float        # mean Q-value across the fleet (learning-progress signal)
-    syncs: int           # gossip syncs performed during this try's learning episode
+    leader: str          # expert that would be served this try (best score so far)
+    fleet: dict          # adaptive-fleet greedy metrics after this try's learning
+    epsilon: float       # fleet's current exploration rate
+    mean_q: float        # mean Q across the fleet (learning-progress signal)
+    syncs: int           # gossip syncs during this try's learning episode
 
     def to_dict(self) -> dict:
         return {
             "trial": self.trial,
             "leader": self.leader,
-            "deep": self.deep,
-            "adaptive": self.adaptive,
+            "fleet": self.fleet,
             "epsilon": round(self.epsilon, 4),
             "mean_q": round(self.mean_q, 4),
             "syncs": self.syncs,
@@ -183,87 +238,94 @@ class MoeTrial:
 
 @dataclass
 class MoeReport:
-    """Outcome of an MoE run: per-try history plus a short summary."""
+    """Outcome of an MoE run: the fixed-expert leaderboard plus the fleet's climb."""
 
+    leaderboard: dict = field(default_factory=dict)   # frozen expert name -> metrics
+    teacher: str | None = None                        # deep expert that taught the fleet
     history: list[MoeTrial] = field(default_factory=list)
-    surpassed_at: int | None = None   # first try the adaptive expert beat the deep one
-    final_leader: str = "deep"
-    deep_score: float = 0.0
-    best_adaptive_score: float = 0.0
+    surpassed_at: int | None = None                   # first try the fleet led overall
+    final_leader: str = ""
+    best_fleet_score: float = 0.0
 
     def to_dict(self) -> dict:
         return {
+            "leaderboard": self.leaderboard,
+            "teacher": self.teacher,
             "history": [t.to_dict() for t in self.history],
             "surpassed_at": self.surpassed_at,
             "final_leader": self.final_leader,
-            "deep_score": round(self.deep_score, 4),
-            "best_adaptive_score": round(self.best_adaptive_score, 4),
+            "best_fleet_score": round(self.best_fleet_score, 4),
         }
 
 
+# ---------------------------------------------------------------------------
+# The Mixture-of-Experts router
+# ---------------------------------------------------------------------------
+
+FLEET = "EpidemicFleet"
+
+
 class MixtureOfExperts:
-    """Gate the trained deep ensemble against an adaptive tabular fleet on one grid.
+    """Performance-gated router over classical, deep, and adaptive rescue experts.
 
     Parameters
     ----------
-    deep_expert:
-        A ``ValueEnsemble`` of a trained QMIX + TransfQMix. It is used only to
-        *act* (greedily); it is never retrained. The fixed grid the experts
-        compete on, the agent count, the view radius, the episode length, and
-        the reward config are all taken from this ensemble's models so the two
-        experts are guaranteed comparable.
-    settings:
-        Mixture and adaptive-learner hyper-parameters (see ``MoeSettings``).
-    grid:
-        The single grid both experts compete on. If ``None``, one is generated
-        from the deep models' ``GridSettings`` using ``settings.grid_seed``.
-    comms:
-        Communication bus for the epidemic gossip round each learning step.
-        Defaults to ``DefaultCommsBus`` (perfect channel); pass a
-        ``ResilientCommsBus`` to study lossy/limited links.
+    deep_experts:
+        ``{name: greedy Policy}`` for the frozen deep models (see ``from_models``
+        and the ``*_policy`` adapters). Used both as gate candidates and as the
+        teacher pool for the adaptive fleet.
+    ref_env:
+        Any ``RescueEnv``/``EntityRescueEnv`` the deep models were built with --
+        the fixed grid, agent count, view radius, episode length, and grid
+        settings are taken from it so every expert is dimension-compatible.
+    settings, grid, comms:
+        Mixture hyper-parameters, an optional fixed grid (else generated from
+        ``ref_env`` + ``settings.grid_seed``), and the fleet's gossip bus.
+    baselines:
+        ``{name: factory}`` of classical (no-AI) strategies to include as
+        gate candidates; defaults to all seven.
     """
 
     def __init__(
         self,
-        deep_expert: ValueEnsemble,
+        deep_experts: Mapping[str, Policy],
+        ref_env,
         settings: MoeSettings = MoeSettings(),
         grid: Grid | None = None,
         comms=None,
+        baselines: Mapping[str, Callable] = DEFAULT_MULTI_AGENT_BASELINES,
         adaptive_reward_config: RewardConfig = ADAPTIVE_REWARD_CONFIG,
     ) -> None:
-        self.deep = deep_expert
+        self.deep_experts = dict(deep_experts)
+        self.baselines = dict(baselines)
         self.cfg = settings
         self.comms = comms if comms is not None else DefaultCommsBus()
 
-        # Inherit the deployment shape from the trained models so dimensions match.
-        deep_env = deep_expert.qmix.env
-        self.num_agents = deep_env.num_agents
-        self.max_steps = deep_env.max_steps
-        view_radius = deep_env.view_radius
+        self.num_agents = ref_env.num_agents
+        self.max_steps = ref_env.max_steps
+        self.view_radius = ref_env.view_radius
+        self.sensor_range = max(2, ref_env.view_radius)
 
         if grid is None:
-            grid_settings = replace(deep_env.grid_settings, random_seed=settings.grid_seed)
+            grid_settings = replace(ref_env.grid_settings, random_seed=settings.grid_seed)
             grid = generate_grid(grid_settings, START)
         self.grid = grid
 
-        # Spread, reachable, non-target start cells (reuses the multi-agent
-        # baseline's placement). With several targets this lets the memoryless
-        # fleet divide the work -- each agent's shared "go to nearest target"
-        # policy flows it to a different nearby target -- so the tabular
-        # specialist stays competitive on multi-target grids.
+        # Spread, reachable, non-target starts (reuses the multi-agent baseline's
+        # placement). With several targets this lets the memoryless fleet divide
+        # the work -- each agent's shared "go to nearest target" policy flows it
+        # to a different nearby target.
         start_map = default_start_positions(grid, self.num_agents)
         self.agent_ids = list(start_map)
         self.start_list = [start_map[aid] for aid in self.agent_ids]
         self.starts = dict(start_map)
 
-        # The shared, fixed-grid environment both experts roll out on. Its reward
-        # config drives only the adaptive learner (deep eval ignores reward, and
-        # the gate scores from env info), so it uses the navigation-focused reward.
+        # Shared fixed-grid env both the deep experts and the fleet roll out on.
         self.env = FixedGridEntityEnv(
             grid,
             num_agents=self.num_agents,
             max_steps=self.max_steps,
-            view_radius=view_radius,
+            view_radius=self.view_radius,
             reward_config=adaptive_reward_config,
             start_positions=self.start_list,
         )
@@ -290,38 +352,57 @@ class MixtureOfExperts:
             self.fleet.add_agent(aid, self.starts[aid])
         self._rng = np.random.default_rng(settings.random_seed)
 
+    # -- construction from trained models -----------------------------------
+
+    @classmethod
+    def from_models(
+        cls,
+        *,
+        qmix=None,
+        transf=None,
+        mappo=None,
+        ensemble=None,
+        settings: MoeSettings = MoeSettings(),
+        grid: Grid | None = None,
+        comms=None,
+        baselines: Mapping[str, Callable] = DEFAULT_MULTI_AGENT_BASELINES,
+    ) -> "MixtureOfExperts":
+        """Build an MoE from any subset of trained deep models (at least one)."""
+        deep: dict[str, Policy] = {}
+        ref_env = None
+        if qmix is not None:
+            deep["QMIX"] = qmix_policy(qmix)
+            ref_env = qmix.env
+        if transf is not None:
+            deep["TransfQMix"] = transf_policy(transf)
+            ref_env = transf.env
+        if mappo is not None:
+            deep["MAPPO"] = mappo_policy(mappo)
+            ref_env = mappo.env
+        if ensemble is not None:
+            deep["Ensemble"] = ensemble_policy(ensemble)
+            ref_env = ensemble.qmix.env
+        if ref_env is None:
+            raise ValueError("from_models needs at least one of qmix/transf/mappo/ensemble")
+        return cls(deep, ref_env, settings=settings, grid=grid, comms=comms, baselines=baselines)
+
     # -- rollouts -----------------------------------------------------------
 
-    def _greedy_episode(self, act) -> dict:
-        """Run one no-learning episode on the fixed grid; ``act`` picks the joint action.
-
-        ``act(env, flat_obs) -> np.ndarray`` returns one action index per agent.
-        Reused for both the deep eval and the adaptive greedy eval.
-        """
+    def _greedy_episode(self, policy: Policy) -> dict:
+        """Run one no-learning episode on the fixed grid driven by ``policy``."""
         flat_obs = self.env.reset()
         done = False
         info: dict = {}
         while not done:
-            actions = act(self.env, flat_obs)
+            actions = policy(self.env, flat_obs)
             flat_obs, _, done, info = self.env.step(actions)
         return info
 
-    def _deep_episode(self) -> dict:
-        """Greedy roll-out of the deep ensemble on the fixed grid."""
-
-        def act(env, flat_obs):
-            tokens = env.entity_obs()
-            avail = env.valid_action_mask()
-            return self.deep.select_actions(flat_obs, tokens, avail)
-
-        return self._greedy_episode(act)
-
     def _adaptive_greedy_episode(self) -> dict:
         """Greedy roll-out of the *current* fleet policy (read-only, no learning)."""
-        # greedy_policy(aid) is the best valid action per cell; index it by position.
         policies = {aid: self.fleet.greedy_policy(aid) for aid in self.agent_ids}
 
-        def act(env, _flat_obs):
+        def act(env: FixedGridEntityEnv, _flat_obs: np.ndarray) -> np.ndarray:
             return np.array(
                 [
                     policies[self.agent_ids[i]][env.positions[i].y, env.positions[i].x]
@@ -332,30 +413,41 @@ class MixtureOfExperts:
 
         return self._greedy_episode(act)
 
-    def _teacher_actions(self, flat_obs: np.ndarray) -> np.ndarray:
-        """Deep-expert joint action for the current env state, with epsilon noise.
+    def _baseline_metrics(self, name: str, factory: Callable) -> dict:
+        """Score one classical baseline as a synchronized team on the fixed grid."""
+        strategy = factory(self.cfg.random_seed)
+        result = run_multi_agent_baseline(
+            strategy=strategy,
+            grid=self.grid,
+            start_positions=self.starts,
+            max_steps=self.max_steps,
+            sensor_range=self.sensor_range,
+            strategy_name=name,
+        )
+        info = {
+            "success": result.success,
+            "rescued": result.rescued_targets,
+            "targets": result.total_targets,
+            "steps": result.steps,
+        }
+        return _metrics(info, self.max_steps)
 
-        Mixing in a little exploration means the fleet sees alternatives to the
-        demonstrated path, not just the single trajectory the teacher walks.
-        """
-        tokens = self.env.entity_obs()
+    def _teacher_actions(self, flat_obs: np.ndarray, teacher: Policy) -> np.ndarray:
+        """Teacher's greedy joint action with a little exploration noise."""
+        actions = teacher(self.env, flat_obs)
         avail = self.env.valid_action_mask()
-        actions = self.deep.select_actions(flat_obs, tokens, avail)
         for i in range(self.num_agents):
             if self._rng.random() < self.fleet.epsilon:
                 actions[i] = int(self._rng.choice(np.flatnonzero(avail[i])))
         return actions
 
-    def _learn_episode(self, teacher: str) -> tuple[dict, int]:
+    def _learn_episode(self, teacher: Policy | None) -> tuple[dict, int]:
         """One learning episode for the fleet on the fixed grid.
 
-        The *behaviour* policy is the current leader's. While the deep expert
-        leads it **demonstrates**: the fleet learns off-policy (Q-learning is
-        off-policy) from the generalist's trajectory, which is how the tabular
-        specialist bootstraps on grids too large to stumble onto targets by
-        chance. Once the fleet leads, it explores with its own epsilon-greedy
-        policy. Either way the fleet applies a hysteretic TD update and gossips
-        each step. Returns ``(episode_info, total_syncs)``.
+        With a ``teacher`` the fleet learns **off-policy** from that expert's
+        demonstrations (how it bootstraps on large/sparse grids); with ``None``
+        it explores with its own epsilon-greedy policy. Either way it applies a
+        hysteretic TD update and runs a gossip round each step.
         """
         flat_obs = self.env.reset()
         self.fleet.reset_positions(self.starts)
@@ -363,20 +455,19 @@ class MixtureOfExperts:
         info: dict = {}
         syncs = 0
         while not done:
-            if teacher == "deep":
-                actions = self._teacher_actions(flat_obs)
+            if teacher is not None:
+                actions = self._teacher_actions(flat_obs, teacher)
             else:
-                amap = self.fleet.select_actions()  # fleet's own epsilon-greedy policy
+                amap = self.fleet.select_actions()
                 actions = np.array(
                     [amap[self.agent_ids[i]] for i in range(self.num_agents)], dtype=np.int64
                 )
             action_map = {self.agent_ids[i]: int(actions[i]) for i in range(self.num_agents)}
             flat_obs, team_reward, done, info = self.env.step(actions)
-            # The cooperative team reward is shared by every agent.
             next_positions = {
                 self.agent_ids[i]: self.env.positions[i] for i in range(self.num_agents)
             }
-            rewards = {aid: team_reward for aid in self.agent_ids}
+            rewards = {aid: team_reward for aid in self.agent_ids}  # shared cooperative reward
             dones = {aid: done for aid in self.agent_ids}
             self.fleet.record_transitions(action_map, rewards, next_positions, dones)
             syncs += self.comms.exchange(self.fleet)
@@ -386,80 +477,69 @@ class MixtureOfExperts:
     # -- the gate -----------------------------------------------------------
 
     def run(self, num_trials: int | None = None) -> MoeReport:
-        """Run the MoE for ``num_trials`` tries and return the routing history.
+        """Score the fixed experts once, then let the fleet climb the leaderboard.
 
-        Each try: the adaptive expert learns one episode, then is scored
-        greedily and compared against the (constant) deep score. The expert that
-        was *leading at the start of the try* is the one credited with driving
-        the fleet that try; once the adaptive expert wins, it leads from the
-        next try on -- matching "it runs the agents in the next try".
+        The deep models and classical baselines are frozen and the grid is
+        fixed, so their scores are constant -- evaluated once. Each try the fleet
+        learns (taught by the best deep expert until it leads) and is re-scored;
+        the overall leader is whoever has the best score that try.
         """
         trials = self.cfg.num_trials if num_trials is None else num_trials
 
-        # The deep expert is frozen and the grid is fixed, so its greedy score is
-        # constant -- evaluate it once and reuse it as the bar to beat.
-        deep_info = self._deep_episode()
-        deep_score = solve_score(deep_info, self.max_steps)
-        deep_metrics = _metrics(deep_info, self.max_steps)
+        leaderboard: dict[str, dict] = {}
+        for name, policy in self.deep_experts.items():
+            leaderboard[name] = _metrics(self._greedy_episode(policy), self.max_steps)
+        for name, factory in self.baselines.items():
+            leaderboard[name] = self._baseline_metrics(name, factory)
 
-        report = MoeReport(deep_score=round(deep_score, 4), final_leader="deep")
-        leader = "deep"
+        best_frozen_name = max(leaderboard, key=lambda n: leaderboard[n]["score"])
+        best_frozen_score = leaderboard[best_frozen_name]["score"]
+        # The fleet learns from the strongest deep expert (baselines can't act on
+        # the deep env, so they are gate candidates only, not teachers).
+        teacher_name = (
+            max(self.deep_experts, key=lambda n: leaderboard[n]["score"])
+            if self.deep_experts
+            else None
+        )
+        teacher_policy = self.deep_experts.get(teacher_name) if teacher_name else None
+
+        report = MoeReport(leaderboard=leaderboard, teacher=teacher_name)
+        fleet_leads = False
         for t in range(1, trials + 1):
-            leader_this_try = leader  # who drives the fleet this try
-            # While the deep expert leads it teaches; once the fleet leads it self-plays.
-            _, syncs = self._learn_episode(leader_this_try)
-            adapt_info = self._adaptive_greedy_episode()
-            adapt_score = solve_score(adapt_info, self.max_steps)
-            report.best_adaptive_score = round(
-                max(report.best_adaptive_score, adapt_score), 4
-            )
+            _, syncs = self._learn_episode(None if fleet_leads else teacher_policy)
+            fleet_metrics = _metrics(self._adaptive_greedy_episode(), self.max_steps)
+            fleet_score = fleet_metrics["score"]
+            report.best_fleet_score = round(max(report.best_fleet_score, fleet_score), 4)
+
+            if fleet_score > best_frozen_score:
+                leader = FLEET
+                if report.surpassed_at is None:
+                    report.surpassed_at = t
+                    fleet_leads = True  # self-play from the next try on
+            else:
+                leader = best_frozen_name
 
             report.history.append(
                 MoeTrial(
                     trial=t,
-                    leader=leader_this_try,
-                    deep=deep_metrics,
-                    adaptive=_metrics(adapt_info, self.max_steps),
+                    leader=leader,
+                    fleet=fleet_metrics,
                     epsilon=self.fleet.epsilon,
                     mean_q=self.fleet.mean_q(),
                     syncs=syncs,
                 )
             )
 
-            # Hand over to the adaptive expert for the NEXT try once it wins.
-            if leader == "deep" and adapt_score > deep_score:
-                report.surpassed_at = t
-                leader = "adaptive"
-
-        report.final_leader = leader
+        report.final_leader = report.history[-1].leader if report.history else best_frozen_name
         return report
 
     # -- serving ------------------------------------------------------------
 
-    @property
-    def current_leader(self) -> str:
-        """Cheap convenience: the expert with the better score right now."""
-        deep_score = solve_score(self._deep_episode(), self.max_steps)
-        adapt_score = solve_score(self._adaptive_greedy_episode(), self.max_steps)
-        return "adaptive" if adapt_score > deep_score else "deep"
+    def leaderboard(self) -> dict:
+        """Score every fixed expert once (for an API/frontend comparison view)."""
+        board = {n: self._metrics_for_deep(p) for n, p in self.deep_experts.items()}
+        board.update({n: self._baseline_metrics(n, f) for n, f in self.baselines.items()})
+        return board
 
-    def serve_actions(self, positions: list[Position]) -> np.ndarray:
-        """Joint action from the better expert, for live stepping by an API/frontend.
-
-        ``positions`` are the agents' current cells (env order). Returns one
-        action index (into ``CARDINAL_ACTIONS``) per agent.
-        """
-        if self.current_leader == "adaptive":
-            policies = [self.fleet.greedy_policy(aid) for aid in self.agent_ids]
-            return np.array(
-                [policies[i][positions[i].y, positions[i].x] for i in range(self.num_agents)],
-                dtype=np.int64,
-            )
-        # Deep expert needs a fresh observation, so roll the fixed env to these
-        # positions is overkill; expose the deep path only when it leads.
-        self.env.reset()
-        self.env.positions = list(positions)
-        flat_obs = self.env._observations()
-        tokens = self.env.entity_obs()
-        avail = self.env.valid_action_mask()
-        return self.deep.select_actions(flat_obs, tokens, avail)
+    def _metrics_for_deep(self, policy: Policy) -> dict:
+        return _metrics(self._greedy_episode(policy), self.max_steps)

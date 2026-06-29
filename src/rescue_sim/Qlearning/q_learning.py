@@ -2,12 +2,14 @@
 
 Two learners live here:
 
-* ``QLearningAgent`` -- the original single-agent tabular Q-learner (Sprint 3
-  baseline; kept unchanged so evaluation/visualization keep working).
+* ``QLearningAgent`` -- **legacy single-agent** tabular Q-learner.  It is NOT
+  part of the multi-agent model line-up or the Mixture-of-Experts; it is kept
+  only because the visualization API's live single-agent demo and the evaluation
+  panel still depend on it.  The multi-agent successor is the fleet below.
 * ``EpidemicHystereticQLearning`` -- a vectorized NumPy learner for a
   *decentralized* multi-robot fleet.  It adds hysteretic updates and epidemic
   peer-to-peer max-sync on top of Q-learning.  See the section header lower in
-  this file and ``rescue_sim.communications`` for the comms boundary.
+  this file and ``rescue_sim.Qlearning.communications`` for the comms boundary.
 """
 
 from __future__ import annotations

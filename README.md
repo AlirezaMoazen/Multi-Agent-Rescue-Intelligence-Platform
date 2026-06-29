@@ -154,7 +154,13 @@ for name, m in results.items():
 
 ---
 
-### Q-Learning (tabular, single-agent)
+### Q-Learning (tabular, single-agent) — legacy
+
+> **Status:** this single-agent learner is the project's *first* RL rung and is
+> kept only because the visualization API's live single-agent demo and the
+> evaluation panel still use it. It is **not** part of the multi-agent line-up
+> or the Mixture-of-Experts. Its multi-agent successor is the **Epidemic
+> Hysteretic fleet** below.
 
 Standard temporal-difference learning with an ε-greedy policy, implemented as `QLearningAgent` in `src/rescue_sim/Qlearning/q_learning.py`.
 
@@ -536,58 +542,60 @@ pip install -e ".[ensemble]"
 python scripts/compare_all.py          # or: docker compose run --rm compare-all
 ```
 
-### Mixture-of-Experts (generalist deep ensemble vs. specialist fleet) — ✅ implemented
+### Mixture-of-Experts router (the best method for *this* grid) — ✅ implemented
 
-Implemented in `src/rescue_sim/MoE/moe.py`. Where the *Ensemble* combines two
-deep methods that are good at the **same** thing, the **Mixture-of-Experts**
-combines two methods that are good at **different** things and lets a gate pick
-between them:
+Implemented in `src/rescue_sim/MoE/moe.py`. This is the project's **top layer**:
+where the *Ensemble* blends two deep models that are good at the **same** thing,
+the **Mixture-of-Experts** is a *gate* over **every** method in the project that
+routes each grid to whichever expert solves it best. Formally this is the
+classical **per-instance algorithm-selection / portfolio** problem (Rice 1976;
+SATzilla, Xu et al. 2008) written as a Mixture-of-Experts (Jacobs et al. 1991)
+whose experts are mostly *fixed* — with one twist: one expert keeps learning.
 
-- **Expert 1 — the generalist.** The frozen `ValueEnsemble` (QMIX + TransfQMix).
-  Trained over many random grids, it acts well on a grid it has never seen, but
-  it never adapts to the grid in front of it.
-- **Expert 2 — the specialist.** `EpidemicHystereticQLearning`, the tabular
-  fleet. It knows nothing about a fresh grid, but on a **fixed** grid it learns
-  a little more every try.
+**The expert pool is the whole project:**
 
-**The gate.** Both experts are scored on the *same fixed grid* with one number:
+| group | experts | role |
+|---|---|---|
+| Classical (no-AI) | frontier, DFS, prioritized planning, CBS, ICBS, ECBS, M\* | fixed candidates |
+| Deep (frozen) | QMIX, TransfQMix, MAPPO, ValueEnsemble | fixed candidates **+** teacher |
+| Adaptive | Epidemic Hysteretic fleet | learns this grid every try |
+
+**The gate.** Every expert is scored on the *same fixed grid* with one number:
 
 $$\text{score} = \underbrace{2\cdot\mathbb{1}[\text{success}]}_{\text{rescued all targets?}} \;+\; \underbrace{\tfrac{\text{rescued}}{\text{targets}}}_{\in[0,1]} \;-\; \underbrace{\tfrac{1}{2}\cdot\tfrac{\text{steps}}{\text{steps}_{\max}}}_{\text{tie-break: be quick}}$$
 
-The first term dominates, so a full rescue always beats a partial one; ties are
-broken by speed. The score reads the environment's `success/rescued/steps`
-info — **not** the reward — so the two experts stay comparable even though the
-specialist *trains* on a navigation-focused reward (a tabular cell-state learner
-needs a Markovian reward; the deep nets are frozen, so eval is reward-agnostic).
+A full rescue always beats a partial one; ties break on speed. The score reads
+the environment's `success/rescued/steps` (**not** the reward), so an MLP, a
+transformer, a CBS planner, and a tabular fleet are all comparable. The deep
+models and classical baselines are frozen, so their scores are computed **once**
+(a leaderboard); only the adaptive fleet is re-scored each try.
 
-**The loop.** On every try the fleet plays one learning episode (hysteretic TD
-update + a gossip round), then is scored greedily against the (constant) deep
-score. The behaviour policy is the current leader's: **while the deep expert
-leads it demonstrates** — the fleet learns *off-policy* (Q-learning is
-off-policy) from the generalist's trajectories, which is how a tabular learner
-bootstraps on a grid too large to stumble onto targets by chance — and **once
-the fleet leads it self-plays** with its own ε-greedy policy. The expert leading
-at the start of a try drives that try; the moment the specialist's greedy score
-beats the deep score, it leads from the **next** try on, and keeps learning:
+**The loop.** Each try the fleet plays one learning episode (hysteretic TD update
++ a gossip round) and is re-scored. **While it is behind, the strongest deep
+expert *teaches* it** — the fleet learns *off-policy* (Q-learning is off-policy)
+from the generalist's trajectories, which is how a tabular learner bootstraps on
+a grid too large to stumble onto targets by chance. **Once the fleet's greedy
+score beats the whole leaderboard, it leads** and self-plays from then on.
 
 ```python
 from rescue_sim.MoE import MixtureOfExperts
 from rescue_sim.config.settings import MoeSettings
 
-moe = MixtureOfExperts(value_ensemble, MoeSettings(num_trials=30))
+moe = MixtureOfExperts.from_models(qmix=qmix, transf=transf, mappo=mappo, ensemble=ens,
+                                   settings=MoeSettings(num_trials=40))
 report = moe.run()
-print(report.surpassed_at, report.final_leader)   # e.g. 8, "adaptive"
-report.to_dict()                                   # JSON-ready per-try history (API/frontend)
+report.leaderboard          # every fixed expert scored once on the grid
+report.surpassed_at         # first try the fleet beat them all (or None)
+report.to_dict()            # JSON-ready: API/frontend can render the whole race
 ```
 
-**Why this is the safe way to combine them.** The gate only hands over when the
-specialist is *measurably* better, so the MoE never does worse than the deep
-ensemble. On a grid the specialist can master (navigation-style, few targets) it
-overtakes the generalist — for example a single-target grid where the generalist
-gets stuck while the fleet learns the route. On harder multi-target layouts the
-tabular cell-state (which has no memory of *which* targets remain) can't
-represent the plan, so the gate simply keeps the generalist in charge. This is
-the honest trade-off, and the gate makes it free.
+**Why the gate makes this safe.** It only serves the best-scoring expert, so the
+MoE is **never worse than the strongest single method** in the pool. On a grid
+the fleet can master (navigation-style / few targets) it climbs the leaderboard
+and takes over; on a hard multi-target 20×20 the tabular cell-state (no memory of
+*which* targets remain) can't beat a well-trained generalist, so the gate simply
+keeps the generalist in charge. That honest trade-off is exactly what a portfolio
+gate is for — pay nothing, gain when a specialist earns it.
 
 ```bash
 pip install -e ".[ensemble]"
@@ -608,17 +616,20 @@ so this measures generalisation, not memorisation):
 All trained on CPU in minutes (TransfQMix is slowest — transformers are heavier).
 Numbers are indicative of short runs; longer training improves all three.
 
-**Mixture-of-Experts** is measured differently — on **one fixed grid**, not fresh
-ones, because that is where a specialist can shine:
+**Mixture-of-Experts** is measured differently — on **one fixed grid**, scoring
+the whole expert pool (7 baselines + QMIX + TransfQMix + MAPPO + Ensemble) once
+as a leaderboard, then letting the adaptive fleet climb it:
 
-- On a grid the deep ensemble already solves well (small / few-target), the
-  tabular fleet learns it from the generalist's demonstrations and **matches or
-  overtakes** it on step-efficiency — `train_moe.py` reports the try it took over.
-- On the full 20×20 / 4-target task, the well-trained generalist leads and the
-  fleet is the *adaptive challenger*: it imitates and improves but, being tabular
-  with a memoryless cell-state, does not fully match a strong deep model on a
-  grid that large and sparse. The gate then simply keeps the generalist — so the
-  MoE is always **at least as good as** the deep ensemble, by construction.
+- On a grid the frozen experts solve poorly (e.g. a single target down a long
+  corridor on a 10×10), the fleet learns it from the strongest deep expert's
+  demonstrations and **overtakes the whole leaderboard** — `train_moe.py` prints
+  the try it took over (regression-tested deterministically).
+- On the full 20×20 / 4-target task, a well-trained deep generalist tops the
+  leaderboard and the fleet is the *adaptive challenger*: it imitates and
+  improves but, being tabular with a memoryless cell-state, does not fully match
+  a strong deep model on a grid that large and sparse. The gate then simply
+  keeps the generalist — so the MoE is always **at least as good as the best
+  single method in the pool**, by construction.
 
 ### Sources & further reading
 
@@ -639,8 +650,16 @@ ones, because that is where a specialist can shine:
   <https://arxiv.org/abs/2409.03052>
 - **Policy distillation** (used by the Ensemble's `Distiller`) — Rusu et al.,
   *Policy Distillation*, ICLR 2016 — <https://arxiv.org/abs/1511.06295>
-- **Mixture-of-Experts** (the gating idea behind `MoE/`) — Jacobs et al.,
-  *Adaptive Mixtures of Local Experts*, Neural Computation 1991.
+- **Mixture-of-Experts** (the gating idea behind `MoE/`) — Jacobs, Jordan,
+  Nowlan & Hinton, *Adaptive Mixtures of Local Experts*, Neural Computation 1991;
+  sparsely-gated modern form: Shazeer et al., ICLR 2017 — <https://arxiv.org/abs/1701.06538>
+- **Algorithm selection / portfolios** (the `MoE/` gate *is* per-instance
+  algorithm selection) — Rice, *The Algorithm Selection Problem*, 1976; SATzilla:
+  Xu, Hutter, Hoos & Leyton-Brown, *Portfolio-based Algorithm Selection for SAT*,
+  JAIR 2008 — <https://arxiv.org/abs/1111.2249>
+- **MAPF baselines** — CBS: Sharon et al., *Conflict-Based Search for Optimal
+  Multi-Agent Pathfinding*, AIJ 2015; M\*: Wagner & Choset, *Subdimensional
+  Expansion for Multirobot Path Planning*, AIJ 2015.
 
 ---
 

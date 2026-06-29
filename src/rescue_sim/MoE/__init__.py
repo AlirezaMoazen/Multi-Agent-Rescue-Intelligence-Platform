@@ -1,19 +1,23 @@
-"""Mixture-of-Experts gate over the deep ensemble and the tabular fleet learner.
+"""Mixture-of-Experts router over every rescue strategy in the project.
 
-Two experts compete on **one fixed rescue grid**:
+A performance gate scores a whole pool of experts on **one fixed rescue grid**
+and routes the fleet to whichever solves it best -- the per-instance
+algorithm-selection problem (Rice 1976; SATzilla, Xu et al. 2008) phrased as a
+Mixture-of-Experts (Jacobs et al. 1991). The pool:
 
-* the *deep expert* -- the trained ``ValueEnsemble`` of QMIX + TransfQMix, which
-  generalizes to any grid but is frozen, and
-* the *adaptive expert* -- ``EpidemicHystereticQLearning``, a tabular fleet that
-  starts from scratch and learns *this* grid a little more on every try.
+* **classical (no-AI)** -- the 7 baselines (frontier, DFS, prioritized planning,
+  CBS, ICBS, ECBS, M*), run as a synchronized team;
+* **deep (frozen)** -- QMIX, TransfQMix, MAPPO, and their ``ValueEnsemble``;
+* **adaptive** -- ``EpidemicHystereticQLearning``, which learns *this* grid a
+  little more every try (off-policy from the best deep expert while it is
+  behind, then self-play once it leads).
 
-A performance gate routes each try to whichever expert currently solves the
-grid better. The adaptive expert keeps learning on every try (even while the
-deep expert is driving), so on a fixed grid it eventually overtakes the
-generalist; from the next try on it drives the fleet -- and keeps learning.
+Frozen experts are scored once (a leaderboard); the adaptive fleet is re-scored
+each try and can climb to the top. Because the gate only ever serves the
+best-scoring expert, the MoE is never worse than the strongest single method.
 
-Requires the optional torch dependency (the deep expert is a neural net):
-``pip install -e ".[ensemble]"``.
+Build it with ``MixtureOfExperts.from_models(qmix=..., transf=..., mappo=...,
+ensemble=...)``. Requires torch (the deep experts): ``pip install -e ".[ensemble]"``.
 """
 
 __all__ = [
@@ -22,6 +26,10 @@ __all__ = [
     "MoeTrial",
     "FixedGridEntityEnv",
     "solve_score",
+    "qmix_policy",
+    "transf_policy",
+    "mappo_policy",
+    "ensemble_policy",
 ]
 
 

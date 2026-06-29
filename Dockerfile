@@ -24,9 +24,9 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 COPY pyproject.toml .
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir \
-    "numpy>=1.26" "pydantic>=2.0" "pyyaml>=6.0" \
+    "numpy>=2.0" "pydantic>=2.7" "pyyaml>=6.0" \
     "fastapi>=0.111" "uvicorn[standard]>=0.30" "websockets>=12.0" \
-    "pytest>=8.0" "ruff>=0.5"
+    "pytest>=8.2" "ruff>=0.6"
 
 # CPU-only PyTorch for the deep methods (MAPPO, QMIX, TransfQMix, Ensemble, MoE).
 # The CPU wheel keeps the image small enough to train on a normal machine; no
