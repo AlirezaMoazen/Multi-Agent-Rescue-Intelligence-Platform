@@ -295,6 +295,7 @@ class MixtureOfExperts:
         comms=None,
         baselines: Mapping[str, Callable] = DEFAULT_MULTI_AGENT_BASELINES,
         adaptive_reward_config: RewardConfig = ADAPTIVE_REWARD_CONFIG,
+        start_positions: Mapping[str, Position] | None = None,
     ) -> None:
         self.deep_experts = dict(deep_experts)
         self.baselines = dict(baselines)
@@ -315,7 +316,11 @@ class MixtureOfExperts:
         # placement). With several targets this lets the memoryless fleet divide
         # the work -- each agent's shared "go to nearest target" policy flows it
         # to a different nearby target.
-        start_map = default_start_positions(grid, self.num_agents)
+        start_map = (
+            dict(start_positions)
+            if start_positions is not None
+            else default_start_positions(grid, self.num_agents)
+        )
         self.agent_ids = list(start_map)
         self.start_list = [start_map[aid] for aid in self.agent_ids]
         self.starts = dict(start_map)
@@ -366,6 +371,7 @@ class MixtureOfExperts:
         grid: Grid | None = None,
         comms=None,
         baselines: Mapping[str, Callable] = DEFAULT_MULTI_AGENT_BASELINES,
+        start_positions: Mapping[str, Position] | None = None,
     ) -> "MixtureOfExperts":
         """Build an MoE from any subset of trained deep models (at least one)."""
         deep: dict[str, Policy] = {}
@@ -384,7 +390,15 @@ class MixtureOfExperts:
             ref_env = ensemble.qmix.env
         if ref_env is None:
             raise ValueError("from_models needs at least one of qmix/transf/mappo/ensemble")
-        return cls(deep, ref_env, settings=settings, grid=grid, comms=comms, baselines=baselines)
+        return cls(
+            deep,
+            ref_env,
+            settings=settings,
+            grid=grid,
+            comms=comms,
+            baselines=baselines,
+            start_positions=start_positions,
+        )
 
     # -- rollouts -----------------------------------------------------------
 

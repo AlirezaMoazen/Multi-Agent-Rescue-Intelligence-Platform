@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import useSimulation from './hooks/useSimulation';
 import StatsBar from './components/StatsBar';
 import GridCanvas from './components/GridCanvas';
@@ -7,42 +7,45 @@ import ParameterPanel from './components/ParameterPanel';
 import MetricsChart from './components/MetricsChart';
 import EvaluationPanel from './components/EvaluationPanel';
 
-const DEFAULT_CONFIG = {
-  grid_width: 10,
-  grid_height: 10,
-  obstacle_probability: 0.15,
-  target_count: 4,
-  num_agents: 1,
-  sensor_range: 3,
-  max_steps: 500,
-  num_episodes: 10,
-  learning_rate: 0.1,
-  discount_factor: 0.9,
-  exploration_rate: 1.0,
-  speed_ms: 100,
-  run_mode: 'train',
-};
-
 export default function App() {
-  const [config, setConfig] = useState(DEFAULT_CONFIG);
+  const [config, setConfig] = useState(null);
   const sim = useSimulation();
 
   const isRunning = sim.status === 'running';
   const isComplete = sim.status === 'complete';
+  const configReady = config !== null;
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/config')
+      .then((response) => response.json())
+      .then((apiConfig) => {
+        if (!cancelled) {
+          setConfig(apiConfig);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handleStart = () => {
+    if (!configReady) return;
     const nextConfig = { ...config, run_mode: 'train' };
     setConfig(nextConfig);
     sim.start(nextConfig);
   };
 
   const handleInstantTrain = () => {
+    if (!configReady) return;
     const nextConfig = { ...config, run_mode: 'instant_train' };
     setConfig(nextConfig);
     sim.start(nextConfig);
   };
 
   const handleRunLearned = () => {
+    if (!configReady) return;
     const nextConfig = { ...config, run_mode: 'evaluate' };
     setConfig(nextConfig);
     sim.start(nextConfig);
@@ -53,11 +56,13 @@ export default function App() {
   };
 
   const handleRestart = () => {
+    if (!configReady) return;
     sim.start({ ...config });
   };
 
   // Send live speed updates to the backend while running
   const handleSpeedChange = (ms) => {
+    if (!configReady) return;
     const newConfig = { ...config, speed_ms: ms };
     setConfig(newConfig);
     if (isRunning) {
@@ -156,15 +161,17 @@ export default function App() {
             onRunLearned={handleRunLearned}
             onStop={handleStop}
             onRestart={handleRestart}
-            speed={config.speed_ms}
+            speed={config?.speed_ms ?? 100}
             onSpeedChange={handleSpeedChange}
-            disabled={!sim.connected}
+            disabled={!sim.connected || !configReady}
           />
         </div>
 
         {/* Side Panel */}
         <div className="side-panel">
-          <ParameterPanel config={config} onChange={setConfig} disabled={isRunning} />
+          {configReady && (
+            <ParameterPanel config={config} onChange={setConfig} disabled={isRunning} />
+          )}
           <MetricsChart metrics={sim.episodeMetrics} />
         </div>
 

@@ -5,7 +5,6 @@ from rescue_sim.environment.generator import generate_grid
 from rescue_sim.Qlearning.q_learning import QLearningAgent
 from rescue_sim.simulation.evaluation import (
     ACTIONS,
-    EVALUATION_REWARD_CONFIG,
     EvaluationScenario,
     RunTrace,
     calculate_run_metrics,
@@ -14,7 +13,7 @@ from rescue_sim.simulation.evaluation import (
     report_to_json,
     train_q_learning_agent,
 )
-from rescue_sim.shared import GridSettings
+from rescue_sim.shared import GridSettings, SPRINT3_REWARD_CONFIG
 
 
 def test_calculate_run_metrics_reports_success_and_exploration() -> None:
@@ -138,7 +137,7 @@ def test_learning_episode_updates_agent_q_values() -> None:
     learner = QLearningAgent(
         actions=ACTIONS,
         epsilon=0.2,
-        reward_config=EVALUATION_REWARD_CONFIG,
+        reward_config=SPRINT3_REWARD_CONFIG,
         rng=Random(9),
     )
 

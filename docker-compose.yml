@@ -7,6 +7,8 @@ services:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app/src:/app
       - FRONTEND_DIST_DIR=/app/frontend_dist
+    volumes:
+      - ./checkpoints:/app/checkpoints
 
   # ── Visualization dashboard (backend + frontend) ────────────────────
   viz:
@@ -18,6 +20,7 @@ services:
       # Mount source so --reload picks up changes
       - ./src:/app/src
       - ./configs:/app/configs
+      - ./checkpoints:/app/checkpoints
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
       interval: 10s
@@ -49,17 +52,17 @@ services:
   # ── Train MAPPO (deep multi-agent RL) ───────────────────────────────
   train-mappo:
     <<: *base
-    command: python scripts/train_mappo.py --updates 100
+    command: python scripts/train_mappo.py --grid 20 --agents 4 --view-radius 3 --max-steps 500 --updates 100 --checkpoint checkpoints/mappo.pt
 
   # ── Train QMIX (deep multi-agent RL) ────────────────────────────────
   train-qmix:
     <<: *base
-    command: python scripts/train_qmix.py --episodes 200
+    command: python scripts/train_qmix.py --grid 20 --agents 4 --view-radius 3 --max-steps 500 --episodes 200 --checkpoint checkpoints/qmix.pt
 
   # ── Train TransfQMix (transformer-based deep MARL) ───────────────────
   train-transfqmix:
     <<: *base
-    command: python scripts/train_transfqmix.py --episodes 200
+    command: python scripts/train_transfqmix.py --grid 20 --agents 4 --view-radius 3 --max-steps 500 --episodes 200 --checkpoint checkpoints/transfqmix.pt
 
   # ── Compare all methods + ensemble + distilled student ──────────────
   compare-all:

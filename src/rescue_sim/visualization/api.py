@@ -13,43 +13,38 @@ environment layer and streams the state to the frontend over WebSocket.
 """
 
 import asyncio
-from dataclasses import replace
 import json
 import math
 import os
 import random
 from pathlib import Path
 
+import yaml
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from rescue_sim.config.settings import GridSettings
+from rescue_sim.config.settings import FleetSettings, GridSettings
 from rescue_sim.environment.generator import generate_grid
 from rescue_sim.environment.grid import Position
 from rescue_sim.environment.movement import MovementModel
 from rescue_sim.environment.sensors import CentralSensor
-from rescue_sim.Qlearning.baseline import (
-    BaselineExplorer,
-    DFSExplorer,
-    PrioritizedPlanningExplorer,
-    CBSExplorer,
-    ICBSExplorer,
-    ECBSExplorer,
-    MStarExplorer,
+from rescue_sim.Qlearning.multi_agent_baseline import default_start_positions
+from rescue_sim.Qlearning.q_learning import EpidemicHystereticQLearning
+from rescue_sim.simulation.evaluation import (
+    EvaluationScenario,
+    evaluate_simulation_grid,
 )
-from rescue_sim.Qlearning.q_learning import QLearningAgent
 from rescue_sim.shared import (
-    Action,
-    LearningState,
+    CARDINAL_ACTIONS,
+    GossipConfig,
+    HystereticConfig,
     RewardEvent,
     SPRINT3_REWARD_CONFIG,
     TargetType,
-    Transition,
     calculate_reward,
-    StrategyInterface,
 )
 
 app = FastAPI(title="Rescue Sim Visualization API")
@@ -83,15 +78,35 @@ if _FRONTEND_DIST.is_dir():
 
 
 # ── Pydantic models for config ─────────────────────────────────────────────
+def _load_default_scenario() -> dict:
+    path = Path("configs/default_scenario.yaml")
+    if not path.exists():
+        return {}
+    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+
+_DEFAULT_SCENARIO = _load_default_scenario()
+_DEFAULT_GRID = _DEFAULT_SCENARIO.get("grid", {})
+_DEFAULT_AGENT = _DEFAULT_SCENARIO.get("agent", {})
+_DEFAULT_SIMULATION = _DEFAULT_SCENARIO.get("simulation", {})
+_DEFAULT_FLEET = FleetSettings()
+_CHECKPOINT_DIR = Path(os.environ.get("RESCUE_SIM_CHECKPOINT_DIR", "checkpoints"))
+_CHECKPOINTS = {
+    "qmix": _CHECKPOINT_DIR / "qmix.pt",
+    "transfqmix": _CHECKPOINT_DIR / "transfqmix.pt",
+    "mappo": _CHECKPOINT_DIR / "mappo.pt",
+}
+
+
 class SimConfig(BaseModel):
-    grid_width: int = 10
-    grid_height: int = 10
-    obstacle_probability: float = 0.15
-    target_count: int = 4
-    num_agents: int = 1
-    sensor_range: int = 3
-    max_steps: int = 500
-    num_episodes: int = 80
+    grid_width: int = _DEFAULT_GRID.get("width", 10)
+    grid_height: int = _DEFAULT_GRID.get("height", 10)
+    obstacle_probability: float = _DEFAULT_GRID.get("obstacle_probability", 0.15)
+    target_count: int = _DEFAULT_GRID.get("target_a_count", 2) + _DEFAULT_GRID.get("target_b_count", 2)
+    num_agents: int = _DEFAULT_FLEET.num_agents
+    sensor_range: int = _DEFAULT_AGENT.get("sensor_range", 3)
+    max_steps: int = _DEFAULT_SIMULATION.get("max_steps", 500)
+    num_episodes: int = 10
     learning_rate: float = 0.1
     discount_factor: float = 0.9
     exploration_rate: float = 1.0
@@ -101,8 +116,10 @@ class SimConfig(BaseModel):
 
 # ── Global state ────────────────────────────────────────────────────────────
 current_config = SimConfig()
-trained_visual_learner: QLearningAgent | None = None
+trained_visual_fleet: EpidemicHystereticQLearning | None = None
 trained_visual_seed: int | None = None
+trained_visual_shape: tuple[int, int, int] | None = None
+trained_hybrid_policy: dict | None = None
 
 
 # ── REST endpoints ──────────────────────────────────────────────────────────
@@ -130,19 +147,11 @@ async def health():
     return {"status": "ok"}
 
 
-def _random_start_from_seed(config: SimConfig, seed: int) -> Position:
-    rng = random.Random(seed + 50_000)
-    return Position(
-        rng.randrange(config.grid_width),
-        rng.randrange(config.grid_height),
-    )
-
-
 # ── WebSocket simulation stream ────────────────────────────────────────────
 @app.websocket("/ws/simulation")
 async def simulation_ws(websocket: WebSocket):
     await websocket.accept()
-    global current_config, trained_visual_learner, trained_visual_seed
+    global current_config, trained_visual_fleet, trained_visual_seed, trained_visual_shape
 
     try:
         while True:
@@ -193,31 +202,48 @@ async def simulation_ws(websocket: WebSocket):
                     }
                 )
                 continue
+            if config.num_agents < 1:
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "message": "At least 1 agent is required.",
+                    }
+                )
+                continue
+
+            await _run_hybrid_simulation(websocket, config)
+            continue
 
             episode_metrics: list[dict] = []
             should_stop = False
             scenario_seed = random.randint(0, 999999)
+            fleet = trained_visual_fleet
+            expected_shape = (config.grid_width, config.grid_height, config.num_agents)
             if run_mode == "evaluate":
-                if trained_visual_learner is None or trained_visual_seed is None:
+                if (
+                    fleet is None
+                    or trained_visual_seed is None
+                    or trained_visual_shape != expected_shape
+                ):
                     await websocket.send_json(
                         {
                             "type": "error",
-                            "message": "No trained policy is available yet. Run Train first.",
+                            "message": (
+                                "No compatible trained multi-agent policy is available yet. "
+                                "Run Train first with the same grid size and agent count."
+                            ),
                         }
                     )
                     continue
                 scenario_seed = trained_visual_seed
-                learner = trained_visual_learner
-                learner.epsilon = 0.0
+                fleet.epsilon = 0.0
             else:
-                learner = QLearningAgent(
-                    learning_rate=config.learning_rate,
-                    discount_factor=config.discount_factor,
-                    epsilon=config.exploration_rate,
-                    rng=random.Random(0),
-                )
+                fleet = None
 
             total_episodes = 1 if run_mode == "evaluate" else config.num_episodes
+            last_grid = None
+            last_settings = None
+            last_starts = None
             for episode in range(total_episodes):
                 if should_stop:
                     break
@@ -237,10 +263,14 @@ async def simulation_ws(websocket: WebSocket):
                     random_seed=seed,
                 )
 
-                start_pos = _random_start_from_seed(config, seed)
+                start_pos = Position(
+                    _DEFAULT_AGENT.get("start_x", 0),
+                    _DEFAULT_AGENT.get("start_y", 0),
+                )
 
                 try:
                     grid = generate_grid(settings, start_pos)
+                    starts = default_start_positions(grid, config.num_agents, start_pos)
                 except ValueError as e:
                     await websocket.send_json(
                         {
@@ -254,6 +284,25 @@ async def simulation_ws(websocket: WebSocket):
                     should_stop = True
                     break
 
+                if fleet is None:
+                    alpha = config.learning_rate
+                    fleet = EpidemicHystereticQLearning(
+                        grid=grid,
+                        config=HystereticConfig(
+                            alpha=alpha,
+                            beta=min(0.1, alpha),
+                            discount_factor=config.discount_factor,
+                            epsilon=config.exploration_rate,
+                        ),
+                        gossip=GossipConfig(comm_radius=float(config.sensor_range)),
+                        max_agents=max(20, config.num_agents),
+                        seed=seed,
+                    )
+                    for agent_id, start in starts.items():
+                        fleet.add_agent(agent_id, start)
+                else:
+                    fleet.reset_positions(starts)
+
                 # Build JSON-serializable obstacle & target lists
                 obstacles = [{"x": p.x, "y": p.y} for p in grid.obstacles]
                 targets = []
@@ -264,13 +313,16 @@ async def simulation_ws(websocket: WebSocket):
 
                 movement = MovementModel()
                 sensor = CentralSensor(grid)
-                position = start_pos
-                found_targets: set[Position] = set()
+                positions = dict(starts)
                 active_targets = set(grid.target_a_positions) | set(grid.target_b_positions)
                 rescued: list[dict] = []
-                visited_positions = {start_pos}
+                rescued_positions: set[Position] = set()
+                visited_by_agent = {
+                    agent_id: {position}
+                    for agent_id, position in positions.items()
+                }
+                visited_positions = set(positions.values())
                 total_reward = 0.0
-                observation = sensor.observe("agent-1", position, config.sensor_range)
 
                 # Send initial state
                 if run_mode != "instant_train":
@@ -284,9 +336,7 @@ async def simulation_ws(websocket: WebSocket):
                                 "obstacles": obstacles,
                                 "targets": targets,
                             },
-                            "agents": [
-                                {"x": start_pos.x, "y": start_pos.y, "id": 0}
-                            ],
+                            "agents": _agent_payloads(positions),
                         }
                     )
 
@@ -318,84 +368,76 @@ async def simulation_ws(websocket: WebSocket):
                         except asyncio.TimeoutError:
                             pass
 
-                    state = _visual_learning_state(
-                        learner=learner,
-                        observation=observation,
-                        grid=grid,
-                        found_targets=frozenset(found_targets),
-                    )
-                    valid_actions = learner.valid_actions(movement, grid, position)
-                    valid_actions = _movement_actions_first(valid_actions)
-                    if not valid_actions:
-                        valid_actions = (Action.WAIT,)
+                    action_indices = fleet.select_actions()
+                    actions = {
+                        agent_id: CARDINAL_ACTIONS[action_index]
+                        for agent_id, action_index in action_indices.items()
+                    }
+                    rewards: dict[str, float] = {}
+                    next_positions: dict[str, Position] = {}
+                    dones: dict[str, bool] = {}
+                    agent_states: list[dict] = []
 
-                    action = learner.choose_action(state, valid_actions)
-                    movement_result = movement.apply(grid, position, action.value)
-                    next_position = movement_result.end
-                    next_observation = sensor.observe(
-                        "agent-1",
-                        next_position,
-                        config.sensor_range,
-                    )
+                    for agent_id in sorted(positions):
+                        action = actions[agent_id]
+                        before = positions[agent_id]
+                        movement_result = movement.apply(grid, before, action.value)
+                        after = movement_result.end
+                        positions[agent_id] = after
+                        next_positions[agent_id] = after
 
-                    target_type = grid.target_type_at(next_position)
-                    rescued_target_type = None
-                    if target_type is not None and next_position not in found_targets:
-                        found_targets.add(next_position)
-                        active_targets.discard(next_position)
-                        rescued_target_type = TargetType(target_type)
-                        rescued.append(
+                        next_observation = sensor.observe(
+                            agent_id,
+                            after,
+                            config.sensor_range,
+                        )
+                        target_type = grid.target_type_at(after)
+                        rescued_target_type = None
+                        if target_type is not None and after not in rescued_positions:
+                            rescued_positions.add(after)
+                            active_targets.discard(after)
+                            rescued_target_type = TargetType(target_type)
+                            rescued.append(
+                                {
+                                    "x": after.x,
+                                    "y": after.y,
+                                    "step": step,
+                                    "type": target_type,
+                                }
+                            )
+
+                        done = not active_targets
+                        reward = calculate_reward(
+                            RewardEvent(
+                                moved=movement_result.moved,
+                                move=action.value,
+                                newly_discovered_cells=len(next_observation.newly_discovered_cells),
+                                rescued_target_type=rescued_target_type,
+                                completed_episode=done,
+                                repeated_cell=after in visited_by_agent[agent_id],
+                            ),
+                            SPRINT3_REWARD_CONFIG,
+                        )
+                        rewards[agent_id] = reward
+                        dones[agent_id] = done
+                        total_reward += reward
+                        visited_by_agent[agent_id].add(after)
+                        visited_positions.add(after)
+                        agent_states.append(
                             {
-                                "x": next_position.x,
-                                "y": next_position.y,
-                                "step": step,
-                                "type": target_type,
+                                "id": int(agent_id.split("-")[-1]),
+                                "x": after.x,
+                                "y": after.y,
+                                "action": action.value,
+                                "reward": round(reward, 2),
                             }
                         )
 
-                    done = not active_targets
-                    reward = calculate_reward(
-                        RewardEvent(
-                            moved=movement_result.moved,
-                            move=action.value,
-                            newly_discovered_cells=len(next_observation.newly_discovered_cells),
-                            rescued_target_type=rescued_target_type,
-                            completed_episode=done,
-                            repeated_cell=next_position in visited_positions,
-                        ),
-                        learner.reward_config,
-                    )
-                    total_reward += reward
-
-                    next_state = _visual_learning_state(
-                        learner=learner,
-                        observation=next_observation,
-                        grid=grid,
-                        found_targets=frozenset(found_targets),
-                    )
-                    next_valid_actions = learner.valid_actions(movement, grid, next_position)
-                    next_valid_actions = _movement_actions_first(next_valid_actions)
-                    if not next_valid_actions:
-                        next_valid_actions = (Action.WAIT,)
                     if run_mode in {"train", "instant_train"}:
-                        learner.update_q_value(
-                            state=state,
-                            action=action,
-                            reward=reward,
-                            next_state=next_state,
-                            next_valid_actions=next_valid_actions,
-                        )
-
-                    position = next_position
-                    observation = next_observation
-                    visited_positions.add(position)
-                    agent_state = {
-                        "id": 0,
-                        "x": position.x,
-                        "y": position.y,
-                        "action": action.value,
-                        "reward": round(reward, 2),
-                    }
+                        fleet.record_transitions(action_indices, rewards, next_positions, dones)
+                        fleet.gossip()
+                    else:
+                        fleet.reset_positions(next_positions)
                     steps = step + 1
 
                     if run_mode != "instant_train":
@@ -404,7 +446,7 @@ async def simulation_ws(websocket: WebSocket):
                                 "type": "step",
                                 "episode": episode,
                                 "step": steps,
-                                "agents": [agent_state],
+                                "agents": agent_states,
                                 "rescued": rescued,
                                 "active_targets": len(active_targets),
                             }
@@ -423,11 +465,11 @@ async def simulation_ws(websocket: WebSocket):
                     "target_count": config.target_count,
                     "success": success,
                     "total_reward": round(total_reward, 2),
-                    "exploration_rate": round(learner.epsilon, 4),
+                    "exploration_rate": round(fleet.epsilon, 4),
                 }
                 episode_metrics.append(metric)
                 if run_mode in {"train", "instant_train"}:
-                    learner.epsilon = max(0.05, learner.epsilon * 0.85)
+                    fleet.epsilon = max(0.05, fleet.epsilon * 0.85)
 
                 success_rate = sum(
                     1 for m in episode_metrics if m["success"]
@@ -447,21 +489,24 @@ async def simulation_ws(websocket: WebSocket):
                 )
                 if run_mode == "instant_train":
                     await asyncio.sleep(0)
+                last_grid = grid
+                last_settings = settings
+                last_starts = starts
 
             if not should_stop:
                 if run_mode in {"train", "instant_train"}:
-                    trained_visual_learner = learner
+                    trained_visual_fleet = fleet
                     trained_visual_seed = scenario_seed
+                    trained_visual_shape = expected_shape
                 if run_mode == "evaluate" and episode_metrics:
                     await websocket.send_json(
                         {
                             "type": "baseline_comparison",
                             "report": _build_run_comparison_report(
-                                grid=grid,
-                                start=start_pos,
+                                grid=last_grid,
+                                grid_settings=last_settings,
+                                starts=last_starts,
                                 config=config,
-                                trained_metric=episode_metrics[-1],
-                                trained_explored_cells=len(visited_positions),
                             ),
                         }
                     )
@@ -480,310 +525,423 @@ async def simulation_ws(websocket: WebSocket):
 
     except WebSocketDisconnect:
         pass
-    except Exception:
-        # Prevent uncaught errors from crashing the server
+    except Exception as error:
         try:
-            await websocket.close()
+            await websocket.send_json({"type": "error", "message": f"Simulation error: {error!s}"})
         except Exception:
             pass
 
 
-def _visual_learning_state(
-    learner: QLearningAgent,
-    observation: object,
-    grid: object,
-    found_targets: frozenset[Position],
-) -> LearningState:
-    """Build a reusable visual-training state for the Q-table.
+async def _run_hybrid_simulation(websocket: WebSocket, config: SimConfig) -> None:
+    global trained_hybrid_policy
 
-    The learner's state builder includes ``steps_taken`` for terminal checks in
-    offline training. The live visualization already checks max steps in its
-    loop, so keeping the step count in the Q-table would make the same cell look
-    like a different state at every time step and hide learning across episodes.
-    """
-
-    state = learner.state_from_observation(
-        observation=observation,
-        grid=grid,
-        found_targets=found_targets,
-        steps_taken=0,
+    seed = _DEFAULT_GRID.get("random_seed", 42)
+    target_a = math.ceil(config.target_count / 2)
+    target_b = config.target_count - target_a
+    settings = GridSettings(
+        width=config.grid_width,
+        height=config.grid_height,
+        obstacle_probability=config.obstacle_probability,
+        target_a_count=target_a,
+        target_b_count=target_b,
+        random_seed=seed,
     )
-    return replace(state, steps_taken=0)
+    start_pos = Position(_DEFAULT_AGENT.get("start_x", 0), _DEFAULT_AGENT.get("start_y", 0))
+
+    try:
+        grid = generate_grid(settings, start_pos)
+        starts = default_start_positions(grid, config.num_agents, start_pos)
+    except ValueError as error:
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": f"Environment generation error: {error!s}. Try reducing target count or obstacles.",
+            }
+        )
+        return
+
+    obstacles = [{"x": p.x, "y": p.y} for p in grid.obstacles]
+    targets = [{"x": p.x, "y": p.y, "type": "A"} for p in grid.target_a_positions]
+    targets += [{"x": p.x, "y": p.y, "type": "B"} for p in grid.target_b_positions]
+
+    if config.run_mode not in {"evaluate", "instant_train"}:
+        await websocket.send_json(
+            {
+                "type": "episode_start",
+                "episode": 0,
+                "grid": {
+                    "width": config.grid_width,
+                    "height": config.grid_height,
+                    "obstacles": obstacles,
+                    "targets": targets,
+                },
+                "agents": _agent_payloads(starts),
+                "algorithm": "hybrid_moe:building",
+            }
+        )
+        await asyncio.sleep(0)
+
+    expected_shape = (config.grid_width, config.grid_height, config.num_agents)
+    if config.run_mode == "evaluate":
+        if trained_hybrid_policy is None or trained_hybrid_policy.get("shape") != expected_shape:
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "message": (
+                        "No compatible trained hybrid policy is available yet. "
+                        "Run Train first with the same grid size and agent count."
+                    ),
+                }
+            )
+            return
+        hybrid = trained_hybrid_policy
+        grid = hybrid["grid"]
+        settings = hybrid["settings"]
+        starts = hybrid["starts"]
+        obstacles = [{"x": p.x, "y": p.y} for p in grid.obstacles]
+        targets = [{"x": p.x, "y": p.y, "type": "A"} for p in grid.target_a_positions]
+        targets += [{"x": p.x, "y": p.y, "type": "B"} for p in grid.target_b_positions]
+    else:
+        try:
+            hybrid = await _build_live_hybrid_policy_async(
+                websocket, settings, grid, starts, config, seed
+            )
+            if hybrid is None:
+                return
+        except ModuleNotFoundError as error:
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "message": f"Hybrid/MoE needs the optional torch dependency: {error!s}",
+                }
+            )
+            return
+        except FileNotFoundError as error:
+            await websocket.send_json({"type": "error", "message": str(error)})
+            return
+        except RuntimeError as error:
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "message": (
+                        "Hybrid checkpoints could not be loaded. "
+                        "They may have been trained with different agents/view radius/settings. "
+                        f"Details: {error!s}"
+                    ),
+                }
+            )
+            return
+        if config.run_mode in {"train", "instant_train"}:
+            trained_hybrid_policy = {**hybrid, "shape": expected_shape}
+
+    if config.run_mode == "instant_train":
+        await websocket.send_json(
+            {
+                "type": "training_complete",
+                "total_episodes": 1,
+                "final_success_rate": 0.0,
+                "metrics": [],
+            }
+        )
+        return
+
+    moe = hybrid["moe"]
+    leader = hybrid["leader"]
+    policy = hybrid["policy"]
+    env = moe.env
+    flat_obs = env.reset()
+
+    if config.run_mode == "evaluate":
+        await websocket.send_json(
+            {
+                "type": "episode_start",
+                "episode": 0,
+                "grid": {
+                    "width": config.grid_width,
+                    "height": config.grid_height,
+                    "obstacles": obstacles,
+                    "targets": targets,
+                },
+                "agents": _agent_payloads(starts),
+                "algorithm": f"hybrid_moe:{leader}",
+            }
+        )
+
+    rescued: list[dict] = []
+    rescued_positions: set[Position] = set()
+    total_reward = 0.0
+    info = {"success": False, "rescued": 0, "targets": config.target_count, "steps": 0}
+
+    for step in range(1, config.max_steps + 1):
+        actions = _select_hybrid_actions(moe, leader, policy, flat_obs)
+        flat_obs, reward, done, info = env.step(actions)
+        total_reward += float(reward)
+
+        agent_states = []
+        for index, position in enumerate(env.positions):
+            target_type = grid.target_type_at(position)
+            if target_type is not None and position not in rescued_positions:
+                rescued_positions.add(position)
+                rescued.append({"x": position.x, "y": position.y, "step": step, "type": target_type})
+            agent_states.append(
+                {
+                    "id": index,
+                    "x": position.x,
+                    "y": position.y,
+                    "action": CARDINAL_ACTIONS[int(actions[index])].value,
+                    "reward": round(float(reward) / max(config.num_agents, 1), 2),
+                }
+            )
+
+        await websocket.send_json(
+            {
+                "type": "step",
+                "episode": 0,
+                "step": step,
+                "agents": agent_states,
+                "rescued": rescued,
+                "active_targets": max(config.target_count - len(rescued_positions), 0),
+                "algorithm": f"hybrid_moe:{leader}",
+            }
+        )
+        if done:
+            break
+        await asyncio.sleep(config.speed_ms / 1000.0)
+
+    success = bool(info.get("success", False))
+    metric = {
+        "episode": 0,
+        "steps": int(info.get("steps", step)),
+        "rescued_count": int(info.get("rescued", len(rescued_positions))),
+        "target_count": int(info.get("targets", config.target_count)),
+        "success": success,
+        "total_reward": round(total_reward, 2),
+        "exploration_rate": round(float(moe.fleet.epsilon), 4),
+    }
+    await websocket.send_json(
+        {
+            "type": "episode_end",
+            **metric,
+            "success_rate": 1.0 if success else 0.0,
+            "avg_steps": metric["steps"],
+            "algorithm": f"hybrid_moe:{leader}",
+        }
+    )
+    await websocket.send_json(
+        {
+            "type": "baseline_comparison",
+            "report": _build_run_comparison_report(
+                grid=grid,
+                grid_settings=settings,
+                starts=starts,
+                config=config,
+                hybrid_report=hybrid.get("report"),
+            ),
+        }
+    )
+    await websocket.send_json(
+        {
+            "type": "training_complete",
+            "total_episodes": 1,
+            "final_success_rate": 1.0 if success else 0.0,
+            "metrics": [metric],
+        }
+    )
 
 
-def _movement_actions_first(actions: tuple[Action, ...]) -> tuple[Action, ...]:
-    """Avoid no-op exploration in the live demo unless the agent is stuck."""
+def _build_live_hybrid_policy(settings, grid, starts, config, seed):
+    from rescue_sim.config.settings import MappoSettings, MoeSettings, QmixSettings, TransfQmixSettings
+    from rescue_sim.Ensemble import ValueEnsemble, performance_weights
+    from rescue_sim.MAPPO import MAPPO, RescueEnv
+    from rescue_sim.MoE import MixtureOfExperts
+    from rescue_sim.MoE.moe import FLEET
+    from rescue_sim.QMIX import QMIX
+    from rescue_sim.TransfQMix import EntityRescueEnv, TransfQMIX
 
-    moving_actions = tuple(action for action in actions if action != Action.WAIT)
-    return moving_actions or actions
+    episodes = max(1, int(config.num_episodes))
+    view_radius = max(1, int(config.sensor_range))
+    _require_hybrid_checkpoints()
+
+    def env():
+        return EntityRescueEnv(
+            settings,
+            num_agents=config.num_agents,
+            max_steps=config.max_steps,
+            view_radius=view_radius,
+            seed=seed,
+        )
+
+    qmix = QMIX(env(), QmixSettings(num_agents=config.num_agents, random_seed=seed))
+    qmix.load_checkpoint(_CHECKPOINTS["qmix"])
+
+    transf = TransfQMIX(env(), TransfQmixSettings(num_agents=config.num_agents, random_seed=seed))
+    transf.load_checkpoint(_CHECKPOINTS["transfqmix"])
+
+    mappo = MAPPO(
+        RescueEnv(
+            settings,
+            num_agents=config.num_agents,
+            max_steps=config.max_steps,
+            view_radius=view_radius,
+            seed=seed,
+        ),
+        MappoSettings(num_agents=config.num_agents, random_seed=seed),
+    )
+    mappo.load_checkpoint(_CHECKPOINTS["mappo"])
+
+    w_qmix, w_transf = performance_weights(
+        qmix.evaluate(episodes=2)["success_rate"],
+        transf.evaluate(episodes=2)["success_rate"],
+    )
+    ensemble = ValueEnsemble(qmix, transf, env(), w_qmix, w_transf)
+
+    moe = MixtureOfExperts.from_models(
+        qmix=qmix,
+        transf=transf,
+        mappo=mappo,
+        ensemble=ensemble,
+        settings=MoeSettings(
+            num_trials=episodes,
+            random_seed=seed,
+            grid_seed=seed,
+            comm_radius=float(config.sensor_range),
+            epsilon_start=float(config.exploration_rate),
+            alpha=float(config.learning_rate),
+            discount_factor=float(config.discount_factor),
+        ),
+        grid=grid,
+        baselines={},
+        start_positions=starts,
+    )
+    report = moe.run(num_trials=episodes)
+    leader = report.final_leader or FLEET
+    policy = None if leader == FLEET else moe.deep_experts[leader]
+    return {
+        "moe": moe,
+        "leader": leader,
+        "policy": policy,
+        "report": report.to_dict(),
+        "grid": grid,
+        "settings": settings,
+        "starts": starts,
+    }
+
+
+def _require_hybrid_checkpoints() -> None:
+    missing = [path for path in _CHECKPOINTS.values() if not path.exists()]
+    if not missing:
+        return
+    commands = (
+        "Missing hybrid checkpoints: "
+        + ", ".join(str(path) for path in missing)
+        + ". Run: python scripts/train_qmix.py --checkpoint checkpoints/qmix.pt; "
+        "python scripts/train_transfqmix.py --checkpoint checkpoints/transfqmix.pt; "
+        "python scripts/train_mappo.py --checkpoint checkpoints/mappo.pt"
+    )
+    raise FileNotFoundError(commands)
+
+
+def _select_hybrid_actions(moe, leader, policy, flat_obs):
+    from rescue_sim.MoE.moe import FLEET
+
+    if leader == FLEET:
+        policies = {agent_id: moe.fleet.greedy_policy(agent_id) for agent_id in moe.agent_ids}
+        return [
+            int(policies[moe.agent_ids[i]][moe.env.positions[i].y, moe.env.positions[i].x])
+            for i in range(moe.num_agents)
+        ]
+    return policy(moe.env, flat_obs)
+
+
+async def _build_live_hybrid_policy_async(websocket, settings, grid, starts, config, seed):
+    task = asyncio.create_task(
+        asyncio.to_thread(_build_live_hybrid_policy, settings, grid, starts, config, seed)
+    )
+    while not task.done():
+        try:
+            raw = await asyncio.wait_for(websocket.receive_text(), timeout=0.2)
+            msg = json.loads(raw)
+            if msg.get("type") == "stop":
+                await websocket.send_json({"type": "stopped"})
+                return None
+        except asyncio.TimeoutError:
+            pass
+    return await task
+
+
+def _agent_payloads(positions: dict[str, Position]) -> list[dict]:
+    return [
+        {"id": int(agent_id.split("-")[-1]), "x": position.x, "y": position.y}
+        for agent_id, position in sorted(positions.items())
+    ]
 
 
 def _build_run_comparison_report(
     grid: object,
-    start: Position,
+    grid_settings: GridSettings,
+    starts: dict[str, Position],
     config: SimConfig,
-    trained_metric: dict,
-    trained_explored_cells: int,
+    hybrid_report: dict | None = None,
 ) -> dict:
-    frontier = _run_baseline_on_visual_grid(
-        grid=grid,
-        start=start,
-        config=config,
-        strategy=BaselineExplorer(seed=0),
-        agent_name="Frontier Greedy",
-    )
-    bfs = _run_baseline_on_visual_grid(
-        grid=grid,
-        start=start,
-        config=config,
-        strategy=DFSExplorer(seed=0),
-        agent_name="DFS Explorer",
-    )
-    prioritized = _run_baseline_on_visual_grid(
-        grid=grid,
-        start=start,
-        config=config,
-        strategy=PrioritizedPlanningExplorer(seed=0),
-        agent_name="Prioritized Planning",
-    )
-    cbs = _run_baseline_on_visual_grid(
-        grid=grid,
-        start=start,
-        config=config,
-        strategy=CBSExplorer(seed=0),
-        agent_name="CBS",
-    )
-    icbs = _run_baseline_on_visual_grid(
-        grid=grid,
-        start=start,
-        config=config,
-        strategy=ICBSExplorer(seed=0),
-        agent_name="ICBS",
-    )
-    ecbs = _run_baseline_on_visual_grid(
-        grid=grid,
-        start=start,
-        config=config,
-        strategy=ECBSExplorer(seed=0),
-        agent_name="ECBS",
-    )
-    mstar = _run_baseline_on_visual_grid(
-        grid=grid,
-        start=start,
-        config=config,
-        strategy=MStarExplorer(seed=0),
-        agent_name="M*",
-    )
-    trained = _metric_to_comparison_row(
-        agent_name="Q-Learning Model",
-        metric=trained_metric,
-        explored_cells=trained_explored_cells,
-        explorable_cells=_explorable_cell_count(grid),
-    )
+    if grid is None or grid_settings is None or starts is None:
+        raise ValueError("evaluation comparison needs a completed simulation grid")
 
-    return {
-        "aggregates": [frontier, bfs, cbs, icbs, ecbs, prioritized, mstar, trained],
-        "sprint_demo_summary": (
-            "Baseline comparison for the latest Run Learned Policy execution.\n"
-            f"CBS: success={cbs['success_rate']:.2f}, steps={cbs['average_steps']:.1f}, reward={cbs['average_accumulated_reward']:.1f}\n"
-            f"ICBS: success={icbs['success_rate']:.2f}, steps={icbs['average_steps']:.1f}, reward={icbs['average_accumulated_reward']:.1f}\n"
-            f"ECBS: success={ecbs['success_rate']:.2f}, steps={ecbs['average_steps']:.1f}, reward={ecbs['average_accumulated_reward']:.1f}\n"
-            f"Prioritized: success={prioritized['success_rate']:.2f}, steps={prioritized['average_steps']:.1f}, reward={prioritized['average_accumulated_reward']:.1f}\n"
-            f"M*: success={mstar['success_rate']:.2f}, steps={mstar['average_steps']:.1f}, reward={mstar['average_accumulated_reward']:.1f}\n"
-            f"Q-Learning: success={trained['success_rate']:.2f}, steps={trained['average_steps']:.1f}, reward={trained['average_accumulated_reward']:.1f}"
-        ),
-    }
-
-
-def _run_baseline_on_visual_grid(
-    grid: object,
-    start: Position,
-    config: SimConfig,
-    strategy: StrategyInterface,
-    agent_name: str,
-) -> dict:
-    movement = MovementModel()
-    sensor = CentralSensor(grid)
-    position = start
-    visited = {start}
-    found_targets: set[Position] = set()
-    all_targets = set(grid.target_a_positions) | set(grid.target_b_positions)
-    total_reward = 0.0
-    steps = 0
-    observation = sensor.observe("baseline", position, config.sensor_range)
-
-    for step in range(config.max_steps):
-        if found_targets == all_targets:
-            break
-
-        state = _baseline_learning_state(
-            observation=observation,
-            grid=grid,
-            discovered_cells=sensor.discovered_cells,
-            found_targets=frozenset(found_targets),
-            steps_taken=step,
+    scenario = EvaluationScenario(
+        name="visualization_current_grid",
+        grid_settings=grid_settings,
+        max_steps=config.max_steps,
+        start=starts["agent-0"],
+        num_agents=config.num_agents,
+        communication_range=float(config.sensor_range),
+    )
+    report = evaluate_simulation_grid(
+        scenario=scenario,
+        grid=grid,
+        start_positions=starts,
+    ).__dict__
+    if hybrid_report:
+        report["hybrid_report"] = hybrid_report
+        report["deep_benchmark"] = _deep_rows_from_hybrid_report(
+            hybrid_report,
+            config.num_agents,
         )
-        valid_actions = tuple(Action(move) for move in movement.allowed_moves(grid, position))
-        if not valid_actions:
-            valid_actions = (Action.WAIT,)
-
-        action = strategy.select_action("baseline", state, valid_actions)
-        movement_result = movement.apply(grid, position, action.value)
-        next_position = movement_result.end
-        next_observation = sensor.observe("baseline", next_position, config.sensor_range)
-
-        repeated_cell = next_position in visited
-        newly_discovered_cells = 0
-        if next_position not in visited:
-            visited.add(next_position)
-            newly_discovered_cells = 1
-
-        rescued_target_type = None
-        target_type = grid.target_type_at(next_position)
-        if target_type is not None and next_position not in found_targets:
-            found_targets.add(next_position)
-            rescued_target_type = TargetType(target_type)
-
-        step_reward = calculate_reward(
-            RewardEvent(
-                moved=movement_result.moved,
-                move=action.value,
-                newly_discovered_cells=len(next_observation.newly_discovered_cells)
-                or newly_discovered_cells,
-                rescued_target_type=rescued_target_type,
-                completed_episode=found_targets == all_targets,
-                repeated_cell=repeated_cell,
-            ),
-            SPRINT3_REWARD_CONFIG,
+        report["deep_benchmark_note"] = (
+            "Deep RL metrics come from the loaded checkpoint models scored by the MoE "
+            "on this same live grid."
         )
-        total_reward += step_reward
+    return report
 
-        next_state = _baseline_learning_state(
-            observation=next_observation,
-            grid=grid,
-            discovered_cells=sensor.discovered_cells,
-            found_targets=frozenset(found_targets),
-            steps_taken=step + 1,
-        )
-        strategy.update(
-            Transition(
-                state=state,
-                action=action,
-                next_state=next_state,
-                reward=step_reward,
-                done=found_targets == all_targets,
-                movement=movement_result,
-                observation=next_observation,
+
+def _deep_rows_from_hybrid_report(hybrid_report: dict, num_agents: int) -> list[dict]:
+    rows = []
+    leaderboard = hybrid_report.get("leaderboard", {})
+    for name in ("MAPPO", "QMIX", "TransfQMix", "Ensemble", "Distilled"):
+        metrics = leaderboard.get(name)
+        if metrics is None:
+            rows.append(
+                {
+                    "agent_name": name,
+                    "algorithm_group": "deep_rl_benchmark",
+                    "status": "unavailable",
+                    "success_rate": None,
+                    "average_steps": None,
+                    "average_accumulated_reward": None,
+                    "average_rescued_targets": None,
+                    "num_agents": num_agents,
+                    "error": "No checkpoint-backed MoE metrics for this algorithm.",
+                }
             )
+            continue
+        rows.append(
+            {
+                "agent_name": name,
+                "algorithm_group": "deep_rl_benchmark",
+                "status": "ok",
+                "success_rate": 1.0 if metrics.get("success") else 0.0,
+                "average_steps": float(metrics.get("steps", 0)),
+                "average_accumulated_reward": float(metrics.get("score", 0.0)),
+                "average_rescued_targets": float(metrics.get("rescued", 0)),
+                "num_agents": num_agents,
+            }
         )
-
-        position = next_position
-        observation = next_observation
-        steps = step + 1
-
-    del observation
-    success = found_targets == all_targets
-    metric = {
-        "success": success,
-        "steps": steps,
-        "rescued_count": len(found_targets),
-        "target_count": len(all_targets),
-        "total_reward": round(total_reward, 2),
-    }
-    return _metric_to_comparison_row(
-        agent_name=agent_name,
-        metric=metric,
-        explored_cells=len(visited),
-        explorable_cells=_explorable_cell_count(grid),
-    )
-
-
-def _baseline_learning_state(
-    observation: object,
-    grid: object,
-    discovered_cells: frozenset[Position],
-    found_targets: frozenset[Position],
-    steps_taken: int,
-) -> LearningState:
-    found_target_a = frozenset(
-        position for position in found_targets if position in grid.target_a_positions
-    )
-    found_target_b = frozenset(
-        position for position in found_targets if position in grid.target_b_positions
-    )
-    visible_target_a = frozenset(
-        position
-        for position, target_type in observation.target_types.items()
-        if target_type == "A"
-    )
-    visible_target_b = frozenset(
-        position
-        for position, target_type in observation.target_types.items()
-        if target_type == "B"
-    )
-
-    return LearningState(
-        agent_id=observation.agent_id,
-        agent_position=observation.agent_position,
-        visible_cells=observation.visible_cells,
-        visible_obstacles=observation.obstacles,
-        visible_target_a_positions=visible_target_a,
-        visible_target_b_positions=visible_target_b,
-        discovered_cells=discovered_cells,
-        discovered_target_a_positions=visible_target_a,
-        discovered_target_b_positions=visible_target_b,
-        rescued_target_a_positions=found_target_a,
-        rescued_target_b_positions=found_target_b,
-        remaining_target_a_positions=grid.target_a_positions - found_target_a,
-        remaining_target_b_positions=grid.target_b_positions - found_target_b,
-        steps_taken=steps_taken,
-    )
-
-
-def _metric_to_comparison_row(
-    agent_name: str,
-    metric: dict,
-    explored_cells: int,
-    explorable_cells: int,
-) -> dict:
-    explored = explored_cells / explorable_cells * 100 if explorable_cells else 0.0
-    success = 1.0 if metric["success"] else 0.0
-    return {
-        "agent_name": agent_name,
-        "num_agents": 1,
-        "scenario_count": 1,
-        "success_rate": round(success, 4),
-        "average_steps": float(metric["steps"]),
-        "average_accumulated_reward": float(metric["total_reward"]),
-        "average_rescued_targets": float(metric["rescued_count"]),
-        "average_explored_area_percentage": round(explored, 4),
-    }
-
-
-def _baseline_action(grid: object, position: Position, visited: set[Position]) -> Action:
-    for action in (Action.RIGHT, Action.DOWN, Action.LEFT, Action.UP):
-        next_position = _next_position(position, action)
-        if grid.is_valid_position(next_position) and next_position not in visited:
-            return action
-
-    for action in (Action.RIGHT, Action.DOWN, Action.LEFT, Action.UP):
-        if grid.is_valid_position(_next_position(position, action)):
-            return action
-
-    return Action.WAIT
-
-
-def _explorable_cell_count(grid: object) -> int:
-    return grid.width * grid.height - len(grid.obstacles)
-
-
-def _next_position(position: Position, action: Action) -> Position:
-    if action == Action.RIGHT:
-        return Position(position.x + 1, position.y)
-    if action == Action.DOWN:
-        return Position(position.x, position.y + 1)
-    if action == Action.LEFT:
-        return Position(position.x - 1, position.y)
-    if action == Action.UP:
-        return Position(position.x, position.y - 1)
-    return position
+    return rows
