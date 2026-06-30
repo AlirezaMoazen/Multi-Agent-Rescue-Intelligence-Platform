@@ -1,11 +1,12 @@
 [project]
 name = "rescue-sim"
 version = "0.1.0"
-description = "Single-agent rescue team simulator for ST04."
+description = "Multi-agent rescue-team simulator: classical baselines + deep MARL (QMIX, TransfQMix, MAPPO) for ST04."
 requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
 dependencies = [
-    "numpy>=1.26",
-    "pydantic>=2.0",
+    "numpy>=2.0",
+    "pydantic>=2.7",
     "pyyaml>=6.0",
     "fastapi>=0.111",
     "uvicorn[standard]>=0.30",
@@ -14,11 +15,28 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
-    "ruff>=0.5",
+    "pytest>=8.2",
+    "ruff>=0.6",
 ]
 visualization = [
     "matplotlib>=3.8",
+]
+# Deep multi-agent RL (MAPPO / QMIX). CPU-only torch is enough for a laptop.
+mappo = [
+    "torch>=2.2",
+]
+qmix = [
+    "torch>=2.2",
+]
+transfqmix = [
+    "torch>=2.2",
+]
+ensemble = [
+    "torch>=2.2",
+]
+# Mixture-of-Experts gate (deep ensemble vs. adaptive tabular fleet).
+moe = [
+    "torch>=2.2",
 ]
 
 [tool.pytest.ini_options]

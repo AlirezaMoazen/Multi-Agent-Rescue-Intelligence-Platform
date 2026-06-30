@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import useSimulation from './hooks/useSimulation';
 import StatsBar from './components/StatsBar';
 import GridCanvas from './components/GridCanvas';
@@ -15,7 +15,7 @@ const DEFAULT_CONFIG = {
   num_agents: 1,
   sensor_range: 3,
   max_steps: 500,
-  num_episodes: 80,
+  num_episodes: 10,
   learning_rate: 0.1,
   discount_factor: 0.9,
   exploration_rate: 1.0,
@@ -166,8 +166,11 @@ export default function App() {
         <div className="side-panel">
           <ParameterPanel config={config} onChange={setConfig} disabled={isRunning} />
           <MetricsChart metrics={sim.episodeMetrics} />
-          <EvaluationPanel report={sim.baselineComparison} />
         </div>
+
+        <section className="evaluation-wide">
+          <EvaluationPanel report={sim.baselineComparison} />
+        </section>
       </main>
     </div>
   );

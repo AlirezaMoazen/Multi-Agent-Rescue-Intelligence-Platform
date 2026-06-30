@@ -1,7 +1,7 @@
 from rescue_sim.config.settings import GridSettings
 from rescue_sim.environment.grid import Grid, Position
-from rescue_sim.learning.baseline import BaselineExplorer, DFSExplorer
-from rescue_sim.learning.multi_agent_baseline import (
+from rescue_sim.Qlearning.baseline import BaselineExplorer, DFSExplorer
+from rescue_sim.Qlearning.multi_agent_baseline import (
     compare_multi_agent_baselines,
     default_start_positions,
     run_multi_agent_baseline,
