@@ -13,14 +13,10 @@ from rescue_sim.environment.generator import generate_grid
 from rescue_sim.environment.grid import Grid, Position
 from rescue_sim.environment.movement import MovementModel
 from rescue_sim.environment.sensors import CentralSensor
-from rescue_sim.Qlearning.baseline import (
-    BaselineExplorer,
-    CBSExplorer,
-    DFSExplorer,
-    ECBSExplorer,
-    ICBSExplorer,
-    MStarExplorer,
-    PrioritizedPlanningExplorer,
+from rescue_sim.Qlearning.multi_agent_baseline import (
+    DEFAULT_MULTI_AGENT_BASELINES,
+    default_start_positions,
+    run_multi_agent_baseline,
 )
 from rescue_sim.Qlearning.q_learning import EpidemicHystereticQLearning, QLearningAgent
 from rescue_sim.shared import (
@@ -30,8 +26,8 @@ from rescue_sim.shared import (
     GridSettings,
     HystereticConfig,
     LearningState,
-    RewardConfig,
     RewardEvent,
+    SPRINT3_REWARD_CONFIG,
     StrategyInterface,
     TargetType,
     calculate_reward,
@@ -42,24 +38,7 @@ DEFAULT_TRAINING_EPISODES = 25
 EVALUATION_SENSOR_RANGE = 3
 ACTIONS: tuple[Action, ...] = (Action.RIGHT, Action.DOWN, Action.LEFT, Action.UP, Action.WAIT)
 
-EVALUATION_REWARD_CONFIG = RewardConfig(
-    move=-1.0,
-    invalid_move=-2.0,
-    wait=-2.0,
-    discovered_cell_bonus=0.2,
-    rescued_target_a=10.0,
-    rescued_target_b=10.0,
-)
-
-BASELINE_STRATEGIES = (
-    ("baseline", BaselineExplorer),
-    ("dfs", DFSExplorer),
-    ("prioritized_planning", PrioritizedPlanningExplorer),
-    ("cbs", CBSExplorer),
-    ("icbs", ICBSExplorer),
-    ("ecbs", ECBSExplorer),
-    ("mstar", MStarExplorer),
-)
+BASELINE_STRATEGIES = tuple(DEFAULT_MULTI_AGENT_BASELINES.items())
 
 DEEP_BENCHMARK_ALGORITHMS = ("MAPPO", "QMIX", "TransfQMix", "Ensemble", "Distilled")
 DEEP_BENCHMARK_NOTE = (
@@ -195,7 +174,7 @@ def evaluate_agents(
         learning_rate=0.2,
         discount_factor=0.9,
         epsilon=0.35,
-        reward_config=EVALUATION_REWARD_CONFIG,
+        reward_config=SPRINT3_REWARD_CONFIG,
         rng=Random(10_000),
     )
     feedback = [
@@ -212,7 +191,13 @@ def evaluate_agents(
     scenario_dicts: list[dict] = []
     for scenario in selected:
         grid = generate_grid(scenario.grid_settings, start=scenario.start)
-        report = evaluate_simulation_grid(scenario=scenario, grid=grid, learner=learner)
+        starts = _agent_starts(grid, scenario)
+        report = evaluate_simulation_grid(
+            scenario=scenario,
+            grid=grid,
+            learner=learner,
+            start_positions=starts,
+        )
         all_runs.extend(report.runs)
         scenario_dicts.extend(report.scenarios)
 
@@ -233,6 +218,7 @@ def evaluate_agents(
 def evaluate_simulation_grid(
     scenario: EvaluationScenario,
     grid: Grid,
+    start_positions: dict[str, Position],
     learner: QLearningAgent | None = None,
 ) -> EvaluationReport:
     """Evaluate algorithms on the exact grid used by the main simulation."""
@@ -242,22 +228,30 @@ def evaluate_simulation_grid(
         learning_rate=0.2,
         discount_factor=0.9,
         epsilon=0.0,
-        reward_config=EVALUATION_REWARD_CONFIG,
+        reward_config=SPRINT3_REWARD_CONFIG,
         rng=Random(_policy_seed(scenario.grid_settings.random_seed, "trained")),
     )
 
-    runs = [calculate_run_metrics(run_main_algorithm(scenario, grid))]
+    runs = [calculate_run_metrics(run_main_algorithm(scenario, grid, start_positions))]
     for name, strategy_type in BASELINE_STRATEGIES:
         if hasattr(strategy_type, "clear_reservations"):
             strategy_type.clear_reservations()
         strategy = strategy_type(seed=_policy_seed(scenario.grid_settings.random_seed, name))
-        runs.append(calculate_run_metrics(run_strategy_on_grid(scenario, grid, name, strategy)))
-    runs.append(calculate_run_metrics(run_q_learning_agent_on_grid(scenario, grid, q_learner)))
+        runs.append(
+            calculate_run_metrics(
+                run_strategy_on_grid(scenario, grid, name, strategy, start_positions)
+            )
+        )
+    runs.append(
+        calculate_run_metrics(
+            run_q_learning_agent_on_grid(scenario, grid, q_learner, start_positions)
+        )
+    )
 
     aggregates = _aggregate_by_agent(runs)
     return EvaluationReport(
         training_scenarios=[],
-        scenarios=[_scenario_to_dict(scenario)],
+        scenarios=[_scenario_to_dict(scenario, start_positions=start_positions)],
         runs=[asdict(run) for run in runs],
         aggregates=aggregates,
         learning_feedback=[],
@@ -267,7 +261,11 @@ def evaluate_simulation_grid(
     )
 
 
-def run_main_algorithm(scenario: EvaluationScenario, grid: Grid) -> RunTrace:
+def run_main_algorithm(
+    scenario: EvaluationScenario,
+    grid: Grid,
+    starts: dict[str, Position],
+) -> RunTrace:
     """Run the main cooperative Q-learning algorithm."""
 
     fleet = EpidemicHystereticQLearning(
@@ -277,13 +275,13 @@ def run_main_algorithm(scenario: EvaluationScenario, grid: Grid) -> RunTrace:
         max_agents=max(20, scenario.num_agents),
         seed=scenario.grid_settings.random_seed,
     )
-    for agent_id, start in _agent_starts(grid, scenario).items():
+    for agent_id, start in starts.items():
         fleet.add_agent(agent_id, start)
 
     return _run_fleet_loop(
         scenario=scenario,
         grid=grid,
-        starts=_agent_starts(grid, scenario),
+        starts=starts,
         group="main",
         name="epidemic_hysteretic_q",
         action_picker=lambda: {
@@ -306,39 +304,32 @@ def run_strategy_on_grid(
     grid: Grid,
     name: str,
     strategy: StrategyInterface,
+    starts: dict[str, Position],
 ) -> RunTrace:
     """Run one baseline-style strategy as a small cooperative fleet."""
 
-    current_positions = _agent_starts(grid, scenario)
-
-    def pick_actions() -> dict[str, Action]:
-        sensor = CentralSensor(grid)
-        actions: dict[str, Action] = {}
-        for agent_id, position in current_positions.items():
-            observation = sensor.observe(agent_id, position, EVALUATION_SENSOR_RANGE)
-            state = _learning_state(observation, grid, sensor.discovered_cells, frozenset(), 0)
-            valid = _valid_actions(grid, position)
-            actions[agent_id] = strategy.select_action(agent_id, state, valid)
-        return actions
-
-    def remember_positions(
-        actions: dict[str, Action],
-        rewards: dict[str, float],
-        positions: dict[str, Position],
-        dones: dict[str, bool],
-    ) -> int:
-        del actions, rewards, dones
-        current_positions.update(positions)
-        return 0
-
-    return _run_fleet_loop(
-        scenario,
-        grid,
-        _agent_starts(grid, scenario),
-        group="baseline",
-        name=name,
-        action_picker=pick_actions,
-        after_step=remember_positions,
+    metrics = run_multi_agent_baseline(
+        strategy=strategy,
+        grid=grid,
+        start_positions=starts,
+        max_steps=scenario.max_steps,
+        sensor_range=EVALUATION_SENSOR_RANGE,
+        reward_config=SPRINT3_REWARD_CONFIG,
+        strategy_name=name,
+    )
+    return RunTrace(
+        scenario_name=scenario.name,
+        agent_name=name,
+        seed=scenario.grid_settings.random_seed,
+        num_agents=scenario.num_agents,
+        steps_taken=metrics.steps,
+        max_steps=scenario.max_steps,
+        total_reward=metrics.total_reward,
+        rescued_targets=metrics.rescued_targets,
+        total_targets=metrics.total_targets,
+        explored_cells=metrics.explored_cells,
+        explorable_cells=_explorable_cell_count(grid),
+        algorithm_group="baseline",
     )
 
 
@@ -351,8 +342,9 @@ def train_q_learning_agent(
     # Legacy single-agent Q-learning path: retained for the visualization API and
     # the evaluation panel. The multi-agent line-up (Epidemic fleet, QMIX,
     # TransfQMix, MAPPO, MoE) does not go through here.
+    starts = _agent_starts(grid, scenario)
     traces = [
-        run_q_learning_agent_on_grid(scenario, grid, learner, training=True)
+        run_q_learning_agent_on_grid(scenario, grid, learner, starts, training=True)
         for _ in range(training_episodes)
     ]
     first, last = traces[0], traces[-1]
@@ -371,6 +363,7 @@ def run_q_learning_agent_on_grid(
     scenario: EvaluationScenario,
     grid: Grid,
     learner: QLearningAgent,
+    starts: dict[str, Position],
     training: bool = False,
 ) -> RunTrace:
     """Run the regular Q-learning policy as another comparator."""
@@ -413,7 +406,7 @@ def run_q_learning_agent_on_grid(
             )
         return 0
 
-    positions = _agent_starts(grid, scenario)
+    positions = starts
     trace = _run_fleet_loop(
         scenario,
         grid,
@@ -482,7 +475,7 @@ def _run_fleet_loop(
                     completed_episode=done,
                     repeated_cell=repeated,
                 ),
-                EVALUATION_REWARD_CONFIG,
+                SPRINT3_REWARD_CONFIG,
             )
             rewards[agent_id] = reward
             dones[agent_id] = done
@@ -661,8 +654,13 @@ def _average(values: Iterable[float]) -> float:
     return sum(items) / len(items)
 
 
-def _scenario_to_dict(scenario: EvaluationScenario, split: str = "test") -> dict:
+def _scenario_to_dict(
+    scenario: EvaluationScenario,
+    split: str = "test",
+    start_positions: dict[str, Position] | None = None,
+) -> dict:
     grid = generate_grid(scenario.grid_settings, start=scenario.start)
+    starts = start_positions or _agent_starts(grid, scenario)
     return {
         "name": scenario.name,
         "split": split,
@@ -672,7 +670,7 @@ def _scenario_to_dict(scenario: EvaluationScenario, split: str = "test") -> dict
         "num_agents": scenario.num_agents,
         "communication_range": scenario.communication_range,
         "agent_starts": {
-            agent_id: asdict(position) for agent_id, position in _agent_starts(grid, scenario).items()
+            agent_id: asdict(position) for agent_id, position in starts.items()
         },
     }
 
@@ -697,16 +695,7 @@ def _scenario(
 
 
 def _agent_starts(grid: Grid, scenario: EvaluationScenario) -> dict[str, Position]:
-    valid_positions = [
-        Position(x, y)
-        for y in range(grid.height)
-        for x in range(grid.width)
-        if grid.is_valid_position(Position(x, y))
-    ]
-    starts = [scenario.start] + [position for position in valid_positions if position != scenario.start]
-    if len(starts) < scenario.num_agents:
-        raise ValueError(f"not enough valid cells for {scenario.num_agents} agents")
-    return {f"agent-{index}": starts[index] for index in range(scenario.num_agents)}
+    return default_start_positions(grid, scenario.num_agents, scenario.start)
 
 
 def _deep_benchmark_rows() -> list[dict]:

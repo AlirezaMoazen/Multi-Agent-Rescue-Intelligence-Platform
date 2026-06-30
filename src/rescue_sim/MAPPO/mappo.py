@@ -15,6 +15,9 @@ Runs on CPU; `torch` is the only extra dependency (install with `pip install
 
 from __future__ import annotations
 
+from dataclasses import asdict
+from pathlib import Path
+
 import numpy as np
 import torch
 from torch import nn
@@ -73,6 +76,39 @@ class MAPPO:
         self.net = ActorCritic(env.obs_dim, env.state_dim, env.n_actions, settings.hidden_dim)
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=settings.learning_rate)
         self.value_norm = RunningMeanStd() if settings.normalize_value else None
+
+    def save_checkpoint(self, path: str | Path) -> None:
+        """Save model weights and training state for later visualization/API use."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        value_norm = None
+        if self.value_norm is not None:
+            value_norm = {
+                "mean": self.value_norm.mean,
+                "var": self.value_norm.var,
+                "count": self.value_norm.count,
+            }
+        torch.save(
+            {
+                "settings": asdict(self.cfg),
+                "network": self.net.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "value_norm": value_norm,
+            },
+            path,
+        )
+
+    def load_checkpoint(self, path: str | Path) -> None:
+        """Load weights into an already-created MAPPO trainer."""
+        checkpoint = torch.load(Path(path), map_location="cpu")
+        self.net.load_state_dict(checkpoint["network"])
+        if "optimizer" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer"])
+        stats = checkpoint.get("value_norm")
+        if self.value_norm is not None and stats is not None:
+            self.value_norm.mean = float(stats["mean"])
+            self.value_norm.var = float(stats["var"])
+            self.value_norm.count = float(stats["count"])
 
     # -- rollout ------------------------------------------------------------
 

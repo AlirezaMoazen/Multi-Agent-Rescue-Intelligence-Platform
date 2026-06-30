@@ -22,6 +22,8 @@ target.  Runs on CPU (`pip install -e ".[transfqmix]"`).
 
 from __future__ import annotations
 
+from dataclasses import asdict
+from pathlib import Path
 from random import Random
 
 import numpy as np
@@ -165,6 +167,36 @@ class TransfQMIX:
     def _sync_targets(self) -> None:
         hard_update(self.target_agent, self.agent)
         hard_update(self.target_mixer, self.mixer)
+
+    def save_checkpoint(self, path: str | Path) -> None:
+        """Save model weights and training state for later visualization/API use."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "settings": asdict(self.cfg),
+                "agent": self.agent.state_dict(),
+                "mixer": self.mixer.state_dict(),
+                "target_agent": self.target_agent.state_dict(),
+                "target_mixer": self.target_mixer.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "epsilon": self.epsilon,
+                "learn_steps": self.learn_steps,
+            },
+            path,
+        )
+
+    def load_checkpoint(self, path: str | Path) -> None:
+        """Load weights into an already-created TransfQMIX trainer."""
+        checkpoint = torch.load(Path(path), map_location="cpu")
+        self.agent.load_state_dict(checkpoint["agent"])
+        self.mixer.load_state_dict(checkpoint["mixer"])
+        self.target_agent.load_state_dict(checkpoint.get("target_agent", checkpoint["agent"]))
+        self.target_mixer.load_state_dict(checkpoint.get("target_mixer", checkpoint["mixer"]))
+        if "optimizer" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer"])
+        self.epsilon = float(checkpoint.get("epsilon", self.epsilon))
+        self.learn_steps = int(checkpoint.get("learn_steps", self.learn_steps))
 
     def _agent_forward(self, net: AgentTransformer, tokens: torch.Tensor):
         """Apply a per-agent transformer to a (B, N, T, D) batch."""
