@@ -1,8 +1,9 @@
-"""Multi-agent runner for the classical non-ML baseline strategies.
+"""Multi-agent adapters for the non-ML baseline strategies.
 
-The existing baseline classes choose one action for one agent. This module
-keeps those classes unchanged and runs them as a synchronized team, so the
-project can compare MARL methods against fair multi-agent classical baselines.
+This module keeps the existing baseline algorithms unchanged and runs them in a
+shared multi-agent rescue episode. It gives the MARL models a fair classical
+comparison point: several agents, shared sensor memory, collision handling, and
+team-level metrics.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from rescue_sim.environment.generator import generate_grid
 from rescue_sim.environment.grid import Grid, Position
 from rescue_sim.environment.movement import MovementModel
 from rescue_sim.environment.sensors import CentralSensor, Observation
-from rescue_sim.learning.baseline import (
+from rescue_sim.Qlearning.baseline import (
     BaselineExplorer,
     CBSExplorer,
     DFSExplorer,
@@ -55,7 +56,7 @@ DEFAULT_MULTI_AGENT_BASELINES: Mapping[str, BaselineFactory] = {
 
 @dataclass(frozen=True, slots=True)
 class MultiAgentBaselineStep:
-    """One synchronized step for all agents."""
+    """One synchronized step for all baseline agents."""
 
     step: int
     actions: dict[str, Action]
@@ -67,7 +68,7 @@ class MultiAgentBaselineStep:
 
 @dataclass(frozen=True, slots=True)
 class MultiAgentBaselineMetrics:
-    """Team-level result for one multi-agent baseline run."""
+    """Report-ready result for one multi-agent non-ML baseline run."""
 
     strategy_name: str
     num_agents: int
@@ -86,7 +87,6 @@ class MultiAgentBaselineMetrics:
 
     @property
     def success_rate(self) -> float:
-        """Return 1.0 for success and 0.0 for failure."""
         return 1.0 if self.success else 0.0
 
 
@@ -99,7 +99,11 @@ def run_multi_agent_baseline(
     reward_config: RewardConfig = SPRINT3_REWARD_CONFIG,
     strategy_name: str | None = None,
 ) -> MultiAgentBaselineMetrics:
-    """Run one non-ML strategy with several agents on the same rescue grid."""
+    """Run one non-ML strategy with several agents on the same grid.
+
+    The strategy object is shared across agents so algorithms with per-agent
+    state can coordinate through their own ``agent_id`` keys.
+    """
     if not start_positions:
         raise ValueError("at least one agent start position is required")
     if max_steps < 0:
@@ -111,7 +115,10 @@ def run_multi_agent_baseline(
     movement = MovementModel()
     sensor = CentralSensor(grid)
     positions = dict(start_positions)
-    visited_by_agent = {agent_id: {position} for agent_id, position in positions.items()}
+    visited_by_agent = {
+        agent_id: {position}
+        for agent_id, position in positions.items()
+    }
     explored_cells = set(positions.values())
     rescued: set[Position] = set()
     all_targets = grid.target_a_positions | grid.target_b_positions
@@ -229,10 +236,7 @@ def run_multi_agent_baseline(
         collisions=collisions,
         invalid_moves=invalid_moves,
         final_positions=dict(positions),
-        reward_by_agent={
-            agent_id: round(reward, 4)
-            for agent_id, reward in reward_by_agent.items()
-        },
+        reward_by_agent={agent_id: round(reward, 4) for agent_id, reward in reward_by_agent.items()},
         trace=tuple(trace),
     )
 
@@ -245,7 +249,7 @@ def compare_multi_agent_baselines(
     seed: int | None = None,
     baseline_factories: Mapping[str, BaselineFactory] = DEFAULT_MULTI_AGENT_BASELINES,
 ) -> dict[str, MultiAgentBaselineMetrics]:
-    """Run configured classical baselines on one shared multi-agent scenario."""
+    """Run all configured non-ML baselines on one shared multi-agent scenario."""
     if num_agents <= 0:
         raise ValueError("num_agents must be positive")
 
@@ -256,8 +260,9 @@ def compare_multi_agent_baselines(
 
     for index, (name, factory) in enumerate(baseline_factories.items()):
         strategy_seed = None if seed is None else seed + index
+        strategy = factory(strategy_seed)
         results[name] = run_multi_agent_baseline(
-            strategy=factory(strategy_seed),
+            strategy=strategy,
             grid=grid,
             start_positions=starts,
             max_steps=max_steps,
@@ -273,7 +278,7 @@ def default_start_positions(
     num_agents: int,
     anchor: Position = Position(0, 0),
 ) -> dict[str, Position]:
-    """Choose deterministic reachable start cells that do not overlap targets."""
+    """Choose deterministic, reachable, non-target starts for a multi-agent run."""
     if num_agents <= 0:
         raise ValueError("num_agents must be positive")
     if not grid.is_valid_position(anchor):
@@ -296,7 +301,10 @@ def default_start_positions(
     if len(ordered) < num_agents:
         raise ValueError("not enough reachable free cells for all agents")
 
-    return {f"agent-{index}": ordered[index] for index in range(num_agents)}
+    return {
+        f"agent-{index}": ordered[index]
+        for index in range(num_agents)
+    }
 
 
 def _state_from_observation(

@@ -1,4 +1,4 @@
-"""Evaluation tools for single-agent rescue strategies."""
+"""Evaluation tools for rescue strategies."""
 
 from __future__ import annotations
 
@@ -7,33 +7,65 @@ import csv
 import io
 import json
 from random import Random
-from typing import Callable, Iterable, Literal
+from typing import Iterable
 
 from rescue_sim.environment.generator import generate_grid
 from rescue_sim.environment.grid import Grid, Position
 from rescue_sim.environment.movement import MovementModel
 from rescue_sim.environment.sensors import CentralSensor
-from rescue_sim.learning.q_learning import QLearningAgent
-from rescue_sim.shared import Action, GridSettings, RewardConfig, RewardEvent, TargetType, calculate_reward
+from rescue_sim.Qlearning.baseline import (
+    BaselineExplorer,
+    CBSExplorer,
+    DFSExplorer,
+    ECBSExplorer,
+    ICBSExplorer,
+    MStarExplorer,
+    PrioritizedPlanningExplorer,
+)
+from rescue_sim.Qlearning.q_learning import EpidemicHystereticQLearning, QLearningAgent
+from rescue_sim.shared import (
+    Action,
+    CARDINAL_ACTIONS,
+    GossipConfig,
+    GridSettings,
+    HystereticConfig,
+    LearningState,
+    RewardConfig,
+    RewardEvent,
+    StrategyInterface,
+    TargetType,
+    calculate_reward,
+)
 
-AgentName = Literal["baseline", "trained"]
-Policy = Callable[[Grid, Position, frozenset[Position], frozenset[Position], Random], Position]
-
-NUM_AGENTS = 1
-STEP_REWARD = -1.0
-NEW_CELL_REWARD = 0.2
-TARGET_REWARD = 10.0
-INVALID_MOVE_REWARD = -2.0
+DEFAULT_NUM_AGENTS = 4
 DEFAULT_TRAINING_EPISODES = 25
 EVALUATION_SENSOR_RANGE = 3
-ACTIONS: tuple[Action, ...] = (Action.RIGHT, Action.DOWN, Action.LEFT, Action.UP)
+ACTIONS: tuple[Action, ...] = (Action.RIGHT, Action.DOWN, Action.LEFT, Action.UP, Action.WAIT)
+
 EVALUATION_REWARD_CONFIG = RewardConfig(
-    move=STEP_REWARD,
-    invalid_move=INVALID_MOVE_REWARD,
-    wait=INVALID_MOVE_REWARD,
-    discovered_cell_bonus=NEW_CELL_REWARD,
-    rescued_target_a=TARGET_REWARD,
-    rescued_target_b=TARGET_REWARD,
+    move=-1.0,
+    invalid_move=-2.0,
+    wait=-2.0,
+    discovered_cell_bonus=0.2,
+    rescued_target_a=10.0,
+    rescued_target_b=10.0,
+)
+
+BASELINE_STRATEGIES = (
+    ("baseline", BaselineExplorer),
+    ("dfs", DFSExplorer),
+    ("prioritized_planning", PrioritizedPlanningExplorer),
+    ("cbs", CBSExplorer),
+    ("icbs", ICBSExplorer),
+    ("ecbs", ECBSExplorer),
+    ("mstar", MStarExplorer),
+)
+
+DEEP_BENCHMARK_ALGORITHMS = ("MAPPO", "QMIX", "TransfQMix", "Ensemble", "Distilled")
+DEEP_BENCHMARK_NOTE = (
+    "Deep RL methods use their own RescueEnv benchmark with fresh generated grids. "
+    "These results are useful as an additional benchmark, but they are not directly "
+    "comparable to the same-grid simulation runs."
 )
 
 
@@ -45,23 +77,13 @@ class EvaluationScenario:
     grid_settings: GridSettings
     max_steps: int
     start: Position = Position(0, 0)
-
-
-@dataclass(frozen=True)
-class EpisodeStep:
-    """One transition that can be used by a learning agent."""
-
-    state: Position
-    action: Action
-    reward: float
-    next_state: Position
-    rescued_targets: int
-    explored_cells: int
+    num_agents: int = DEFAULT_NUM_AGENTS
+    communication_range: float = 3.0
 
 
 @dataclass(frozen=True)
 class LearningFeedback:
-    """Training feedback produced before evaluating the trained agent."""
+    """Small training summary for the Q-learning comparator."""
 
     scenario_name: str
     training_episodes: int
@@ -74,10 +96,10 @@ class LearningFeedback:
 
 @dataclass(frozen=True)
 class RunTrace:
-    """Raw information collected during one strategy run."""
+    """Raw result for one algorithm on one scenario."""
 
     scenario_name: str
-    agent_name: AgentName
+    agent_name: str
     seed: int | None
     num_agents: int
     steps_taken: int
@@ -87,15 +109,18 @@ class RunTrace:
     total_targets: int
     explored_cells: int
     explorable_cells: int
-    episode_steps: tuple[EpisodeStep, ...] = ()
+    algorithm_group: str = "baseline"
+    status: str = "ok"
+    communication_events: int = 0
+    error: str | None = None
 
 
 @dataclass(frozen=True)
 class RunMetrics:
-    """Report-ready metrics for one scenario and one strategy."""
+    """Report-ready metrics for one scenario and one algorithm."""
 
     scenario_name: str
-    agent_name: AgentName
+    agent_name: str
     seed: int | None
     num_agents: int
     success: bool
@@ -107,11 +132,15 @@ class RunMetrics:
     rescued_targets: int
     total_targets: int
     explored_area_percentage: float
+    algorithm_group: str = "baseline"
+    status: str = "ok"
+    communication_events: int = 0
+    error: str | None = None
 
 
 @dataclass(frozen=True)
 class EvaluationReport:
-    """Full comparison report for visualization, JSON export, or sprint demos."""
+    """Full comparison report for JSON, CSV, or visualization."""
 
     training_scenarios: list[dict]
     scenarios: list[dict]
@@ -119,120 +148,28 @@ class EvaluationReport:
     aggregates: list[dict]
     learning_feedback: list[dict]
     sprint_demo_summary: str
+    deep_benchmark: list[dict]
+    deep_benchmark_note: str
 
 
 def default_evaluation_scenarios() -> list[EvaluationScenario]:
-    """Define varied scenarios across seeds, grid sizes, obstacles, and targets."""
-
-    return [
-        EvaluationScenario(
-            name="small_open_seed_7",
-            grid_settings=GridSettings(
-                width=5,
-                height=5,
-                obstacle_probability=0.05,
-                target_a_count=1,
-                target_b_count=1,
-                random_seed=7,
-            ),
-            max_steps=35,
-        ),
-        EvaluationScenario(
-            name="medium_mixed_seed_13",
-            grid_settings=GridSettings(
-                width=8,
-                height=8,
-                obstacle_probability=0.18,
-                target_a_count=2,
-                target_b_count=2,
-                random_seed=13,
-            ),
-            max_steps=80,
-        ),
-        EvaluationScenario(
-            name="large_dense_seed_23",
-            grid_settings=GridSettings(
-                width=10,
-                height=10,
-                obstacle_probability=0.25,
-                target_a_count=3,
-                target_b_count=2,
-                random_seed=23,
-            ),
-            max_steps=130,
-        ),
-        EvaluationScenario(
-            name="wide_sparse_seed_31",
-            grid_settings=GridSettings(
-                width=12,
-                height=6,
-                obstacle_probability=0.12,
-                target_a_count=2,
-                target_b_count=3,
-                random_seed=31,
-            ),
-            max_steps=95,
-        ),
+    specs = [
+        ("small_open_seed_7", 5, 5, 0.05, 1, 1, 7, 35),
+        ("medium_mixed_seed_13", 8, 8, 0.18, 2, 2, 13, 80),
+        ("large_dense_seed_23", 10, 10, 0.25, 3, 2, 23, 130),
+        ("wide_sparse_seed_31", 12, 6, 0.12, 2, 3, 31, 95),
     ]
+    return [_scenario(*spec) for spec in specs]
 
 
 def default_training_scenarios() -> list[EvaluationScenario]:
-    """Define training-only scenarios so evaluation can test unseen seeds."""
-
-    return [
-        EvaluationScenario(
-            name="train_small_seed_101",
-            grid_settings=GridSettings(
-                width=5,
-                height=5,
-                obstacle_probability=0.05,
-                target_a_count=1,
-                target_b_count=1,
-                random_seed=101,
-            ),
-            max_steps=35,
-            start=Position(1, 1),
-        ),
-        EvaluationScenario(
-            name="train_medium_seed_113",
-            grid_settings=GridSettings(
-                width=8,
-                height=8,
-                obstacle_probability=0.18,
-                target_a_count=2,
-                target_b_count=2,
-                random_seed=113,
-            ),
-            max_steps=80,
-            start=Position(2, 2),
-        ),
-        EvaluationScenario(
-            name="train_large_seed_123",
-            grid_settings=GridSettings(
-                width=10,
-                height=10,
-                obstacle_probability=0.25,
-                target_a_count=3,
-                target_b_count=2,
-                random_seed=123,
-            ),
-            max_steps=130,
-            start=Position(3, 3),
-        ),
-        EvaluationScenario(
-            name="train_wide_seed_131",
-            grid_settings=GridSettings(
-                width=12,
-                height=6,
-                obstacle_probability=0.12,
-                target_a_count=2,
-                target_b_count=3,
-                random_seed=131,
-            ),
-            max_steps=95,
-            start=Position(4, 2),
-        ),
+    specs = [
+        ("train_small_seed_101", 5, 5, 0.05, 1, 1, 101, 35, Position(1, 1)),
+        ("train_medium_seed_113", 8, 8, 0.18, 2, 2, 113, 80, Position(2, 2)),
+        ("train_large_seed_123", 10, 10, 0.25, 3, 2, 123, 130, Position(3, 3)),
+        ("train_wide_seed_131", 12, 6, 0.12, 2, 3, 131, 95, Position(4, 2)),
     ]
+    return [_scenario(*spec) for spec in specs]
 
 
 def evaluate_agents(
@@ -240,16 +177,19 @@ def evaluate_agents(
     training_scenarios: Iterable[EvaluationScenario] | None = None,
     training_episodes: int = DEFAULT_TRAINING_EPISODES,
 ) -> EvaluationReport:
-    """Train on training seeds, then compare baseline and trained agents on test seeds."""
+    """Compatibility wrapper that builds demo grids from scenario settings.
 
-    selected_scenarios = list(scenarios or default_evaluation_scenarios())
-    selected_training_scenarios = list(
+    The real simulation/visualization path should call evaluate_simulation_grid()
+    with the grid that the main simulation already generated.
+    """
+
+    selected = list(scenarios or default_evaluation_scenarios())
+    train_selected = list(
         training_scenarios
         if training_scenarios is not None
-        else (selected_scenarios if scenarios is not None else default_training_scenarios())
+        else (selected if scenarios is not None else default_training_scenarios())
     )
-    runs: list[RunMetrics] = []
-    learning_feedback: list[LearningFeedback] = []
+
     learner = QLearningAgent(
         actions=ACTIONS,
         learning_rate=0.2,
@@ -258,123 +198,147 @@ def evaluate_agents(
         reward_config=EVALUATION_REWARD_CONFIG,
         rng=Random(10_000),
     )
-
-    for training_scenario in selected_training_scenarios:
-        training_grid = generate_grid(training_scenario.grid_settings, start=training_scenario.start)
-        learning_feedback.append(
-            train_q_learning_agent(learner, training_scenario, training_grid, training_episodes)
+    feedback = [
+        train_q_learning_agent(
+            learner,
+            training_scenario,
+            generate_grid(training_scenario.grid_settings, start=training_scenario.start),
+            training_episodes,
         )
+        for training_scenario in train_selected
+    ]
 
-    for scenario in selected_scenarios:
+    all_runs: list[dict] = []
+    scenario_dicts: list[dict] = []
+    for scenario in selected:
         grid = generate_grid(scenario.grid_settings, start=scenario.start)
+        report = evaluate_simulation_grid(scenario=scenario, grid=grid, learner=learner)
+        all_runs.extend(report.runs)
+        scenario_dicts.extend(report.scenarios)
 
-        baseline_trace = run_agent_on_grid(
-            scenario=scenario,
-            grid=grid,
-            agent_name="baseline",
-            policy=_baseline_policy,
-        )
-        runs.append(calculate_run_metrics(baseline_trace))
-
-        trained_trace = run_q_learning_agent_on_grid(
-            scenario=scenario,
-            grid=grid,
-            learner=learner,
-        )
-        runs.append(calculate_run_metrics(trained_trace))
-
-    run_dicts = [asdict(run) for run in runs]
-    aggregate_dicts = _aggregate_by_agent(runs)
-
+    runs = [RunMetrics(**run) for run in all_runs]
+    aggregates = _aggregate_by_agent(runs)
     return EvaluationReport(
-        training_scenarios=[
-            _scenario_to_dict(scenario, split="train") for scenario in selected_training_scenarios
-        ],
-        scenarios=[_scenario_to_dict(scenario) for scenario in selected_scenarios],
-        runs=run_dicts,
-        aggregates=aggregate_dicts,
-        learning_feedback=[asdict(feedback) for feedback in learning_feedback],
-        sprint_demo_summary=build_sprint_demo_summary(aggregate_dicts),
+        training_scenarios=[_scenario_to_dict(s, "train") for s in train_selected],
+        scenarios=scenario_dicts,
+        runs=all_runs,
+        aggregates=aggregates,
+        learning_feedback=[asdict(item) for item in feedback],
+        sprint_demo_summary=build_sprint_demo_summary(aggregates),
+        deep_benchmark=_deep_benchmark_rows(),
+        deep_benchmark_note=DEEP_BENCHMARK_NOTE,
     )
 
 
-def run_agent_on_grid(
+def evaluate_simulation_grid(
     scenario: EvaluationScenario,
     grid: Grid,
-    agent_name: AgentName,
-    policy: Policy,
-) -> RunTrace:
-    """Execute one policy on a generated grid and collect raw trace values."""
+    learner: QLearningAgent | None = None,
+) -> EvaluationReport:
+    """Evaluate algorithms on the exact grid used by the main simulation."""
 
-    rng = Random(_policy_seed(scenario.grid_settings.random_seed, agent_name))
-    position = scenario.start
-    visited = {position}
-    rescued: set[Position] = set()
-    all_targets = grid.target_a_positions | grid.target_b_positions
-    total_reward = 0.0
-    steps_taken = 0
-    episode_steps: list[EpisodeStep] = []
+    q_learner = learner or QLearningAgent(
+        actions=ACTIONS,
+        learning_rate=0.2,
+        discount_factor=0.9,
+        epsilon=0.0,
+        reward_config=EVALUATION_REWARD_CONFIG,
+        rng=Random(_policy_seed(scenario.grid_settings.random_seed, "trained")),
+    )
 
-    for step in range(1, scenario.max_steps + 1):
-        if rescued == all_targets:
-            break
+    runs = [calculate_run_metrics(run_main_algorithm(scenario, grid))]
+    for name, strategy_type in BASELINE_STRATEGIES:
+        if hasattr(strategy_type, "clear_reservations"):
+            strategy_type.clear_reservations()
+        strategy = strategy_type(seed=_policy_seed(scenario.grid_settings.random_seed, name))
+        runs.append(calculate_run_metrics(run_strategy_on_grid(scenario, grid, name, strategy)))
+    runs.append(calculate_run_metrics(run_q_learning_agent_on_grid(scenario, grid, q_learner)))
 
-        previous_position = position
-        next_position = policy(grid, position, frozenset(visited), frozenset(rescued), rng)
-        steps_taken = step
-        action = _action_between(previous_position, next_position)
-        moved = False
+    aggregates = _aggregate_by_agent(runs)
+    return EvaluationReport(
+        training_scenarios=[],
+        scenarios=[_scenario_to_dict(scenario)],
+        runs=[asdict(run) for run in runs],
+        aggregates=aggregates,
+        learning_feedback=[],
+        sprint_demo_summary=build_sprint_demo_summary(aggregates),
+        deep_benchmark=_deep_benchmark_rows(),
+        deep_benchmark_note=DEEP_BENCHMARK_NOTE,
+    )
 
-        if grid.is_valid_position(next_position):
-            position = next_position
-            moved = position != previous_position
 
-        newly_discovered_cells = 0
-        if position not in visited:
-            visited.add(position)
-            newly_discovered_cells = 1
+def run_main_algorithm(scenario: EvaluationScenario, grid: Grid) -> RunTrace:
+    """Run the main cooperative Q-learning algorithm."""
 
-        rescued_target_type = None
-        if position in all_targets and position not in rescued:
-            rescued.add(position)
-            rescued_target_type = _target_type_enum(grid, position)
-
-        step_reward = calculate_reward(
-            RewardEvent(
-                moved=moved,
-                move=action.value,
-                newly_discovered_cells=newly_discovered_cells,
-                rescued_target_type=rescued_target_type,
-                completed_episode=rescued == all_targets,
-            ),
-            EVALUATION_REWARD_CONFIG,
-        )
-
-        total_reward += step_reward
-        episode_steps.append(
-            EpisodeStep(
-                state=previous_position,
-                action=action,
-                reward=round(step_reward, 4),
-                next_state=position,
-                rescued_targets=len(rescued),
-                explored_cells=len(visited),
-            )
-        )
-
-    return RunTrace(
-        scenario_name=scenario.name,
-        agent_name=agent_name,
+    fleet = EpidemicHystereticQLearning(
+        grid=grid,
+        config=HystereticConfig(),
+        gossip=GossipConfig(comm_radius=scenario.communication_range),
+        max_agents=max(20, scenario.num_agents),
         seed=scenario.grid_settings.random_seed,
-        num_agents=NUM_AGENTS,
-        steps_taken=steps_taken,
-        max_steps=scenario.max_steps,
-        total_reward=round(total_reward, 4),
-        rescued_targets=len(rescued),
-        total_targets=len(all_targets),
-        explored_cells=len(visited),
-        explorable_cells=_explorable_cell_count(grid),
-        episode_steps=tuple(episode_steps),
+    )
+    for agent_id, start in _agent_starts(grid, scenario).items():
+        fleet.add_agent(agent_id, start)
+
+    return _run_fleet_loop(
+        scenario=scenario,
+        grid=grid,
+        starts=_agent_starts(grid, scenario),
+        group="main",
+        name="epidemic_hysteretic_q",
+        action_picker=lambda: {
+            agent_id: CARDINAL_ACTIONS[index] for agent_id, index in fleet.select_actions().items()
+        },
+        after_step=lambda actions, rewards, positions, dones: (
+            fleet.record_transitions(
+                {agent_id: CARDINAL_ACTIONS.index(action) for agent_id, action in actions.items()},
+                rewards,
+                positions,
+                dones,
+            ),
+            fleet.gossip(),
+        )[1],
+    )
+
+
+def run_strategy_on_grid(
+    scenario: EvaluationScenario,
+    grid: Grid,
+    name: str,
+    strategy: StrategyInterface,
+) -> RunTrace:
+    """Run one baseline-style strategy as a small cooperative fleet."""
+
+    current_positions = _agent_starts(grid, scenario)
+
+    def pick_actions() -> dict[str, Action]:
+        sensor = CentralSensor(grid)
+        actions: dict[str, Action] = {}
+        for agent_id, position in current_positions.items():
+            observation = sensor.observe(agent_id, position, EVALUATION_SENSOR_RANGE)
+            state = _learning_state(observation, grid, sensor.discovered_cells, frozenset(), 0)
+            valid = _valid_actions(grid, position)
+            actions[agent_id] = strategy.select_action(agent_id, state, valid)
+        return actions
+
+    def remember_positions(
+        actions: dict[str, Action],
+        rewards: dict[str, float],
+        positions: dict[str, Position],
+        dones: dict[str, bool],
+    ) -> int:
+        del actions, rewards, dones
+        current_positions.update(positions)
+        return 0
+
+    return _run_fleet_loop(
+        scenario,
+        grid,
+        _agent_starts(grid, scenario),
+        group="baseline",
+        name=name,
+        action_picker=pick_actions,
+        after_step=remember_positions,
     )
 
 
@@ -384,30 +348,22 @@ def train_q_learning_agent(
     grid: Grid,
     training_episodes: int,
 ) -> LearningFeedback:
-    """Train the real Sprint 3 QLearningAgent on one training scenario."""
-
-    episode_traces: list[RunTrace] = []
-
-    for episode_number in range(training_episodes):
-        learner.epsilon = max(0.05, learner.epsilon * (0.96**episode_number))
-        trace = run_q_learning_agent_on_grid(
-            scenario=scenario,
-            grid=grid,
-            learner=learner,
-            training=True,
-        )
-        episode_traces.append(trace)
-
-    first_trace = episode_traces[0]
-    last_trace = episode_traces[-1]
+    # Legacy single-agent Q-learning path: retained for the visualization API and
+    # the evaluation panel. The multi-agent line-up (Epidemic fleet, QMIX,
+    # TransfQMix, MAPPO, MoE) does not go through here.
+    traces = [
+        run_q_learning_agent_on_grid(scenario, grid, learner, training=True)
+        for _ in range(training_episodes)
+    ]
+    first, last = traces[0], traces[-1]
     return LearningFeedback(
-        scenario_name=scenario.name,
-        training_episodes=training_episodes,
-        first_episode_steps=first_trace.steps_taken,
-        last_episode_steps=last_trace.steps_taken,
-        first_episode_reward=first_trace.total_reward,
-        last_episode_reward=last_trace.total_reward,
-        learned_state_actions=len(learner.q_table),
+        scenario.name,
+        training_episodes,
+        first.steps_taken,
+        last.steps_taken,
+        first.total_reward,
+        last.total_reward,
+        len(learner.q_table),
     )
 
 
@@ -417,132 +373,144 @@ def run_q_learning_agent_on_grid(
     learner: QLearningAgent,
     training: bool = False,
 ) -> RunTrace:
-    """Run the real QLearningAgent and optionally update its Q-table."""
+    """Run the regular Q-learning policy as another comparator."""
 
-    movement = MovementModel()
-    sensor = CentralSensor(grid)
-    position = scenario.start
-    visited = {position}
-    rescued: set[Position] = set()
-    all_targets = grid.target_a_positions | grid.target_b_positions
-    total_reward = 0.0
-    steps_taken = 0
-    episode_steps: list[EpisodeStep] = []
     previous_epsilon = learner.epsilon
-
     if not training:
         learner.epsilon = 0.0
 
-    observation = sensor.observe("agent-1", position, sensor_range=EVALUATION_SENSOR_RANGE)
+    sensor = CentralSensor(grid)
+
+    def pick_actions() -> dict[str, Action]:
+        actions: dict[str, Action] = {}
+        for agent_id, position in positions.items():
+            observation = sensor.observe(agent_id, position, EVALUATION_SENSOR_RANGE)
+            state = learner.state_from_observation(observation, grid, frozenset(), 0)
+            actions[agent_id] = learner.choose_action(state, _learner_actions(learner, grid, position))
+        return actions
+
+    def learn(
+        actions: dict[str, Action],
+        rewards: dict[str, float],
+        next_positions: dict[str, Position],
+        dones: dict[str, bool],
+    ) -> int:
+        if not training:
+            return 0
+        for agent_id, action in actions.items():
+            before = positions[agent_id]
+            after = next_positions[agent_id]
+            state_obs = sensor.observe(agent_id, before, EVALUATION_SENSOR_RANGE)
+            next_obs = sensor.observe(agent_id, after, EVALUATION_SENSOR_RANGE)
+            state = learner.state_from_observation(state_obs, grid, frozenset(), 0)
+            next_state = learner.state_from_observation(next_obs, grid, frozenset(), 0)
+            learner.update_q_value(
+                state,
+                action,
+                rewards[agent_id],
+                next_state,
+                _learner_actions(learner, grid, after),
+            )
+        return 0
+
+    positions = _agent_starts(grid, scenario)
+    trace = _run_fleet_loop(
+        scenario,
+        grid,
+        positions,
+        group="q_learning",
+        name="trained",
+        action_picker=pick_actions,
+        after_step=learn,
+    )
+    learner.epsilon = previous_epsilon
+    return trace
+
+
+def _run_fleet_loop(
+    scenario: EvaluationScenario,
+    grid: Grid,
+    starts: dict[str, Position],
+    group: str,
+    name: str,
+    action_picker,
+    after_step,
+) -> RunTrace:
+    movement = MovementModel()
+    sensor = CentralSensor(grid)
+    positions = dict(starts)
+    visited = set(starts.values())
+    visited_by_agent = {agent_id: {start} for agent_id, start in starts.items()}
+    rescued: set[Position] = set()
+    targets = grid.target_a_positions | grid.target_b_positions
+    steps = 0
+    reward_total = 0.0
+    communication_events = 0
 
     for step in range(1, scenario.max_steps + 1):
-        if rescued == all_targets:
+        if rescued == targets:
             break
 
-        previous_position = position
-        state = learner.state_from_observation(
-            observation=observation,
-            grid=grid,
-            found_targets=frozenset(rescued),
-            steps_taken=0,
-        )
-        valid_actions = learner.valid_actions(movement, grid, position)
-        valid_actions = tuple(action for action in valid_actions if action != Action.WAIT) or valid_actions
-        if not valid_actions:
-            valid_actions = (Action.WAIT,)
+        actions = action_picker()
+        rewards: dict[str, float] = {}
+        next_positions: dict[str, Position] = {}
+        dones: dict[str, bool] = {}
 
-        action = learner.choose_action(state, valid_actions)
-        movement_result = movement.apply(grid, position, action.value)
-        position = movement_result.end
-        next_observation = sensor.observe("agent-1", position, sensor_range=EVALUATION_SENSOR_RANGE)
-        steps_taken = step
+        for agent_id, action in actions.items():
+            before = positions[agent_id]
+            result = movement.apply(grid, before, action.value)
+            after = result.end
+            positions[agent_id] = after
+            next_positions[agent_id] = after
 
-        repeated_cell = position in visited
-        newly_discovered_cells = 0
-        if position not in visited:
-            visited.add(position)
-            newly_discovered_cells = 1
+            observation = sensor.observe(agent_id, after, EVALUATION_SENSOR_RANGE)
+            target_type = _target_type_enum(grid, after) if after not in rescued else None
+            if target_type is not None:
+                rescued.add(after)
 
-        rescued_target_type = None
-        if position in all_targets and position not in rescued:
-            rescued.add(position)
-            rescued_target_type = _target_type_enum(grid, position)
-
-        done = rescued == all_targets
-        step_reward = calculate_reward(
-            RewardEvent(
-                moved=movement_result.moved,
-                move=action.value,
-                newly_discovered_cells=newly_discovered_cells,
-                rescued_target_type=rescued_target_type,
-                completed_episode=done,
-                repeated_cell=repeated_cell,
-            ),
-            learner.reward_config,
-        )
-        total_reward += step_reward
-
-        next_state = learner.state_from_observation(
-            observation=next_observation,
-            grid=grid,
-            found_targets=frozenset(rescued),
-            steps_taken=0,
-        )
-        next_valid_actions = learner.valid_actions(movement, grid, position)
-        next_valid_actions = (
-            tuple(action for action in next_valid_actions if action != Action.WAIT)
-            or next_valid_actions
-        )
-        if not next_valid_actions:
-            next_valid_actions = (Action.WAIT,)
-        if training:
-            learner.update_q_value(
-                state=state,
-                action=action,
-                reward=step_reward,
-                next_state=next_state,
-                next_valid_actions=next_valid_actions,
+            new_cell = after not in visited
+            visited.add(after)
+            repeated = after in visited_by_agent[agent_id]
+            visited_by_agent[agent_id].add(after)
+            done = rescued == targets
+            reward = calculate_reward(
+                RewardEvent(
+                    moved=result.moved,
+                    move=action.value,
+                    newly_discovered_cells=len(observation.newly_discovered_cells) or int(new_cell),
+                    rescued_target_type=target_type,
+                    completed_episode=done,
+                    repeated_cell=repeated,
+                ),
+                EVALUATION_REWARD_CONFIG,
             )
+            rewards[agent_id] = reward
+            dones[agent_id] = done
+            reward_total += reward
 
-        observation = next_observation
-        episode_steps.append(
-            EpisodeStep(
-                state=previous_position,
-                action=action,
-                reward=round(step_reward, 4),
-                next_state=position,
-                rescued_targets=len(rescued),
-                explored_cells=len(visited),
-            )
-        )
-
-    if not training:
-        learner.epsilon = previous_epsilon
+        communication_events += int(after_step(actions, rewards, next_positions, dones))
+        steps = step
 
     return RunTrace(
         scenario_name=scenario.name,
-        agent_name="trained",
+        agent_name=name,
         seed=scenario.grid_settings.random_seed,
-        num_agents=NUM_AGENTS,
-        steps_taken=steps_taken,
+        num_agents=scenario.num_agents,
+        steps_taken=steps,
         max_steps=scenario.max_steps,
-        total_reward=round(total_reward, 4),
+        total_reward=round(reward_total, 4),
         rescued_targets=len(rescued),
-        total_targets=len(all_targets),
+        total_targets=len(targets),
         explored_cells=len(visited),
         explorable_cells=_explorable_cell_count(grid),
-        episode_steps=tuple(episode_steps),
+        algorithm_group=group,
+        communication_events=communication_events,
     )
 
 
 def calculate_run_metrics(trace: RunTrace) -> RunMetrics:
-    """Convert raw trace data into normalized evaluation metrics."""
-
-    success = trace.total_targets == 0 or trace.rescued_targets == trace.total_targets
-    explored_percentage = (
-        trace.explored_cells / trace.explorable_cells * 100 if trace.explorable_cells else 0.0
-    )
-
+    success = trace.status == "ok" and trace.rescued_targets == trace.total_targets
+    explored = trace.explored_cells / trace.explorable_cells * 100 if trace.explorable_cells else 0.0
     return RunMetrics(
         scenario_name=trace.scenario_name,
         agent_name=trace.agent_name,
@@ -556,82 +524,92 @@ def calculate_run_metrics(trace: RunTrace) -> RunMetrics:
         average_accumulated_reward=trace.total_reward,
         rescued_targets=trace.rescued_targets,
         total_targets=trace.total_targets,
-        explored_area_percentage=round(explored_percentage, 2),
+        explored_area_percentage=round(explored, 2),
+        algorithm_group=trace.algorithm_group,
+        status=trace.status,
+        communication_events=trace.communication_events,
+        error=trace.error,
     )
 
 
 def report_to_json(report: EvaluationReport) -> str:
-    """Serialize the evaluation report as deterministic pretty JSON."""
-
     return json.dumps(asdict(report), indent=2, sort_keys=True)
 
 
 def report_to_csv(report: EvaluationReport) -> str:
-    """Serialize per-run metrics as CSV for spreadsheets or dashboards."""
-
-    rows = report.runs
-    if not rows:
+    if not report.runs:
         return ""
-
     output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()))
+    writer = csv.DictWriter(output, fieldnames=list(report.runs[0]))
     writer.writeheader()
-    writer.writerows(rows)
+    writer.writerows(report.runs)
     return output.getvalue()
 
 
 def build_sprint_demo_summary(aggregates: list[dict]) -> str:
-    """Create a concise text summary for the sprint demo."""
-
-    lines = ["Single-agent evaluation compares the baseline and trained Q-learning agent."]
-    for aggregate in aggregates:
+    lines = ["Evaluation compares real strategy runs on the same generated grids."]
+    for row in aggregates:
+        error = f", error={row['error']}" if row.get("error") else ""
         lines.append(
-            (
-                f"{aggregate['agent_name']}: success_rate={aggregate['success_rate']:.2f}, "
-                f"average_steps={aggregate['average_steps']:.1f}, "
-                f"average_reward={aggregate['average_accumulated_reward']:.1f}, "
-                f"average_rescued_targets={aggregate['average_rescued_targets']:.1f}, "
-                f"average_explored_area={aggregate['average_explored_area_percentage']:.1f}%, "
-                f"num_agents={aggregate['num_agents']}"
-            )
+            f"{row['agent_name']} ({row['algorithm_group']}): "
+            f"success_rate={row['success_rate']:.2f}, "
+            f"average_steps={row['average_steps']:.1f}, "
+            f"average_reward={row['average_accumulated_reward']:.1f}, "
+            f"average_rescued_targets={row['average_rescued_targets']:.1f}, "
+            f"average_explored_area={row['average_explored_area_percentage']:.1f}%, "
+            f"num_agents={row['num_agents']}, "
+            f"communication_events={row['communication_events']:.1f}, "
+            f"status={row['status']}{error}"
         )
     return "\n".join(lines)
 
 
-def _baseline_policy(
+def _learning_state(
+    observation: object,
     grid: Grid,
-    position: Position,
-    visited: frozenset[Position],
+    discovered_cells: frozenset[Position],
     rescued: frozenset[Position],
-    rng: Random,
-) -> Position:
-    del rescued, rng
-
-    for neighbor in _neighbors(position):
-        if grid.is_valid_position(neighbor) and neighbor not in visited:
-            return neighbor
-
-    valid_neighbors = [neighbor for neighbor in _neighbors(position) if grid.is_valid_position(neighbor)]
-    return valid_neighbors[0] if valid_neighbors else position
-
-
-def _neighbors(position: Position) -> tuple[Position, Position, Position, Position]:
-    return (
-        Position(position.x + 1, position.y),
-        Position(position.x, position.y + 1),
-        Position(position.x - 1, position.y),
-        Position(position.x, position.y - 1),
+    steps: int,
+) -> LearningState:
+    rescued_a = frozenset(position for position in rescued if position in grid.target_a_positions)
+    rescued_b = frozenset(position for position in rescued if position in grid.target_b_positions)
+    visible_a = frozenset(
+        position for position, target_type in observation.target_types.items() if target_type == "A"
+    )
+    visible_b = frozenset(
+        position for position, target_type in observation.target_types.items() if target_type == "B"
+    )
+    return LearningState(
+        agent_id=observation.agent_id,
+        agent_position=observation.agent_position,
+        visible_cells=observation.visible_cells,
+        visible_obstacles=observation.obstacles,
+        visible_target_a_positions=visible_a,
+        visible_target_b_positions=visible_b,
+        discovered_cells=discovered_cells,
+        discovered_target_a_positions=visible_a,
+        discovered_target_b_positions=visible_b,
+        rescued_target_a_positions=rescued_a,
+        rescued_target_b_positions=rescued_b,
+        remaining_target_a_positions=grid.target_a_positions - rescued_a,
+        remaining_target_b_positions=grid.target_b_positions - rescued_b,
+        steps_taken=steps,
     )
 
 
-def _action_between(current: Position, next_position: Position) -> Action:
-    if next_position.x > current.x:
-        return Action.RIGHT
-    if next_position.y > current.y:
-        return Action.DOWN
-    if next_position.x < current.x:
-        return Action.LEFT
-    return Action.UP
+def _valid_actions(grid: Grid, position: Position) -> tuple[Action, ...]:
+    movement = MovementModel()
+    valid = tuple(Action(move) for move in movement.allowed_moves(grid, position))
+    return valid or (Action.WAIT,)
+
+
+def _learner_actions(
+    learner: QLearningAgent,
+    grid: Grid,
+    position: Position,
+) -> tuple[Action, ...]:
+    valid = tuple(action for action in _valid_actions(grid, position) if action in learner.actions)
+    return valid or (Action.WAIT,)
 
 
 def _target_type_enum(grid: Grid, position: Position) -> TargetType | None:
@@ -648,17 +626,16 @@ def _explorable_cell_count(grid: Grid) -> int:
 
 
 def _aggregate_by_agent(runs: list[RunMetrics]) -> list[dict]:
-    aggregates: list[dict] = []
-
-    for agent_name in ("baseline", "trained"):
-        agent_runs = [run for run in runs if run.agent_name == agent_name]
-        if not agent_runs:
-            continue
-
+    aggregates = []
+    for name in dict.fromkeys(run.agent_name for run in runs):
+        agent_runs = [run for run in runs if run.agent_name == name]
         aggregates.append(
             {
-                "agent_name": agent_name,
-                "num_agents": NUM_AGENTS,
+                "agent_name": name,
+                "algorithm_group": agent_runs[0].algorithm_group,
+                "status": "ok" if all(run.status == "ok" for run in agent_runs) else "unavailable",
+                "error": next((run.error for run in agent_runs if run.error), None),
+                "num_agents": agent_runs[0].num_agents,
                 "scenario_count": len(agent_runs),
                 "success_rate": round(_average(run.success_rate for run in agent_runs), 4),
                 "average_steps": round(_average(run.steps_taken for run in agent_runs), 4),
@@ -671,29 +648,89 @@ def _aggregate_by_agent(runs: list[RunMetrics]) -> list[dict]:
                 "average_explored_area_percentage": round(
                     _average(run.explored_area_percentage for run in agent_runs), 4
                 ),
+                "communication_events": round(
+                    _average(run.communication_events for run in agent_runs), 4
+                ),
             }
         )
-
     return aggregates
 
 
 def _average(values: Iterable[float]) -> float:
-    value_list = list(values)
-    return sum(value_list) / len(value_list)
+    items = list(values)
+    return sum(items) / len(items)
 
 
 def _scenario_to_dict(scenario: EvaluationScenario, split: str = "test") -> dict:
+    grid = generate_grid(scenario.grid_settings, start=scenario.start)
     return {
         "name": scenario.name,
         "split": split,
         "grid": asdict(scenario.grid_settings),
         "max_steps": scenario.max_steps,
         "start": asdict(scenario.start),
-        "num_agents": NUM_AGENTS,
+        "num_agents": scenario.num_agents,
+        "communication_range": scenario.communication_range,
+        "agent_starts": {
+            agent_id: asdict(position) for agent_id, position in _agent_starts(grid, scenario).items()
+        },
     }
 
 
-def _policy_seed(seed: int | None, agent_name: AgentName) -> int:
-    base_seed = seed or 0
-    agent_offset = 0 if agent_name == "baseline" else 10_000
-    return base_seed + agent_offset
+def _scenario(
+    name: str,
+    width: int,
+    height: int,
+    obstacle_probability: float,
+    target_a_count: int,
+    target_b_count: int,
+    seed: int,
+    max_steps: int,
+    start: Position = Position(0, 0),
+) -> EvaluationScenario:
+    return EvaluationScenario(
+        name,
+        GridSettings(width, height, obstacle_probability, target_a_count, target_b_count, seed),
+        max_steps,
+        start=start,
+    )
+
+
+def _agent_starts(grid: Grid, scenario: EvaluationScenario) -> dict[str, Position]:
+    valid_positions = [
+        Position(x, y)
+        for y in range(grid.height)
+        for x in range(grid.width)
+        if grid.is_valid_position(Position(x, y))
+    ]
+    starts = [scenario.start] + [position for position in valid_positions if position != scenario.start]
+    if len(starts) < scenario.num_agents:
+        raise ValueError(f"not enough valid cells for {scenario.num_agents} agents")
+    return {f"agent-{index}": starts[index] for index in range(scenario.num_agents)}
+
+
+def _deep_benchmark_rows() -> list[dict]:
+    try:
+        import torch  # noqa: F401
+    except ModuleNotFoundError:
+        status = "requires_torch"
+    else:
+        status = "external_benchmark"
+
+    return [
+        {
+            "agent_name": name,
+            "algorithm_group": "deep_rl_benchmark",
+            "evaluation_mode": "fresh_grid_benchmark",
+            "status": status,
+            "success_rate": None,
+            "average_steps": None,
+            "average_rescued_targets": None,
+            "source": "scripts/compare_all.py",
+        }
+        for name in DEEP_BENCHMARK_ALGORITHMS
+    ]
+
+
+def _policy_seed(seed: int | None, name: str) -> int:
+    return (seed or 0) + (0 if name == "baseline" else 10_000)
