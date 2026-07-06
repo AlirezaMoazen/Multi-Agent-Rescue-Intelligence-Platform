@@ -14,16 +14,15 @@ from rescue_sim.shared import Action, Position
 class SharedFeatureEncoder(nn.Module):
     """Processes local spatial grid maps and scalar/communication inputs into a unified latent space.
 
-    Extracts features from the egocentric observation window via a spatial CNN,
-    extracts metadata and agent identity via an MLP, and extracts connection status
-    via a sum-pooled permutation-invariant active peer count MLP.
+    Processes a 7x7 ego-centric spatial window (representing a 3-block visibility radius
+    in all directions) alongside peer connection inputs and metadata.
     """
 
     def __init__(
         self,
         obs_dim: int,
         num_agents: int,
-        view_radius: int,
+        view_radius: int = 3,
         latent_dim: int = 128,
     ) -> None:
         """Initializes the encoder layers.
@@ -31,17 +30,17 @@ class SharedFeatureEncoder(nn.Module):
         Args:
             obs_dim: Dimension of the flattened agent observation vector.
             num_agents: Swarm fleet size.
-            view_radius: Perception radius defining the grid window.
+            view_radius: Perception radius (default 3, producing 7x7 windows).
             latent_dim: Target embedding size.
         """
         super().__init__()
         self.num_agents = num_agents
         self.view_radius = view_radius
-        self.win = 2 * view_radius + 1
+        self.win = 2 * view_radius + 1  # 7
         self.channels = 4
-        self.window_dim = self.win * self.win * self.channels
+        self.window_dim = self.win * self.win * self.channels  # 7 * 7 * 4 = 196
         
-        # Spatial CNN for grid maps
+        # Spatial CNN for 7x7 local grid maps
         # Input shape: [Batch, Channels, Height, Width]
         self.conv = nn.Sequential(
             nn.Conv2d(self.channels, 16, kernel_size=3, padding=1),
@@ -50,7 +49,7 @@ class SharedFeatureEncoder(nn.Module):
             nn.ReLU(),
             nn.Flatten(),
         )
-        conv_output_dim = 32 * self.win * self.win
+        conv_output_dim = 32 * self.win * self.win  # 32 * 49 = 1568
 
         # MLP for meta features (pos, steps, targets) and agent ID
         # Input shape: [Batch, 4 + num_agents]
@@ -115,11 +114,7 @@ class GatingRouter(nn.Module):
     def __init__(self, latent_dim: int) -> None:
         """Initializes the gating projection layers."""
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 3),
-        )
+        self.gate = nn.Linear(latent_dim, 3)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """Forward pass to yield gating weights.
@@ -130,7 +125,7 @@ class GatingRouter(nn.Module):
         Returns:
             weights: [Batch, 3] soft gating weights summing to 1.0.
         """
-        logits = self.net(z)
+        logits = self.gate(z)
         return torch.softmax(logits, dim=-1)
 
 
@@ -145,7 +140,7 @@ class NeuralMoEPolicy(nn.Module):
         self,
         obs_dim: int,
         num_agents: int,
-        view_radius: int,
+        view_radius: int = 3,
         action_dim: int = 4,
         latent_dim: int = 128,
     ) -> None:
@@ -154,7 +149,7 @@ class NeuralMoEPolicy(nn.Module):
         Args:
             obs_dim: Size of the flat observations vector.
             num_agents: Swarm agent size.
-            view_radius: Sensor range radius.
+            view_radius: Sensor range radius (default 3, 7x7 egocentric window).
             action_dim: Total actions in policy distribution.
             latent_dim: Layer size for shared space.
         """
@@ -280,9 +275,7 @@ def distill_expert_heads(
     Args:
         policy: The Neural MoE policy instance.
         expert_datasets: Trajectory dataset list: [exploration_data, coordination_data, fallback_data].
-            Each element contains (obs_team, peer_matrix_team, actions_team) tuples where
-            obs_team is [Num_Agents, obs_dim], peer_matrix_team is [Num_Agents, Num_Agents],
-            and actions_team is [Num_Agents].
+            Each element contains (obs_team, peer_matrix_team, actions_team) tuples.
         epochs: Training epochs.
         batch_size: Mini-batch dimensions.
         lr: Adam learning rate.
@@ -327,7 +320,6 @@ def distill_expert_heads(
             epoch_loss = 0.0
             num_batches = 0
             
-            # Shuffle indices
             indices = list(range(len(dataset)))
             random.shuffle(indices)
             
@@ -335,7 +327,6 @@ def distill_expert_heads(
                 batch_idx = indices[i: i + batch_size]
                 batch = [dataset[bi] for bi in batch_idx]
                 
-                # Batch dimensions: B = len(batch), A = Num_Agents
                 obs_batch = torch.stack([b[0] for b in batch])          # [B, A, obs_dim]
                 peer_matrix_batch = torch.stack([b[1] for b in batch])  # [B, A, A]
                 act_batch = torch.stack([b[2] for b in batch])          # [B, A]
@@ -429,7 +420,6 @@ def train_gating_router(
                     if dist < 3:
                         peer_matrix[i, j] = 1.0
                         
-            # Wrap as unsqueezed batch tensors (Batch=1)
             obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)             # [1, A, obs_dim]
             peer_matrix_t = torch.tensor(peer_matrix, dtype=torch.float32).unsqueeze(0)  # [1, A, A]
             act_mask_t = torch.tensor(env.valid_action_mask(), dtype=torch.bool).unsqueeze(0)  # [1, A, action_dim]
@@ -444,12 +434,8 @@ def train_gating_router(
             
             next_obs, reward, done, _ = env.step(actions.squeeze(0).numpy())
             
-            # Communication-routing blackout penalty via Conditional Indicator Mask:
-            # If peer count is exactly 1.0 (isolated self), fallback weight g_2 is penalized.
-            # Otherwise (when peer count > 1.0), the penalty is 0.0.
+            # Communication-routing blackout penalty via Conditional Indicator Mask
             peer_count = torch.sum(peer_matrix_t, dim=-1)  # [1, A]
-            
-            # Indicator mask: 1.0 if isolated, 0.0 otherwise
             is_isolated = (peer_count == 1.0).float()  # [1, A]
             
             g_fallback = weights[:, :, 2]  # [1, A]
@@ -472,7 +458,6 @@ def train_gating_router(
         optimizer.zero_grad()
         policy_loss = []
         for log_prob, G, penalty in zip(saved_log_probs, discounted_returns, saved_penalties):
-            # policy loss = -log_prob * G + penalty_coef * penalty
             policy_loss.append((-log_prob.mean() * G) + comm_penalty_coef * penalty.mean())
             
         total_loss = torch.stack(policy_loss).sum()

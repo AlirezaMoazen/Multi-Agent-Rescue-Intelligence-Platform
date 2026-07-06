@@ -1,107 +1,69 @@
 # Multi-Agent Neural Mixture of Experts (MoE) Policy Framework
 
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.2.0-red.svg?logo=pytorch)](https://pytorch.org/)
+[![CUDA](https://img.shields.io/badge/CUDA-12.1-green.svg?logo=nvidia)](https://developer.nvidia.com/cuda-toolkit)
+[![Docker](https://img.shields.io/badge/Docker-Multi--Stage-blue.svg?logo=docker)](https://www.docker.com/)
+
 A state-of-the-art step-level **Neural Mixture of Experts (MoE)** policy implementation for cooperative robot swarms (1 to 20 agents) operating under localized communication blackouts ($d \ge 3$ grid cells). 
 
-This framework operates under the **Centralized Training, Decentralized Execution (CTDE)** paradigm. It utilizes unnormalized policy logit blending to eliminate value-scale mismatches, a dual-encoder topology to prevent representational drift during fine-tuning, and a permutation-invariant communication pooling layer that allows the policy to generalize seamlessly across varying fleet sizes.
+This framework replaces omniscient legacy planners with a decentralized neural network matching the **Centralized Training, Decentralized Execution (CTDE)** paradigm.
 
 ---
 
-## System Architecture
+## Directory Structure
 
 ```text
-                       +-----------------------------------+
-                       |    Raw Local Input State (obs)    |
-                       +-----------------+-----------------+
-                                         |
-                       +─────────────────┴─────────────────+
-                       | Permutation-Invariant Comms Pool  |
-                       +─────────────────┬─────────────────+
-                                         |
-                                  [z_comm pooled]
-                                         |
-                 +───────────────────────┴───────────────────────+
-                 |                                               |
-                 v                                               v
-     +───────────────────────+                       +───────────────────────+
-     |  Router Encoder (RL)  |                       |  Expert Encoder (Fix) |
-     +───────────┬───────────+                       +───────────┬───────────+
-                 | [z_router]                                    | [z_expert]
-                 v                                               +-----+-----+
-     +───────────────────────+                                         |
-     |     Gating Router     |                 +───────────────────────┼───────────────────────+
-     +───────────┬───────────+                 |                       |                       |
-                 |                             v                       v                       v
-                 |                      +─────────────+         +─────────────+         +─────────────+
-                 |                      |  Expert 1   |         |  Expert 2   |         |  Expert 3   |
-                 |                      | (Exploration|         | (Coordination|        | (Fallback   |
-                 |                      |   Heuristic)|         |    Planner) |         | Hysteretic) |
-                 |                      +──────┬──────+         +──────┬──────+         +──────┬──────+
-                 | [Weights g]                 | [Logits y_1]          | [Logits y_2]          | [Logits y_3]
-                 |                             +                       +                       +
-                 +────────────────────────────>+                      >+                      >+
-                                               |                       |                       |
-                                               v                       v                       v
-                                        +───────────────────────────────────────────────────────+
-                                        |                Actor Logit Blending                   |
-                                        |      y_final = g_1*y_1 + g_2*y_2 + g_3*y_3            |
-                                        +──────────────────────────┬────────────────────────────+
-                                                                   |
-                                                                   v
-                                        +───────────────────────────────────────────────────────+
-                                        |                 Invalid Action Mask                   |
-                                        +──────────────────────────┬────────────────────────────+
-                                                                   |
-                                                                   v
-                                        +───────────────────────────────────────────────────────+
-                                        |                   Softmax & Sample                    |
-                                        +-------------------------------------------------------+
+├── Dockerfile_moe            # Multi-stage, VRAM-optimized Docker deployment file
+├── README_moe.md             # Theoretical documentation and quickstart instructions
+├── demo_moe.py               # Self-contained, executable simulation and training dashboard
+└── src/
+    └── rescue_sim/
+        └── MoE/
+            ├── __init__.py   # Neural MoE package declarations
+            └── moe.py        # Production-grade step-level Neural MoE implementation
 ```
-
-### 1. Dual-Encoder Topology
-To preserve the performance of distilled heuristic experts while optimization fine-tunes the gating router online, the architecture implements two distinct parameter spaces:
-* `expert_encoder`: Extracted features feed the expert heads. Locked permanently during Stage 2.
-* `router_encoder`: Extracted features feed the gating router. Remains fully trainable during Stage 2 online optimization.
-
-### 2. Permutation-Invariant Communication Tracking
-The policy maps neighbor link states to a single pooled active peer count metric:
-$$\text{peer\_count} = \sum_{j=1}^{\text{Num\_Agents}} \text{peer\_matrix}_{i, j}$$
-Because neighbor identity coordinates are summed, the network processes active neighbors uniformly. This enables the swarm controller to generalize from 1 up to 20 agents out of the box.
-
-### 3. Actor logit Blending & Masking
-Value-scale conflicts are eliminated by blending unnormalized directional logits ($\mathbb{R}^4$) instead of utility Q-values:
-$$y_i^{\text{final}} = \sum_{j=1}^{3} g_{i, j} \cdot y_i^{j}$$
-Where $g_{i, j}$ represents the routing weight of expert $j$ for agent $i$. Blended logits are masked prior to softmax sampling to prevent invalid transitions:
-$$y_i^{\text{masked}} = \text{torch.where}(\text{action\_mask}_i, y_i^{\text{final}}, -10^9)$$
 
 ---
 
-## Two-Stage Optimization Workflow
+## Theoretical Foundations
 
-### Stage 1: Expert Distillation (Offline Behavioral Cloning)
-Supervised Cross-Entropy distillation is executed to clone policies into the expert heads from recorded grid trajectories:
-$$\mathcal{L}_{\text{distill}} = -\sum_{a \in A} \log \pi_{\text{expert}}(a \mid o)$$
-During this phase, the gating router parameters are kept frozen (`requires_grad = False`).
+### 1. Centralized Training, Decentralized Execution (CTDE)
+During training, the critic network uses global states (all agent observations concatenated) to stabilize value estimation. During execution, each agent acts independently, mapping its own $7 \times 7$ local ego-centric observation (visibility radius $r=3$) to action probabilities:
+$$\pi_i(a_i \mid o_i) = \text{Softmax}(\mathbf{y}_i^{\text{masked}})$$
 
-### Stage 2: Router Optimization (Online Policy Gradient)
-The Gating Router is trained online using Policy Gradients (MAPPO). To enforce correct behavior under communication dropouts, we apply a **Conditional Indicator Mask Penalty**:
-$$\mathcal{L}_{\text{penalty}} = \lambda \cdot \mathbb{I}(\text{peer\_count} == 1.0) \cdot (1.0 - g_{\text{fallback}})^2$$
-Where $\mathbb{I}$ is the indicator function yielding $1.0$ if the agent is isolated (peer count is exactly $1.0$) and $0.0$ if it is connected to peers. This forces $g_{\text{fallback}} \approx 1.0$ under blackout, while leaving the router free to choose the optimal expert during normal operations.
+### 2. Individual-Global-Max (IGM) Constraint in QMIX
+QMIX enforces the IGM constraint, ensuring that the joint argmax action matches the collection of individual greedy actions:
+$$\arg\max_{\mathbf{a}} Q_{\text{tot}}(\mathbf{s}, \mathbf{a}) = \left( \arg\max_{a_1} Q_1(s_1, a_1), \dots, \arg\max_{a_n} Q_n(s_n, a_n) \right)$$
+This is guaranteed by maintaining monotonicity between the joint utility and individual utilities:
+$$\frac{\partial Q_{\text{tot}}}{\partial Q_i} \ge 0, \quad \forall i \in \{1, \dots, n\}$$
+Our **Expert 2 Head** is distilled directly from this monotonic coordinate policy space.
+
+### 3. Logit-Blending & Partial Observability
+Under communication blackouts ($d \ge 3$), the gating router shifts allocation weights from the coordination head to the decentralized fallback head. Action selection remains robust under partial observability because the Gating Router blends unnormalized policy logits ($\mathbb{R}^4$) directly, preventing the value-scale mismatches common in state-action utility mixing:
+$$y_i^{\text{final}} = \sum_{j=1}^{3} g_{i, j} \cdot y_i^{j}$$
+
+---
+
+## Comparative Trade-Off Matrix
+
+| Metric | Legacy Planners (CBS, M*) | QMIX / MAPPO Generalists | Step-Level Neural MoE (Ours) |
+| :--- | :--- | :--- | :--- |
+| **Observation Requirement** | Omniscient Global View | Local / Flattened Window | Rigid $7 \times 7$ Ego-centric View |
+| **Coordination Method** | Centralized Tree Branching | Decentralized Monotonic Q-mixing | Dynamic Actor Logit Blending |
+| **Blackout Behavior ($d \ge 3$)**| Failure / Total Halt | Suboptimal drift | Smooth transition to Hysteretic fallback |
+| **Execution Complexity** | Exponential $O(b^d)$ | Constant $O(1)$ | Constant $O(1)$ |
 
 ---
 
 ## Docker Quickstart
-
-### Prerequisites
-* Docker installed on host.
-* NVIDIA Container Toolkit (for VRAM-optimized GPU acceleration).
 
 ### 1. Build the Container
 ```bash
 docker build -t marl-moe -f Dockerfile_moe .
 ```
 
-### 2. Run the Container
+### 2. Run the Container (with GPU Acceleration)
 ```bash
 docker run --rm --gpus all marl-moe
 ```
-*(Omit the `--gpus all` flag if running on a CPU-only laptop; the PyTorch backend will automatically fallback to host CPU execution).*
+*(Omit the `--gpus all` flag if running on a CPU-only host; PyTorch will automatically fallback to CPU mode).*
