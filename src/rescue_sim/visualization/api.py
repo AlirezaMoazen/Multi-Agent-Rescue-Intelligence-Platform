@@ -31,7 +31,7 @@ from rescue_sim.environment.generator import generate_grid
 from rescue_sim.environment.grid import Position
 from rescue_sim.environment.movement import MovementModel
 from rescue_sim.environment.sensors import CentralSensor
-from rescue_sim.Qlearning.multi_agent_baseline import default_start_positions
+from rescue_sim.Qlearning.baseline import default_start_positions
 from rescue_sim.Qlearning.q_learning import EpidemicHystereticQLearning
 from rescue_sim.simulation.evaluation import (
     EvaluationScenario,

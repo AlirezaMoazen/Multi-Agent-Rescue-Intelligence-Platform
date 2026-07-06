@@ -1,559 +1,484 @@
-"""Mixture-of-Experts (MoE) router over every rescue strategy in the project.
-
-This is the project's top-level "use the best method for *this* grid" layer. It
-is a **performance-gated Mixture of Experts**, which is exactly the classical
-**per-instance algorithm-selection / portfolio** problem (Rice 1976; SATzilla,
-Xu et al. 2008) phrased as an MoE with mostly *fixed* experts (Jacobs et al.
-1991): a gate scores each expert on the grid in front of it and routes the fleet
-to whichever solves it best.
-
-The expert pool is the whole project:
-
-* **Classical (no-AI) experts** -- the 7 baselines (frontier, DFS, prioritized
-  planning, CBS, ICBS, ECBS, M*), run as a synchronized team.
-* **Deep experts (frozen)** -- QMIX, TransfQMix, MAPPO, and their ValueEnsemble.
-* **One adaptive expert** -- the ``EpidemicHystereticQLearning`` fleet, which
-  keeps learning *this* grid on every try.
-
-The gate is what makes the combination safe: it only ever serves the
-best-scoring expert, so the MoE is **never worse than the strongest single
-method**. The twist over a static portfolio: the adaptive expert improves every
-try (bootstrapping off-policy from the best deep expert's demonstrations while
-it is behind), so on a grid it can master it climbs the leaderboard and takes
-over -- and from then on it self-plays.
-
-Everything is comparable because every expert is scored on the same fixed grid
-with the same ``solve_score`` (read from the environment's success/rescued/steps,
-not the reward). Requires torch for the deep experts: ``pip install -e ".[ensemble]"``.
-"""
-
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, replace
+import random
+from typing import Dict, List, Tuple
 
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
-from rescue_sim.config.settings import GridSettings, MoeSettings
-from rescue_sim.environment.generator import generate_grid
-from rescue_sim.environment.grid import Grid, Position
-from rescue_sim.Qlearning.communications import DefaultCommsBus
-from rescue_sim.Qlearning.multi_agent_baseline import (
-    DEFAULT_MULTI_AGENT_BASELINES,
-    default_start_positions,
-    run_multi_agent_baseline,
-)
-from rescue_sim.Qlearning.q_learning import EpidemicHystereticQLearning
-from rescue_sim.shared import GossipConfig, HystereticConfig, RewardConfig
-from rescue_sim.TransfQMix.transf_qmix import EntityRescueEnv
-
-# A greedy joint-action policy: given the env and its flat observation, return
-# one action index (into CARDINAL_ACTIONS) per agent. This is the uniform
-# interface the gate uses to roll any deep expert out on the fixed grid.
-Policy = Callable[["FixedGridEntityEnv", np.ndarray], np.ndarray]
-
-# All agents start at the grid origin unless spread starts are supplied.
-START = Position(0, 0)
-
-# Reward the adaptive (tabular) expert learns from. Its state is just the grid
-# cell (y, x), so it needs a *Markovian* navigation reward: a large sparse bonus
-# for reaching a target plus a per-step cost. The deep models' SPRINT3 reward
-# adds history-dependent terms ("newly discovered cell", "repeated cell") that
-# are not a function of the cell alone, which -- combined with the hysteretic
-# max-only update and the epidemic max-merge -- would inflate every Q-value
-# instead of forming a gradient toward the targets. This only changes what the
-# fleet *learns*: the gate scores every expert from the environment's
-# success/rescued/steps info (not the reward), so the comparison stays fair.
-ADAPTIVE_REWARD_CONFIG = RewardConfig(
-    move=-1.0,
-    invalid_move=-5.0,
-    wait=-2.0,
-    discovered_cell_bonus=0.0,
-    repeated_cell=0.0,
-    rescued_target_a=150.0,
-    rescued_target_b=100.0,
-    completed_episode_bonus=50.0,
-)
+from rescue_sim.shared import Action, Position
 
 
-# ---------------------------------------------------------------------------
-# Fixed-grid environment
-# ---------------------------------------------------------------------------
+class SharedFeatureEncoder(nn.Module):
+    """Processes local spatial grid maps and scalar/communication inputs into a unified latent space.
 
-
-class FixedGridEntityEnv(EntityRescueEnv):
-    """An ``EntityRescueEnv`` pinned to ONE grid (reset reuses it, never regenerates).
-
-    The base environment draws a fresh random grid on every ``reset()``. The MoE
-    instead needs every expert to compete on the *same* rescue instance -- that
-    is what "solve the grid" means here -- so this subclass freezes the grid and
-    only resets agent positions and bookkeeping. All observation, stepping,
-    reward, and metric logic is inherited unchanged (no duplication).
+    Extracts features from the egocentric observation window via a spatial CNN,
+    extracts metadata and agent identity via an MLP, and extracts connection status
+    via a sum-pooled permutation-invariant active peer count MLP.
     """
 
     def __init__(
         self,
-        grid: Grid,
+        obs_dim: int,
         num_agents: int,
-        max_steps: int,
         view_radius: int,
-        reward_config,
-        start_positions: list[Position] | None = None,
+        latent_dim: int = 128,
     ) -> None:
-        # Rebuild a GridSettings that matches the fixed grid so the parent's
-        # observation/state dimensions are correct; obstacle_probability is
-        # irrelevant because reset() never regenerates.
-        settings = GridSettings(
-            width=grid.width,
-            height=grid.height,
-            obstacle_probability=0.0,
-            target_a_count=len(grid.target_a_positions),
-            target_b_count=len(grid.target_b_positions),
+        """Initializes the encoder layers.
+
+        Args:
+            obs_dim: Dimension of the flattened agent observation vector.
+            num_agents: Swarm fleet size.
+            view_radius: Perception radius defining the grid window.
+            latent_dim: Target embedding size.
+        """
+        super().__init__()
+        self.num_agents = num_agents
+        self.view_radius = view_radius
+        self.win = 2 * view_radius + 1
+        self.channels = 4
+        self.window_dim = self.win * self.win * self.channels
+        
+        # Spatial CNN for grid maps
+        # Input shape: [Batch, Channels, Height, Width]
+        self.conv = nn.Sequential(
+            nn.Conv2d(self.channels, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
         )
-        super().__init__(
-            settings,
-            num_agents=num_agents,
-            max_steps=max_steps,
-            view_radius=view_radius,
-            reward_config=reward_config,
-            seed=0,
+        conv_output_dim = 32 * self.win * self.win
+
+        # MLP for meta features (pos, steps, targets) and agent ID
+        # Input shape: [Batch, 4 + num_agents]
+        self.mlp_meta = nn.Sequential(
+            nn.Linear(4 + num_agents, 32),
+            nn.ReLU(),
+            nn.Linear(32, 32),
+            nn.ReLU(),
         )
-        self._fixed_grid = grid
-        self._start_positions = list(start_positions) if start_positions else [
-            START for _ in range(num_agents)
-        ]
 
-    def reset(self) -> np.ndarray:
-        """Reset agents to their start cells on the *fixed* grid; returns flat obs."""
-        self.grid = self._fixed_grid
-        self.positions = list(self._start_positions)
-        self._rescued = set()
-        self._discovered = set()
-        self._visited = set(self._start_positions)
-        self._steps = 0
-        self._build_grid_arrays()
-        return self._observations()
+        # MLP for permutation-invariant peer count
+        # Input shape: [Batch, 1]
+        self.mlp_comm = nn.Sequential(
+            nn.Linear(1, 16),
+            nn.ReLU(),
+            nn.Linear(16, 16),
+            nn.ReLU(),
+        )
+
+        # Unified projection head
+        self.proj = nn.Sequential(
+            nn.Linear(conv_output_dim + 32 + 16, latent_dim),
+            nn.LayerNorm(latent_dim),
+        )
+
+    def forward(self, obs: torch.Tensor, peer_count: torch.Tensor) -> torch.Tensor:
+        """Forward pass to extract embedding z.
+
+        Args:
+            obs: [Batch, obs_dim] flat agent observations.
+            peer_count: [Batch, 1] pooled peer count.
+
+        Returns:
+            z: [Batch, latent_dim] unified representation.
+        """
+        batch_size = obs.size(0)
+        
+        # Slice spatial window and reshape to [Batch, Channels, Height, Width]
+        window = obs[:, :self.window_dim].view(batch_size, self.win, self.win, self.channels)
+        window = window.permute(0, 3, 1, 2)  # [Batch, Channels, Height, Width]
+        
+        # Slice meta features and agent ID
+        meta = obs[:, self.window_dim:]
+        
+        # Forward pass on spatial and meta layers
+        h_spatial = self.conv(window)  # [Batch, conv_output_dim]
+        h_meta = self.mlp_meta(meta)    # [Batch, 32]
+        h_comm = self.mlp_comm(peer_count)  # [Batch, 16]
+        
+        # Concatenate representation and project
+        z = torch.cat([h_spatial, h_meta, h_comm], dim=-1)      # [Batch, conv_output_dim + 32 + 16]
+        return self.proj(z)                                      # [Batch, latent_dim]
 
 
-# ---------------------------------------------------------------------------
-# Scoring
-# ---------------------------------------------------------------------------
+class GatingRouter(nn.Module):
+    """Router network that outputs gating weight distributions over the three experts.
 
-
-def solve_score(info: dict, max_steps: int) -> float:
-    """Scalar "how well was the grid solved" score; higher is better.
-
-    Lexicographic by construction:
-
-    * a full success (all targets rescued) always outscores any failure
-      (the ``+2.0`` term dwarfs the rest), then
-    * more targets rescued is better (``rescued_frac`` in ``[0, 1]``), then
-    * fewer steps is better (``-0.5 * step_frac`` breaks ties between two runs
-      that rescued the same number).
-
-    One float keeps the gate trivial to compare and the history easy to plot.
+    Takes the latent embedding from the trainable router encoder and maps it to
+    a 3-dimensional probability vector.
     """
-    targets = info.get("targets", 0) or 0
-    rescued_frac = info["rescued"] / targets if targets else 1.0
-    step_frac = info["steps"] / max_steps if max_steps else 0.0
-    return (2.0 if info["success"] else 0.0) + rescued_frac - 0.5 * step_frac
+
+    def __init__(self, latent_dim: int) -> None:
+        """Initializes the gating projection layers."""
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 3),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """Forward pass to yield gating weights.
+
+        Args:
+            z: [Batch, latent_dim] router representation.
+
+        Returns:
+            weights: [Batch, 3] soft gating weights summing to 1.0.
+        """
+        logits = self.net(z)
+        return torch.softmax(logits, dim=-1)
 
 
-def _metrics(info: dict, max_steps: int) -> dict:
-    """Serializable per-expert result for one grid (API/frontend friendly)."""
-    return {
-        "success": bool(info["success"]),
-        "rescued": int(info["rescued"]),
-        "targets": int(info.get("targets", 0)),
-        "steps": int(info["steps"]),
-        "score": round(solve_score(info, max_steps), 4),
-    }
+class NeuralMoEPolicy(nn.Module):
+    """Step-level Neural Mixture of Experts (MoE) Policy with Dual-Encoder topology.
 
-
-# ---------------------------------------------------------------------------
-# Greedy policy adapters for the deep experts
-# ---------------------------------------------------------------------------
-# Each returns a uniform ``Policy`` so the gate can roll any model out on the
-# fixed grid without knowing its internals.
-
-
-def qmix_policy(qmix) -> Policy:
-    def act(env: FixedGridEntityEnv, flat_obs: np.ndarray) -> np.ndarray:
-        return qmix.select_actions(flat_obs, env.valid_action_mask(), greedy=True)
-
-    return act
-
-
-def transf_policy(transf) -> Policy:
-    def act(env: FixedGridEntityEnv, _flat_obs: np.ndarray) -> np.ndarray:
-        return transf.select_actions(env.entity_obs(), env.valid_action_mask(), greedy=True)
-
-    return act
-
-
-def ensemble_policy(ensemble) -> Policy:
-    def act(env: FixedGridEntityEnv, flat_obs: np.ndarray) -> np.ndarray:
-        return ensemble.select_actions(flat_obs, env.entity_obs(), env.valid_action_mask())
-
-    return act
-
-
-def mappo_policy(mappo) -> Policy:
-    import torch
-
-    def act(env: FixedGridEntityEnv, flat_obs: np.ndarray) -> np.ndarray:
-        mask = torch.as_tensor(env.valid_action_mask())
-        logits = mappo.net.actor(torch.as_tensor(flat_obs).float()).masked_fill(~mask, -1e8)
-        return logits.argmax(dim=-1).numpy()
-
-    return act
-
-
-# ---------------------------------------------------------------------------
-# Report types
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class MoeTrial:
-    """One try on the fixed grid: how the adaptive fleet did and who led."""
-
-    trial: int
-    leader: str          # expert that would be served this try (best score so far)
-    fleet: dict          # adaptive-fleet greedy metrics after this try's learning
-    epsilon: float       # fleet's current exploration rate
-    mean_q: float        # mean Q across the fleet (learning-progress signal)
-    syncs: int           # gossip syncs during this try's learning episode
-
-    def to_dict(self) -> dict:
-        return {
-            "trial": self.trial,
-            "leader": self.leader,
-            "fleet": self.fleet,
-            "epsilon": round(self.epsilon, 4),
-            "mean_q": round(self.mean_q, 4),
-            "syncs": self.syncs,
-        }
-
-
-@dataclass
-class MoeReport:
-    """Outcome of an MoE run: the fixed-expert leaderboard plus the fleet's climb."""
-
-    leaderboard: dict = field(default_factory=dict)   # frozen expert name -> metrics
-    teacher: str | None = None                        # deep expert that taught the fleet
-    history: list[MoeTrial] = field(default_factory=list)
-    surpassed_at: int | None = None                   # first try the fleet led overall
-    final_leader: str = ""
-    best_fleet_score: float = 0.0
-
-    def to_dict(self) -> dict:
-        return {
-            "leaderboard": self.leaderboard,
-            "teacher": self.teacher,
-            "history": [t.to_dict() for t in self.history],
-            "surpassed_at": self.surpassed_at,
-            "final_leader": self.final_leader,
-            "best_fleet_score": round(self.best_fleet_score, 4),
-        }
-
-
-# ---------------------------------------------------------------------------
-# The Mixture-of-Experts router
-# ---------------------------------------------------------------------------
-
-FLEET = "EpidemicFleet"
-
-
-class MixtureOfExperts:
-    """Performance-gated router over classical, deep, and adaptive rescue experts.
-
-    Parameters
-    ----------
-    deep_experts:
-        ``{name: greedy Policy}`` for the frozen deep models (see ``from_models``
-        and the ``*_policy`` adapters). Used both as gate candidates and as the
-        teacher pool for the adaptive fleet.
-    ref_env:
-        Any ``RescueEnv``/``EntityRescueEnv`` the deep models were built with --
-        the fixed grid, agent count, view radius, episode length, and grid
-        settings are taken from it so every expert is dimension-compatible.
-    settings, grid, comms:
-        Mixture hyper-parameters, an optional fixed grid (else generated from
-        ``ref_env`` + ``settings.grid_seed``), and the fleet's gossip bus.
-    baselines:
-        ``{name: factory}`` of classical (no-AI) strategies to include as
-        gate candidates; defaults to all seven.
+    Uses distinct feature encoders to isolate learning between the frozen expert
+    heads (distilled offline) and the gating router fine-tuned online.
     """
 
     def __init__(
         self,
-        deep_experts: Mapping[str, Policy],
-        ref_env,
-        settings: MoeSettings = MoeSettings(),
-        grid: Grid | None = None,
-        comms=None,
-        baselines: Mapping[str, Callable] = DEFAULT_MULTI_AGENT_BASELINES,
-        adaptive_reward_config: RewardConfig = ADAPTIVE_REWARD_CONFIG,
-        start_positions: Mapping[str, Position] | None = None,
+        obs_dim: int,
+        num_agents: int,
+        view_radius: int,
+        action_dim: int = 4,
+        latent_dim: int = 128,
     ) -> None:
-        self.deep_experts = dict(deep_experts)
-        self.baselines = dict(baselines)
-        self.cfg = settings
-        self.comms = comms if comms is not None else DefaultCommsBus()
+        """Initializes encoders, the router, and three expert heads.
 
-        self.num_agents = ref_env.num_agents
-        self.max_steps = ref_env.max_steps
-        self.view_radius = ref_env.view_radius
-        self.sensor_range = max(2, ref_env.view_radius)
-
-        if grid is None:
-            grid_settings = replace(ref_env.grid_settings, random_seed=settings.grid_seed)
-            grid = generate_grid(grid_settings, START)
-        self.grid = grid
-
-        # Spread, reachable, non-target starts (reuses the multi-agent baseline's
-        # placement). With several targets this lets the memoryless fleet divide
-        # the work -- each agent's shared "go to nearest target" policy flows it
-        # to a different nearby target.
-        start_map = (
-            dict(start_positions)
-            if start_positions is not None
-            else default_start_positions(grid, self.num_agents)
-        )
-        self.agent_ids = list(start_map)
-        self.start_list = [start_map[aid] for aid in self.agent_ids]
-        self.starts = dict(start_map)
-
-        # Shared fixed-grid env both the deep experts and the fleet roll out on.
-        self.env = FixedGridEntityEnv(
-            grid,
-            num_agents=self.num_agents,
-            max_steps=self.max_steps,
-            view_radius=self.view_radius,
-            reward_config=adaptive_reward_config,
-            start_positions=self.start_list,
-        )
-
-        # The adaptive expert: a decentralized Epidemic Hysteretic fleet.
-        self.fleet = EpidemicHystereticQLearning(
-            grid,
-            config=HystereticConfig(
-                alpha=settings.alpha,
-                beta=settings.beta,
-                discount_factor=settings.discount_factor,
-                epsilon=settings.epsilon_start,
-            ),
-            gossip=GossipConfig(
-                comm_radius=settings.comm_radius,
-                cooldown=settings.gossip_cooldown,
-                max_links_per_step=settings.max_links_per_step,
-                utility_threshold=settings.utility_threshold,
-            ),
-            max_agents=max(settings.max_agents, self.num_agents),
-            seed=settings.random_seed,
-        )
-        for aid in self.agent_ids:
-            self.fleet.add_agent(aid, self.starts[aid])
-        self._rng = np.random.default_rng(settings.random_seed)
-
-    # -- construction from trained models -----------------------------------
-
-    @classmethod
-    def from_models(
-        cls,
-        *,
-        qmix=None,
-        transf=None,
-        mappo=None,
-        ensemble=None,
-        settings: MoeSettings = MoeSettings(),
-        grid: Grid | None = None,
-        comms=None,
-        baselines: Mapping[str, Callable] = DEFAULT_MULTI_AGENT_BASELINES,
-        start_positions: Mapping[str, Position] | None = None,
-    ) -> "MixtureOfExperts":
-        """Build an MoE from any subset of trained deep models (at least one)."""
-        deep: dict[str, Policy] = {}
-        ref_env = None
-        if qmix is not None:
-            deep["QMIX"] = qmix_policy(qmix)
-            ref_env = qmix.env
-        if transf is not None:
-            deep["TransfQMix"] = transf_policy(transf)
-            ref_env = transf.env
-        if mappo is not None:
-            deep["MAPPO"] = mappo_policy(mappo)
-            ref_env = mappo.env
-        if ensemble is not None:
-            deep["Ensemble"] = ensemble_policy(ensemble)
-            ref_env = ensemble.qmix.env
-        if ref_env is None:
-            raise ValueError("from_models needs at least one of qmix/transf/mappo/ensemble")
-        return cls(
-            deep,
-            ref_env,
-            settings=settings,
-            grid=grid,
-            comms=comms,
-            baselines=baselines,
-            start_positions=start_positions,
-        )
-
-    # -- rollouts -----------------------------------------------------------
-
-    def _greedy_episode(self, policy: Policy) -> dict:
-        """Run one no-learning episode on the fixed grid driven by ``policy``."""
-        flat_obs = self.env.reset()
-        done = False
-        info: dict = {}
-        while not done:
-            actions = policy(self.env, flat_obs)
-            flat_obs, _, done, info = self.env.step(actions)
-        return info
-
-    def _adaptive_greedy_episode(self) -> dict:
-        """Greedy roll-out of the *current* fleet policy (read-only, no learning)."""
-        policies = {aid: self.fleet.greedy_policy(aid) for aid in self.agent_ids}
-
-        def act(env: FixedGridEntityEnv, _flat_obs: np.ndarray) -> np.ndarray:
-            return np.array(
-                [
-                    policies[self.agent_ids[i]][env.positions[i].y, env.positions[i].x]
-                    for i in range(env.num_agents)
-                ],
-                dtype=np.int64,
-            )
-
-        return self._greedy_episode(act)
-
-    def _baseline_metrics(self, name: str, factory: Callable) -> dict:
-        """Score one classical baseline as a synchronized team on the fixed grid."""
-        strategy = factory(self.cfg.random_seed)
-        result = run_multi_agent_baseline(
-            strategy=strategy,
-            grid=self.grid,
-            start_positions=self.starts,
-            max_steps=self.max_steps,
-            sensor_range=self.sensor_range,
-            strategy_name=name,
-        )
-        info = {
-            "success": result.success,
-            "rescued": result.rescued_targets,
-            "targets": result.total_targets,
-            "steps": result.steps,
-        }
-        return _metrics(info, self.max_steps)
-
-    def _teacher_actions(self, flat_obs: np.ndarray, teacher: Policy) -> np.ndarray:
-        """Teacher's greedy joint action with a little exploration noise."""
-        actions = teacher(self.env, flat_obs)
-        avail = self.env.valid_action_mask()
-        for i in range(self.num_agents):
-            if self._rng.random() < self.fleet.epsilon:
-                actions[i] = int(self._rng.choice(np.flatnonzero(avail[i])))
-        return actions
-
-    def _learn_episode(self, teacher: Policy | None) -> tuple[dict, int]:
-        """One learning episode for the fleet on the fixed grid.
-
-        With a ``teacher`` the fleet learns **off-policy** from that expert's
-        demonstrations (how it bootstraps on large/sparse grids); with ``None``
-        it explores with its own epsilon-greedy policy. Either way it applies a
-        hysteretic TD update and runs a gossip round each step.
+        Args:
+            obs_dim: Size of the flat observations vector.
+            num_agents: Swarm agent size.
+            view_radius: Sensor range radius.
+            action_dim: Total actions in policy distribution.
+            latent_dim: Layer size for shared space.
         """
-        flat_obs = self.env.reset()
-        self.fleet.reset_positions(self.starts)
-        done = False
-        info: dict = {}
-        syncs = 0
-        while not done:
-            if teacher is not None:
-                actions = self._teacher_actions(flat_obs, teacher)
-            else:
-                amap = self.fleet.select_actions()
-                actions = np.array(
-                    [amap[self.agent_ids[i]] for i in range(self.num_agents)], dtype=np.int64
-                )
-            action_map = {self.agent_ids[i]: int(actions[i]) for i in range(self.num_agents)}
-            flat_obs, team_reward, done, info = self.env.step(actions)
-            next_positions = {
-                self.agent_ids[i]: self.env.positions[i] for i in range(self.num_agents)
-            }
-            rewards = {aid: team_reward for aid in self.agent_ids}  # shared cooperative reward
-            dones = {aid: done for aid in self.agent_ids}
-            self.fleet.record_transitions(action_map, rewards, next_positions, dones)
-            syncs += self.comms.exchange(self.fleet)
-        self.fleet.decay_epsilon(self.cfg.epsilon_decay, floor=self.cfg.epsilon_floor)
-        return info, syncs
-
-    # -- the gate -----------------------------------------------------------
-
-    def run(self, num_trials: int | None = None) -> MoeReport:
-        """Score the fixed experts once, then let the fleet climb the leaderboard.
-
-        The deep models and classical baselines are frozen and the grid is
-        fixed, so their scores are constant -- evaluated once. Each try the fleet
-        learns (taught by the best deep expert until it leads) and is re-scored;
-        the overall leader is whoever has the best score that try.
-        """
-        trials = self.cfg.num_trials if num_trials is None else num_trials
-
-        leaderboard: dict[str, dict] = {}
-        for name, policy in self.deep_experts.items():
-            leaderboard[name] = _metrics(self._greedy_episode(policy), self.max_steps)
-        for name, factory in self.baselines.items():
-            leaderboard[name] = self._baseline_metrics(name, factory)
-
-        best_frozen_name = max(leaderboard, key=lambda n: leaderboard[n]["score"])
-        best_frozen_score = leaderboard[best_frozen_name]["score"]
-        # The fleet learns from the strongest deep expert (baselines can't act on
-        # the deep env, so they are gate candidates only, not teachers).
-        teacher_name = (
-            max(self.deep_experts, key=lambda n: leaderboard[n]["score"])
-            if self.deep_experts
-            else None
+        super().__init__()
+        self.action_dim = action_dim
+        self.num_agents = num_agents
+        
+        # Dual-Encoder Topology
+        self.expert_encoder = SharedFeatureEncoder(obs_dim, num_agents, view_radius, latent_dim)
+        self.router_encoder = SharedFeatureEncoder(obs_dim, num_agents, view_radius, latent_dim)
+        
+        # Gating router network
+        self.router = GatingRouter(latent_dim)
+        
+        # Expert Heads: output unnormalized directional policy logits
+        self.expert_exploration = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, action_dim),
         )
-        teacher_policy = self.deep_experts.get(teacher_name) if teacher_name else None
+        self.expert_coordination = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, action_dim),
+        )
+        self.expert_adaptation = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, action_dim),
+        )
 
-        report = MoeReport(leaderboard=leaderboard, teacher=teacher_name)
-        fleet_leads = False
-        for t in range(1, trials + 1):
-            _, syncs = self._learn_episode(None if fleet_leads else teacher_policy)
-            fleet_metrics = _metrics(self._adaptive_greedy_episode(), self.max_steps)
-            fleet_score = fleet_metrics["score"]
-            report.best_fleet_score = round(max(report.best_fleet_score, fleet_score), 4)
+    def forward(
+        self,
+        obs: torch.Tensor,
+        peer_matrix: torch.Tensor,
+        action_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Calculates blended logits and gating assignments over 3D inputs.
 
-            if fleet_score > best_frozen_score:
-                leader = FLEET
-                if report.surpassed_at is None:
-                    report.surpassed_at = t
-                    fleet_leads = True  # self-play from the next try on
-            else:
-                leader = best_frozen_name
+        Args:
+            obs: [Batch_Size, Num_Agents, obs_dim] flat observations.
+            peer_matrix: [Batch_Size, Num_Agents, Num_Agents] adjacency peer matrix.
+            action_mask: [Batch_Size, Num_Agents, action_dim] boolean action mask.
 
-            report.history.append(
-                MoeTrial(
-                    trial=t,
-                    leader=leader,
-                    fleet=fleet_metrics,
-                    epsilon=self.fleet.epsilon,
-                    mean_q=self.fleet.mean_q(),
-                    syncs=syncs,
-                )
-            )
+        Returns:
+            y_final: [Batch_Size, Num_Agents, action_dim] blended action logits with invalid action masking.
+            weights: [Batch_Size, Num_Agents, 3] expert allocation weights.
+        """
+        B, A, O = obs.shape
+        assert A == self.num_agents, f"Expected {self.num_agents} agents, got {A}"
+        
+        # Standardize peer matrix to get pooled permutation-invariant peer count
+        peer_count = torch.sum(peer_matrix, dim=-1, keepdim=True)  # [B, A, 1]
+        
+        # Flatten first two dimensions for spatial encoder processing
+        obs_flat = obs.view(B * A, O)
+        peer_count_flat = peer_count.view(B * A, 1)
+        
+        # Feature extraction from the frozen expert brain (no-grad offline)
+        with torch.no_grad():
+            z_expert = self.expert_encoder(obs_flat, peer_count_flat)
+            y_exp0 = self.expert_exploration(z_expert)
+            y_exp1 = self.expert_coordination(z_expert)
+            y_exp2 = self.expert_adaptation(z_expert)
+            
+        # Feature extraction for gating router (online trainable)
+        z_router = self.router_encoder(obs_flat, peer_count_flat)
+        weights_flat = self.router(z_router)  # [B * A, 3]
+        
+        # Actor-Critic Logit Blending: y_final = sum(g_j * y_j)
+        y_final_flat = (
+            weights_flat[:, 0:1] * y_exp0 +
+            weights_flat[:, 1:2] * y_exp1 +
+            weights_flat[:, 2:3] * y_exp2
+        )  # [B * A, action_dim]
+        
+        # Reshape back to 3D layouts
+        y_final = y_final_flat.view(B, A, self.action_dim)
+        weights = weights_flat.view(B, A, 3)
+        
+        # Apply invalid action mask (large negative value for illegal moves)
+        y_final = torch.where(action_mask, y_final, torch.full_like(y_final, -1e9))
+        
+        return y_final, weights
 
-        report.final_leader = report.history[-1].leader if report.history else best_frozen_name
-        return report
+    def get_action(
+        self,
+        obs: torch.Tensor,
+        peer_matrix: torch.Tensor,
+        action_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sample actions under valid-action masking.
 
-    # -- serving ------------------------------------------------------------
+        Args:
+            obs: [Batch_Size, Num_Agents, obs_dim] observations.
+            peer_matrix: [Batch_Size, Num_Agents, Num_Agents] peer adjacency link matrix.
+            action_mask: [Batch_Size, Num_Agents, action_dim] boolean valid action masks.
 
-    def leaderboard(self) -> dict:
-        """Score every fixed expert once (for an API/frontend comparison view)."""
-        board = {n: self._metrics_for_deep(p) for n, p in self.deep_experts.items()}
-        board.update({n: self._baseline_metrics(n, f) for n, f in self.baselines.items()})
-        return board
+        Returns:
+            actions: [Batch_Size, Num_Agents] sampled action indices.
+        """
+        y_final, _ = self.forward(obs, peer_matrix, action_mask)
+        probs = torch.softmax(y_final, dim=-1)
+        
+        B, A, AD = probs.shape
+        # Flatten to sample
+        probs_flat = probs.view(B * A, AD)
+        sampled = torch.multinomial(probs_flat, num_samples=1).squeeze(-1)
+        return sampled.view(B, A)
 
-    def _metrics_for_deep(self, policy: Policy) -> dict:
-        return _metrics(self._greedy_episode(policy), self.max_steps)
+
+def distill_expert_heads(
+    policy: NeuralMoEPolicy,
+    expert_datasets: list[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]],
+    epochs: int = 10,
+    batch_size: int = 64,
+    lr: float = 1e-3,
+) -> dict[str, list[float]]:
+    """Trains expert heads and the expert encoder from offline team trajectories.
+
+    Keeps the gating router network completely locked.
+
+    Args:
+        policy: The Neural MoE policy instance.
+        expert_datasets: Trajectory dataset list: [exploration_data, coordination_data, fallback_data].
+            Each element contains (obs_team, peer_matrix_team, actions_team) tuples where
+            obs_team is [Num_Agents, obs_dim], peer_matrix_team is [Num_Agents, Num_Agents],
+            and actions_team is [Num_Agents].
+        epochs: Training epochs.
+        batch_size: Mini-batch dimensions.
+        lr: Adam learning rate.
+
+    Returns:
+        loss_history: List of average losses per expert head over epochs.
+    """
+    # Freeze Gating Router parameters
+    for p in policy.router_encoder.parameters():
+        p.requires_grad = False
+    for p in policy.router.parameters():
+        p.requires_grad = False
+
+    # Enable gradients for expert parameters
+    for p in policy.expert_encoder.parameters():
+        p.requires_grad = True
+    for p in policy.expert_exploration.parameters():
+        p.requires_grad = True
+    for p in policy.expert_coordination.parameters():
+        p.requires_grad = True
+    for p in policy.expert_adaptation.parameters():
+        p.requires_grad = True
+
+    optimizer = optim.Adam(
+        list(policy.expert_encoder.parameters()) +
+        list(policy.expert_exploration.parameters()) +
+        list(policy.expert_coordination.parameters()) +
+        list(policy.expert_adaptation.parameters()),
+        lr=lr,
+    )
+    criterion = nn.CrossEntropyLoss()
+    loss_history: dict[str, list[float]] = {"exploration": [], "coordination": [], "fallback": []}
+
+    for epoch in range(epochs):
+        for idx, dataset in enumerate(expert_datasets):
+            if not dataset:
+                continue
+            
+            expert_name = ["exploration", "coordination", "fallback"][idx]
+            head = [policy.expert_exploration, policy.expert_coordination, policy.expert_adaptation][idx]
+            
+            epoch_loss = 0.0
+            num_batches = 0
+            
+            # Shuffle indices
+            indices = list(range(len(dataset)))
+            random.shuffle(indices)
+            
+            for i in range(0, len(indices), batch_size):
+                batch_idx = indices[i: i + batch_size]
+                batch = [dataset[bi] for bi in batch_idx]
+                
+                # Batch dimensions: B = len(batch), A = Num_Agents
+                obs_batch = torch.stack([b[0] for b in batch])          # [B, A, obs_dim]
+                peer_matrix_batch = torch.stack([b[1] for b in batch])  # [B, A, A]
+                act_batch = torch.stack([b[2] for b in batch])          # [B, A]
+                
+                B, A, O = obs_batch.shape
+                peer_count = torch.sum(peer_matrix_batch, dim=-1, keepdim=True)  # [B, A, 1]
+                
+                obs_flat = obs_batch.view(B * A, O)
+                peer_count_flat = peer_count.view(B * A, 1)
+                act_flat = act_batch.view(B * A).long()
+                
+                optimizer.zero_grad()
+                z = policy.expert_encoder(obs_flat, peer_count_flat)
+                logits = head(z)
+                loss = criterion(logits, act_flat)
+                loss.backward()
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+                num_batches += 1
+                
+            avg_loss = epoch_loss / num_batches if num_batches > 0 else 0.0
+            loss_history[expert_name].append(avg_loss)
+            
+    return loss_history
+
+
+def train_gating_router(
+    policy: NeuralMoEPolicy,
+    env,
+    updates: int = 50,
+    lr: float = 1e-3,
+    comm_penalty_coef: float = 5.0,
+    gamma: float = 0.99,
+) -> list[float]:
+    """Fine-tunes the gating router online using a policy gradient algorithm.
+
+    Enforces fallback routing weights (g_fallback approx 1.0) under blackout.
+
+    Args:
+        policy: Neural MoE network.
+        env: Simulation environment supporting gym-style interface and valid_action_mask().
+        updates: Policy gradient iteration steps.
+        lr: Adam learning rate.
+        comm_penalty_coef: Penalty scale for routing off Expert 3 during blackouts.
+        gamma: Returns discount rate.
+
+    Returns:
+        losses: Policy gradient losses per training step.
+    """
+    # Freeze Expert parameters
+    for p in policy.expert_encoder.parameters():
+        p.requires_grad = False
+    for p in policy.expert_exploration.parameters():
+        p.requires_grad = False
+    for p in policy.expert_coordination.parameters():
+        p.requires_grad = False
+    for p in policy.expert_adaptation.parameters():
+        p.requires_grad = False
+
+    # Enable router gradients
+    for p in policy.router_encoder.parameters():
+        p.requires_grad = True
+    for p in policy.router.parameters():
+        p.requires_grad = True
+
+    optimizer = optim.Adam(
+        list(policy.router_encoder.parameters()) + list(policy.router.parameters()),
+        lr=lr,
+    )
+    
+    loss_history: list[float] = []
+
+    for update in range(updates):
+        obs = env.reset()
+        done = False
+        
+        saved_log_probs: list[torch.Tensor] = []
+        saved_rewards: list[float] = []
+        saved_penalties: list[torch.Tensor] = []
+        
+        while not done:
+            num_agents = env.num_agents
+            positions = env.positions
+            
+            # Reconstruct the dynamic peer link adjacency mask (d < 3 threshold)
+            peer_matrix = np.zeros((num_agents, num_agents), dtype=np.float32)
+            for i in range(num_agents):
+                for j in range(num_agents):
+                    dist = abs(positions[i].x - positions[j].x) + abs(positions[i].y - positions[j].y)
+                    if dist < 3:
+                        peer_matrix[i, j] = 1.0
+                        
+            # Wrap as unsqueezed batch tensors (Batch=1)
+            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)             # [1, A, obs_dim]
+            peer_matrix_t = torch.tensor(peer_matrix, dtype=torch.float32).unsqueeze(0)  # [1, A, A]
+            act_mask_t = torch.tensor(env.valid_action_mask(), dtype=torch.bool).unsqueeze(0)  # [1, A, action_dim]
+            
+            y_final, weights = policy(obs_t, peer_matrix_t, act_mask_t)
+            probs = torch.softmax(y_final, dim=-1)
+            
+            m = torch.distributions.Categorical(probs)
+            actions = m.sample()  # [1, A]
+            
+            log_prob = m.log_prob(actions)  # [1, A]
+            
+            next_obs, reward, done, _ = env.step(actions.squeeze(0).numpy())
+            
+            # Communication-routing blackout penalty via Conditional Indicator Mask:
+            # If peer count is exactly 1.0 (isolated self), fallback weight g_2 is penalized.
+            # Otherwise (when peer count > 1.0), the penalty is 0.0.
+            peer_count = torch.sum(peer_matrix_t, dim=-1)  # [1, A]
+            
+            # Indicator mask: 1.0 if isolated, 0.0 otherwise
+            is_isolated = (peer_count == 1.0).float()  # [1, A]
+            
+            g_fallback = weights[:, :, 2]  # [1, A]
+            step_penalty = is_isolated * (1.0 - g_fallback) ** 2  # [1, A]
+            
+            saved_log_probs.append(log_prob)
+            saved_rewards.append(reward)
+            saved_penalties.append(step_penalty)
+            
+            obs = next_obs
+            
+        # Calculate discounted returns
+        discounted_returns: list[float] = []
+        R = 0.0
+        for r in reversed(saved_rewards):
+            R = r + gamma * R
+            discounted_returns.insert(0, R)
+            
+        # Compute policy gradient update
+        optimizer.zero_grad()
+        policy_loss = []
+        for log_prob, G, penalty in zip(saved_log_probs, discounted_returns, saved_penalties):
+            # policy loss = -log_prob * G + penalty_coef * penalty
+            policy_loss.append((-log_prob.mean() * G) + comm_penalty_coef * penalty.mean())
+            
+        total_loss = torch.stack(policy_loss).sum()
+        total_loss.backward()
+        optimizer.step()
+        
+        loss_history.append(total_loss.item())
+        
+    return loss_history

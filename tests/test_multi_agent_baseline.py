@@ -1,10 +1,11 @@
 from rescue_sim.config.settings import GridSettings
 from rescue_sim.environment.grid import Grid, Position
-from rescue_sim.Qlearning.baseline import BaselineExplorer, DFSExplorer
-from rescue_sim.Qlearning.multi_agent_baseline import (
+from rescue_sim.Qlearning.baseline import (
+    BaselineExplorer,
     compare_multi_agent_baselines,
     default_start_positions,
     run_multi_agent_baseline,
+    CBSExplorer,
 )
 from rescue_sim.shared import Action, LearningState, Transition
 
@@ -89,11 +90,11 @@ def test_compare_multi_agent_baselines_runs_existing_non_ml_strategies() -> None
         seed=3,
         baseline_factories={
             "frontier": BaselineExplorer,
-            "dfs": DFSExplorer,
+            "cbs": CBSExplorer,
         },
     )
 
-    assert set(results) == {"frontier", "dfs"}
+    assert set(results) == {"frontier", "cbs"}
     assert all(metrics.num_agents == 2 for metrics in results.values())
     assert all(metrics.total_targets == 2 for metrics in results.values())
     assert all(metrics.steps <= 20 for metrics in results.values())

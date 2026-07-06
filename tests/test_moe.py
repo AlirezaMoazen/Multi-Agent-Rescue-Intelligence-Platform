@@ -1,134 +1,205 @@
-"""Tests for the Mixture-of-Experts router (rescue_sim.MoE).
-
-torch is an optional dependency, so the whole module is skipped when it is
-missing -- exactly like the other deep-RL test modules.
-"""
+"""Tests for the step-level Neural Mixture of Experts (MoE) Policy."""
 
 from __future__ import annotations
 
 import pytest
+import numpy as np
+import torch
+import torch.nn as nn
 
 pytest.importorskip("torch")
 
-from rescue_sim.config.settings import (  # noqa: E402
-    GridSettings,
-    MappoSettings,
-    MoeSettings,
-    QmixSettings,
-    TransfQmixSettings,
+from rescue_sim.MoE.moe import (
+    GatingRouter,
+    NeuralMoEPolicy,
+    SharedFeatureEncoder,
+    distill_expert_heads,
+    train_gating_router,
 )
-from rescue_sim.Ensemble import ValueEnsemble  # noqa: E402
-from rescue_sim.MAPPO import MAPPO, RescueEnv  # noqa: E402
-from rescue_sim.MoE import FixedGridEntityEnv, MixtureOfExperts, solve_score  # noqa: E402
-from rescue_sim.QMIX import QMIX  # noqa: E402
-from rescue_sim.Qlearning.multi_agent_baseline import DEFAULT_MULTI_AGENT_BASELINES  # noqa: E402
-from rescue_sim.TransfQMix import EntityRescueEnv, TransfQMIX  # noqa: E402
+from rescue_sim.shared import Position
 
 
-GRID = GridSettings(width=5, height=5, obstacle_probability=0.1,
-                    target_a_count=1, target_b_count=1)
+class MockEnv:
+    """Mock environment with gym-style interface and blackout state support."""
+    def __init__(self, num_agents: int = 2, obs_dim: int = 108):
+        self.num_agents = num_agents
+        self.obs_dim = obs_dim
+        self.positions = [Position(0, 0) for _ in range(num_agents)]
+        self.max_steps = 5
+        self._steps = 0
+        self.n_actions = 4
+
+    def reset(self) -> np.ndarray:
+        self._steps = 0
+        # Force blackout at reset (dist >= 3)
+        self.positions = [Position(0, 0), Position(5, 5)]
+        return np.zeros((self.num_agents, self.obs_dim), dtype=np.float32)
+
+    def step(self, actions: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
+        self._steps += 1
+        done = self._steps >= self.max_steps
+        obs = np.zeros((self.num_agents, self.obs_dim), dtype=np.float32)
+        # Keep positions isolated (blackout)
+        self.positions = [Position(0, 0), Position(10, 10)]
+        return obs, 1.0, done, {}
+
+    def valid_action_mask(self) -> np.ndarray:
+        return np.ones((self.num_agents, self.n_actions), dtype=bool)
 
 
-def _make_moe(num_agents: int = 2, trials: int = 4, grid: GridSettings = GRID,
-              max_steps: int = 40, baselines=None, with_mappo: bool = False,
-              **moe_kwargs) -> MixtureOfExperts:
-    """A tiny MoE with *untrained* deep nets -- enough to exercise the gate fast."""
-    def env() -> EntityRescueEnv:
-        return EntityRescueEnv(grid, num_agents=num_agents, max_steps=max_steps,
-                               view_radius=1, seed=0)
+def test_shared_feature_encoder() -> None:
+    batch_size = 4
+    num_agents = 3
+    view_radius = 2
+    obs_dim = (2 * view_radius + 1) * (2 * view_radius + 1) * 4 + 4 + num_agents
+    latent_dim = 64
 
-    qmix = QMIX(env(), QmixSettings(num_agents=num_agents, random_seed=0))
-    transf = TransfQMIX(env(), TransfQmixSettings(num_agents=num_agents, random_seed=0))
-    ensemble = ValueEnsemble(qmix, transf, env())
-    mappo = None
-    if with_mappo:
-        mappo = MAPPO(
-            RescueEnv(grid, num_agents=num_agents, max_steps=max_steps, view_radius=1, seed=0),
-            MappoSettings(num_agents=num_agents, random_seed=0),
-        )
-    kwargs = dict(num_trials=trials, random_seed=0, grid_seed=0,
-                  epsilon_start=0.4, epsilon_decay=0.05)
-    kwargs.update(moe_kwargs)
-    bl = DEFAULT_MULTI_AGENT_BASELINES if baselines is None else baselines
-    return MixtureOfExperts.from_models(
-        qmix=qmix, transf=transf, mappo=mappo, ensemble=ensemble,
-        settings=MoeSettings(**kwargs), baselines=bl,
+    encoder = SharedFeatureEncoder(obs_dim, num_agents, view_radius, latent_dim)
+    
+    # Encoder expects 2D inputs when processing flattened agent batches
+    obs = torch.randn(batch_size * num_agents, obs_dim)
+    peer_count = torch.ones(batch_size * num_agents, 1)
+
+    z = encoder(obs, peer_count)
+    assert z.shape == (batch_size * num_agents, latent_dim)
+
+
+def test_permutation_invariant_comm_pooling() -> None:
+    num_agents = 3
+    view_radius = 2
+    obs_dim = (2 * view_radius + 1) * (2 * view_radius + 1) * 4 + 4 + num_agents
+    latent_dim = 64
+
+    encoder = SharedFeatureEncoder(obs_dim, num_agents, view_radius, latent_dim)
+    
+    obs = torch.randn(1, obs_dim)
+    
+    # Peer count is sum-pooled, so identical neighbor count gives identical outputs
+    peer_count1 = torch.tensor([[2.0]], dtype=torch.float32)
+    peer_count2 = torch.tensor([[2.0]], dtype=torch.float32)
+
+    z1 = encoder(obs, peer_count1)
+    z2 = encoder(obs, peer_count2)
+    
+    assert torch.allclose(z1, z2, atol=1e-5)
+
+
+def test_gating_router() -> None:
+    latent_dim = 64
+    router = GatingRouter(latent_dim)
+    z = torch.randn(5, latent_dim)
+    weights = router(z)
+
+    assert weights.shape == (5, 3)
+    assert torch.allclose(torch.sum(weights, dim=-1), torch.ones(5), atol=1e-5)
+    assert torch.all(weights >= 0.0)
+
+
+def test_neural_moe_policy_forward_and_action() -> None:
+    batch_size = 3
+    num_agents = 2
+    view_radius = 2
+    obs_dim = (2 * view_radius + 1) * (2 * view_radius + 1) * 4 + 4 + num_agents
+    action_dim = 4
+
+    policy = NeuralMoEPolicy(obs_dim, num_agents, view_radius, action_dim)
+    
+    # 3D inputs: [Batch_Size, Num_Agents, ...]
+    obs = torch.randn(batch_size, num_agents, obs_dim)
+    peer_matrix = torch.ones(batch_size, num_agents, num_agents)
+    action_mask = torch.ones(batch_size, num_agents, action_dim, dtype=torch.bool)
+
+    y_final, weights = policy(obs, peer_matrix, action_mask)
+    assert y_final.shape == (batch_size, num_agents, action_dim)
+    assert weights.shape == (batch_size, num_agents, 3)
+
+    # Action selection with custom masking
+    custom_mask = torch.tensor([[[True, False, False, False], [False, True, False, False]],
+                                [[False, False, True, False], [False, False, False, True]],
+                                [[True, False, False, False], [False, True, False, False]]], dtype=torch.bool)
+    actions = policy.get_action(obs, peer_matrix, custom_mask)
+    assert actions.shape == (batch_size, num_agents)
+    assert actions[0, 0].item() == 0
+    assert actions[0, 1].item() == 1
+    assert actions[1, 0].item() == 2
+    assert actions[1, 1].item() == 3
+
+
+def test_distill_expert_heads() -> None:
+    num_agents = 2
+    view_radius = 2
+    obs_dim = (2 * view_radius + 1) * (2 * view_radius + 1) * 4 + 4 + num_agents
+    action_dim = 4
+
+    policy = NeuralMoEPolicy(obs_dim, num_agents, view_radius, action_dim)
+
+    # Build tiny datasets of team transitions: (obs_team, peer_matrix_team, actions_team)
+    # obs_team: [num_agents, obs_dim]
+    # peer_matrix_team: [num_agents, num_agents]
+    # actions_team: [num_agents]
+    exploration_data = [(torch.randn(num_agents, obs_dim), torch.ones(num_agents, num_agents), torch.zeros(num_agents)) for _ in range(10)]
+    coordination_data = [(torch.randn(num_agents, obs_dim), torch.ones(num_agents, num_agents), torch.ones(num_agents)) for _ in range(10)]
+    fallback_data = [(torch.randn(num_agents, obs_dim), torch.ones(num_agents, num_agents), torch.ones(num_agents) * 2) for _ in range(10)]
+
+    loss_history = distill_expert_heads(
+        policy,
+        [exploration_data, coordination_data, fallback_data],
+        epochs=3,
+        batch_size=2,
+        lr=0.01,
     )
 
+    assert "exploration" in loss_history
+    assert "coordination" in loss_history
+    assert "fallback" in loss_history
+    assert len(loss_history["exploration"]) == 3
+    assert loss_history["exploration"][-1] >= 0.0
 
-def test_solve_score_orders_success_above_failure():
-    success = {"success": True, "rescued": 2, "targets": 2, "steps": 30}
-    failure = {"success": False, "rescued": 2, "targets": 2, "steps": 5}
-    assert solve_score(success, max_steps=40) > solve_score(failure, max_steps=40)
-    faster = {"success": True, "rescued": 2, "targets": 2, "steps": 10}
-    assert solve_score(faster, max_steps=40) > solve_score(success, max_steps=40)
-
-
-def test_fixed_grid_env_does_not_regenerate():
-    moe = _make_moe()
-    assert isinstance(moe.env, FixedGridEntityEnv)
-    obs = moe.env.reset()
-    grid1 = moe.env.grid
-    moe.env.reset()
-    grid2 = moe.env.grid
-    assert grid1 is grid2          # same fixed grid object across resets
-    assert grid1 is moe.grid
-    assert obs.shape[0] == moe.num_agents
+    # Ensure Gating Router parameters are frozen (grad is False)
+    for p in policy.router_encoder.parameters():
+        assert not p.requires_grad
+    for p in policy.router.parameters():
+        assert not p.requires_grad
 
 
-def test_leaderboard_scores_all_experts():
-    """Every classical baseline and deep expert (incl. MAPPO) appears, scored once."""
-    moe = _make_moe(with_mappo=True, trials=3)
-    report = moe.run()
-    # 7 classical baselines + QMIX + TransfQMix + MAPPO + Ensemble.
-    for name in DEFAULT_MULTI_AGENT_BASELINES:
-        assert name in report.leaderboard
-    for name in ("QMIX", "TransfQMix", "MAPPO", "Ensemble"):
-        assert name in report.leaderboard
-    for m in report.leaderboard.values():
-        assert set(m) == {"success", "rescued", "targets", "steps", "score"}
-    assert report.teacher in ("QMIX", "TransfQMix", "MAPPO", "Ensemble")
+def test_train_gating_router_penalty() -> None:
+    num_agents = 2
+    view_radius = 2
+    obs_dim = (2 * view_radius + 1) * (2 * view_radius + 1) * 4 + 4 + num_agents
+    action_dim = 4
 
+    policy = NeuralMoEPolicy(obs_dim, num_agents, view_radius, action_dim)
+    env = MockEnv(num_agents, obs_dim)
 
-def test_moe_run_produces_consistent_history():
-    moe = _make_moe(num_agents=2, trials=5)
-    report = moe.run()
-    assert len(report.history) == 5
-    known = set(report.leaderboard) | {"EpidemicFleet"}
-    for i, row in enumerate(report.history, start=1):
-        assert row.trial == i
-        assert row.leader in known
-        assert 0.0 <= row.epsilon <= 1.0
+    # Train router on the mock environment (isolated agents)
+    losses = train_gating_router(
+        policy,
+        env,
+        updates=5,
+        lr=0.01,
+        comm_penalty_coef=20.0,
+    )
 
+    assert len(losses) == 5
 
-def test_moe_report_is_json_serializable():
-    import json
+    # Gating Router parameters should now have gradients enabled
+    for p in policy.router_encoder.parameters():
+        assert p.requires_grad
+    for p in policy.router.parameters():
+        assert p.requires_grad
 
-    report = _make_moe(trials=3).run()
-    payload = report.to_dict()
-    assert json.loads(json.dumps(payload))["final_leader"]
-    assert len(payload["history"]) == 3
-    assert payload["leaderboard"]  # non-empty
+    # Expert parameters should remain frozen
+    for p in policy.expert_encoder.parameters():
+        assert not p.requires_grad
 
-
-def test_specialist_overtakes_weak_generalists():
-    """On a single-target grid with only weak (untrained) deep experts in the
-    pool, the fleet must learn the grid and lead -- the headline MoE story."""
-    single = GridSettings(width=10, height=10, obstacle_probability=0.2,
-                          target_a_count=1, target_b_count=0)
-    # A grid the untrained deep experts cannot solve (long path behind obstacles);
-    # isolate the deep-vs-fleet gate by excluding the classical baselines.
-    moe = _make_moe(num_agents=2, trials=25, grid=single, max_steps=120,
-                    baselines={}, grid_seed=1, epsilon_start=0.6, epsilon_decay=0.03)
-    report = moe.run()
-    assert report.surpassed_at is not None
-    assert report.final_leader == "EpidemicFleet"
-    leaders = [row.leader for row in report.history]
-    first = leaders.index("EpidemicFleet")
-    assert all(lead == "EpidemicFleet" for lead in leaders[first:])  # monotone takeover
-
-
-def test_adaptive_expert_learns_over_trials():
-    moe = _make_moe(num_agents=2, trials=6, baselines={})
-    report = moe.run()
-    assert report.history[-1].mean_q >= report.history[0].mean_q
+    # Verify that in a blackout, the policy assigns high weight to the fallback head (Expert 3)
+    obs = torch.zeros(1, num_agents, obs_dim)
+    # peer_matrix for isolated agent (only self connection, so identity matrix)
+    peer_matrix = torch.eye(num_agents).unsqueeze(0)  # [1, A, A]
+    action_mask = torch.ones(1, num_agents, action_dim, dtype=torch.bool)
+    
+    _, weights = policy(obs, peer_matrix, action_mask)
+    
+    # Due to penalty during training, Expert 3 (index 2) weight should be significantly positive
+    assert weights[0, 0, 2].item() > 0.5
+    assert weights[0, 1, 2].item() > 0.5

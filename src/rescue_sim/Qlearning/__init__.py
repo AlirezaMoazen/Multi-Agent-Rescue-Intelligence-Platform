@@ -1,6 +1,6 @@
 """Q-learning and classical baseline helpers."""
 
-from rescue_sim.Qlearning.multi_agent_baseline import (
+from rescue_sim.Qlearning.baseline import (
     DEFAULT_MULTI_AGENT_BASELINES,
     MultiAgentBaselineMetrics,
     MultiAgentBaselineStep,

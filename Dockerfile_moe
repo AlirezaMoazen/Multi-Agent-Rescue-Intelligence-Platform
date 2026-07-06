@@ -1,0 +1,36 @@
+# Multi-stage, VRAM-optimized PyTorch execution container for MARL MoE policy
+# Stage 1: Dependency builder stage
+FROM pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime AS builder
+
+WORKDIR /build
+
+# Install system compilation dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy project configuration files
+COPY pyproject.toml ./
+
+# Install python package and dependencies
+RUN pip install --no-cache-dir -e .
+
+# Stage 2: Final runtime container stage
+FROM pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime AS runner
+
+WORKDIR /app
+
+# VRAM memory fragmentation and allocation optimizations
+# Use cudaMallocAsync memory backend with pool splitting thresholds
+ENV PYTORCH_CUDA_ALLOC_CONF="backend:cudaMallocAsync,max_split_size_mb:128"
+ENV CUDA_VISIBLE_DEVICES="0"
+
+# Copy installed conda environment and libraries from builder
+COPY --from=builder /opt/conda /opt/conda
+
+# Copy simulator project source files and demo entrypoint
+COPY src/ ./src/
+COPY demo_moe.py ./
+
+# Run the self-contained evolution demonstration by default
+ENTRYPOINT ["python", "demo_moe.py"]

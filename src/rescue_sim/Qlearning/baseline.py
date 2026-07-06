@@ -31,15 +31,27 @@ from __future__ import annotations
 
 import random
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Callable, Mapping
 
-from rescue_sim.environment.grid import Position
+from rescue_sim.config.settings import GridSettings
+from rescue_sim.environment.generator import generate_grid
+from rescue_sim.environment.grid import Grid, Position
+from rescue_sim.environment.movement import MovementModel
+from rescue_sim.environment.sensors import CentralSensor, Observation
 from rescue_sim.shared import (
     Action,
     EnvironmentInterface,
     LearningState,
     MOVE_DELTAS,
+    MovementResult,
+    RewardConfig,
+    RewardEvent,
+    SPRINT3_REWARD_CONFIG,
+    StrategyInterface,
+    TargetType,
     Transition,
+    calculate_reward,
 )
 
 
@@ -270,378 +282,6 @@ class BaselineExplorer:
 # Strategy 2 — Depth-First Search (DFSExplorer)
 # ---------------------------------------------------------------------------
 
-class DFSExplorer:
-    """Depth-First Search explorer implementing StrategyInterface.
-
-    Maintains a per-agent LIFO stack.  Each time the agent arrives at a new
-    cell it pushes all immediately reachable unvisited neighbours; the agent
-    always navigates to the top of the stack (going deep before backtracking).
-
-    When the stack target is not directly adjacent the explorer uses BFS over
-    the accumulated known-passable map to compute a navigation path, which is
-    then buffered and consumed one action at a time.
-
-    Direction exploration order: UP → RIGHT → DOWN → LEFT (first direction
-    in the list is pushed last so it ends up on top of the LIFO stack).
-
-    Parameters
-    ----------
-    seed:
-        RNG seed used as a fallback when the stack is exhausted or a target
-        is unreachable.  Pass an integer for reproducible runs.
-    """
-
-    # Primary directions only; "forward" is an alias for "up" and is omitted
-    # to avoid duplicate stack entries.
-    _DIRS: tuple[tuple[str, int, int], ...] = (
-        ("up",    0, -1),
-        ("right", 1,  0),
-        ("down",  0,  1),
-        ("left", -1,  0),
-    )
-
-    def __init__(self, seed: int | None = 42) -> None:
-        self._rng = random.Random(seed)
-        self._visited: dict[str, set[Position]] = {}
-        # LIFO stack of cells to visit next, per agent.
-        self._stack: dict[str, list[Position]] = {}
-        # Buffered navigation path (actions), per agent.
-        self._path_buffer: dict[str, list[Action]] = {}
-        # Accumulated obstacle knowledge, per agent.
-        self._known_obstacles: dict[str, set[Position]] = {}
-
-    # ------------------------------------------------------------------
-    # StrategyInterface
-    # ------------------------------------------------------------------
-
-    def select_action(
-        self,
-        agent_id: str,
-        state: LearningState,
-        valid_actions: tuple[Action, ...],
-    ) -> Action:
-        """Return the next DFS action for *agent_id*."""
-        visited = self._visited_for(agent_id)
-        pos = state.agent_position
-        just_arrived = pos not in visited
-        visited.add(pos)
-
-        obs = self._obstacles_for(agent_id)
-        obs.update(state.visible_obstacles)
-
-        moveable = [a for a in valid_actions if a != Action.WAIT]
-        if not moveable:
-            return Action.WAIT
-
-        stack = self._stack_for(agent_id)
-        buf = self._buffer_for(agent_id)
-
-        # Node expansion: push unvisited reachable neighbours (first arrival only).
-        # Appended in reverse _DIRS order so the first direction ends up on top.
-        if just_arrived:
-            to_push: list[Position] = []
-            for name, dx, dy in self._DIRS:
-                try:
-                    action = Action(name)
-                except ValueError:
-                    continue
-                if action not in moveable:
-                    continue
-                npos = Position(pos.x + dx, pos.y + dy)
-                if npos not in visited and npos not in stack:
-                    to_push.append(npos)
-            for npos in reversed(to_push):
-                stack.append(npos)
-
-        # Execute buffered navigation path if still valid.
-        while buf:
-            action = buf[0]
-            if action in valid_actions:
-                buf.pop(0)
-                return action
-            buf.clear()   # Path blocked by newly discovered obstacle — replan.
-            break
-
-        # Discard stack entries that are already visited.
-        while stack and stack[-1] in visited:
-            stack.pop()
-
-        if not stack:
-            # Stack exhausted — fall back to random valid move.
-            return self._rng.choice(moveable)
-
-        target = stack[-1]
-
-        # If target is directly adjacent, move there immediately.
-        for name, dx, dy in self._DIRS:
-            try:
-                action = Action(name)
-            except ValueError:
-                continue
-            if action not in moveable:
-                continue
-            if Position(pos.x + dx, pos.y + dy) == target:
-                stack.pop()
-                return action
-
-        # Not adjacent — navigate via BFS over known passable cells.
-        passable = set(state.discovered_cells) - obs
-        path = self._bfs_navigate(pos, target, passable)
-        if path:
-            stack.pop()
-            buf.extend(path[1:])
-            return path[0]
-
-        # Target unreachable — discard and fall back to random.
-        stack.pop()
-        return self._rng.choice(moveable)
-
-    def update(self, transition: Transition) -> None:
-        """No-op: the DFS baseline never updates from experience."""
-
-    def run_episode(
-        self,
-        env: EnvironmentInterface,
-        max_steps: int = 500,
-        total_cells: int | None = None,
-    ) -> BaselineMetrics:
-        """Convenience wrapper around the module-level :func:`run_episode`."""
-        return run_episode(self, env, max_steps, total_cells)
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _bfs_navigate(
-        self,
-        start: Position,
-        target: Position,
-        passable: set[Position],
-    ) -> list[Action]:
-        """BFS over *passable* cells; returns the action sequence start→target."""
-        if start == target:
-            return []
-        reachable = passable | {start, target}
-        queue: deque[tuple[Position, list[Action]]] = deque([(start, [])])
-        seen: set[Position] = {start}
-        while queue:
-            pos, path = queue.popleft()
-            for name, dx, dy in self._DIRS:
-                npos = Position(pos.x + dx, pos.y + dy)
-                if npos == target:
-                    return path + [Action(name)]
-                if npos not in seen and npos in reachable:
-                    seen.add(npos)
-                    queue.append((npos, path + [Action(name)]))
-        return []
-
-    def _visited_for(self, agent_id: str) -> set[Position]:
-        if agent_id not in self._visited:
-            self._visited[agent_id] = set()
-        return self._visited[agent_id]
-
-    def _stack_for(self, agent_id: str) -> list[Position]:
-        if agent_id not in self._stack:
-            self._stack[agent_id] = []
-        return self._stack[agent_id]
-
-    def _buffer_for(self, agent_id: str) -> list[Action]:
-        if agent_id not in self._path_buffer:
-            self._path_buffer[agent_id] = []
-        return self._path_buffer[agent_id]
-
-    def _obstacles_for(self, agent_id: str) -> set[Position]:
-        if agent_id not in self._known_obstacles:
-            self._known_obstacles[agent_id] = set()
-        return self._known_obstacles[agent_id]
-
-
-class PrioritizedPlanningExplorer:
-    """Prioritized Planning explorer implementing StrategyInterface.
-
-    In a multi-agent environment, agents plan paths sequentially based on priority
-    (determined by agent_id). Higher-priority agents reserve their planned positions
-    per timestep in a shared reservation registry. Lower-priority agents treat these
-    reservations as dynamic obstacles when planning their paths using BFS.
-    """
-
-    # Shared class-level registry of reservations: (agent_id) -> list of Positions at each step
-    _shared_reservations: dict[str, list[Position]] = {}
-
-    def __init__(self, seed: int | None = 42) -> None:
-        self._rng = random.Random(seed)
-        self._visited: dict[str, set[Position]] = {}
-        self._path_buffer: dict[str, list[Action]] = {}
-        self._known_obstacles: dict[str, set[Position]] = {}
-
-    @classmethod
-    def clear_reservations(cls) -> None:
-        cls._shared_reservations.clear()
-
-    def select_action(
-        self,
-        agent_id: str,
-        state: LearningState,
-        valid_actions: tuple[Action, ...],
-    ) -> Action:
-        """Return the next Prioritized Planning action for *agent_id*."""
-        visited = self._visited_for(agent_id)
-        pos = state.agent_position
-        visited.add(pos)
-
-        obs = self._obstacles_for(agent_id)
-        obs.update(state.visible_obstacles)
-
-        moveable = [a for a in valid_actions if a != Action.WAIT]
-        if not moveable:
-            return Action.WAIT
-
-        buf = self._buffer_for(agent_id)
-
-        # If we have a buffered path, return the next action
-        while buf:
-            action = buf[0]
-            if action in valid_actions:
-                buf.pop(0)
-                return action
-            buf.clear()
-            break
-
-        # Replan: Find nearest target
-        targets = sorted(
-            list(
-                state.visible_target_a_positions
-                | state.visible_target_b_positions
-                | state.remaining_target_a_positions
-                | state.remaining_target_b_positions
-            ),
-            key=lambda t: abs(t.x - pos.x) + abs(t.y - pos.y)
-        )
-
-        path = []
-        passable = set(state.discovered_cells) - obs
-
-        # Prioritized Planning collision avoidance:
-        # Collect reservations from higher-priority agents (lexicographically smaller ids)
-        other_reservations: list[list[Position]] = [
-            res_path
-            for other_id, res_path in self._shared_reservations.items()
-            if other_id < agent_id
-        ]
-
-        for target in targets:
-            path = self._bfs_navigate_prioritized(pos, target, passable, other_reservations)
-            if path:
-                break
-
-        if path:
-            actions = self._path_to_actions(pos, path)
-            if actions:
-                # Save planned positions to shared reservations for priority check
-                self._shared_reservations[agent_id] = path
-                buf.extend(actions[1:])
-                return actions[0]
-
-        # Fallback to random if no target or path is found
-        return self._rng.choice(moveable)
-
-    def update(self, transition: Transition) -> None:
-        """No-op: the prioritized planning baseline never updates from experience."""
-        pass
-
-    def run_episode(
-        self,
-        env: EnvironmentInterface,
-        max_steps: int = 500,
-        total_cells: int | None = None,
-    ) -> BaselineMetrics:
-        """Convenience wrapper around the module-level :func:`run_episode`."""
-        self.clear_reservations()
-        return run_episode(self, env, max_steps, total_cells)
-
-    def _visited_for(self, agent_id: str) -> set[Position]:
-        if agent_id not in self._visited:
-            self._visited[agent_id] = set()
-        return self._visited[agent_id]
-
-    def _buffer_for(self, agent_id: str) -> list[Action]:
-        if agent_id not in self._path_buffer:
-            self._path_buffer[agent_id] = []
-        return self._path_buffer[agent_id]
-
-    def _obstacles_for(self, agent_id: str) -> set[Position]:
-        if agent_id not in self._known_obstacles:
-            self._known_obstacles[agent_id] = set()
-        return self._known_obstacles[agent_id]
-
-    def _bfs_navigate_prioritized(
-        self,
-        start: Position,
-        target: Position,
-        passable: set[Position],
-        other_reservations: list[list[Position]],
-    ) -> list[Position]:
-        """BFS that avoids collision with reserved paths of higher-priority agents."""
-        if start == target:
-            return [start]
-
-        queue: deque[tuple[Position, list[Position]]] = deque([(start, [start])])
-        seen: set[tuple[Position, int]] = {(start, 0)}  # (position, step_index)
-        reachable = passable | {start, target}
-        max_depth = max(100, len(reachable))
-
-        while queue:
-            pos, path = queue.popleft()
-            depth = len(path) - 1
-
-            if depth > max_depth:
-                continue
-
-            for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
-                npos = Position(pos.x + dx, pos.y + dy)
-                next_depth = depth + 1
-
-                # Check if this position is reserved by a higher priority agent at next_depth
-                reserved = False
-                for res_path in other_reservations:
-                    if next_depth < len(res_path) and res_path[next_depth] == npos:
-                        reserved = True
-                        break
-                    # Avoid swapping positions (edge conflict)
-                    if next_depth < len(res_path) and depth < len(res_path) and res_path[depth] == npos and res_path[next_depth] == pos:
-                        reserved = True
-                        break
-
-                if reserved:
-                    continue
-
-                if npos == target:
-                    return path + [npos]
-
-                if npos in reachable and (npos, next_depth) not in seen:
-                    seen.add((npos, next_depth))
-                    queue.append((npos, path + [npos]))
-
-        return []
-
-    def _path_to_actions(self, start: Position, path: list[Position]) -> list[Action]:
-        actions = []
-        curr = start
-        for next_pos in path[1:]:
-            if next_pos.x > curr.x:
-                actions.append(Action.RIGHT)
-            elif next_pos.y > curr.y:
-                actions.append(Action.DOWN)
-            elif next_pos.x < curr.x:
-                actions.append(Action.LEFT)
-            elif next_pos.y < curr.y:
-                actions.append(Action.UP)
-            else:
-                actions.append(Action.WAIT)
-            curr = next_pos
-        return actions
-
-
 class CBSExplorer:
     """Conflict-Based Search explorer implementing StrategyInterface.
 
@@ -777,436 +417,397 @@ class CBSExplorer:
         return actions
 
 
-class ICBSExplorer:
-    """Improved Conflict-Based Search explorer implementing StrategyInterface.
+BaselineFactory = Callable[[int | None], StrategyInterface]
 
-    Optimal centralized MAPF algorithm. Prioritizes resolving conflicts first;
-    uses specialized tie-breakers for path selection.
+
+DEFAULT_MULTI_AGENT_BASELINES: Mapping[str, BaselineFactory] = {
+    "frontier": BaselineExplorer,
+    "cbs": CBSExplorer,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class MultiAgentBaselineStep:
+    """One synchronized step for all baseline agents."""
+
+    step: int
+    actions: dict[str, Action]
+    positions: dict[str, Position]
+    rewards: dict[str, float]
+    rescued_targets: int
+    collisions: int
+
+
+@dataclass(frozen=True, slots=True)
+class MultiAgentBaselineMetrics:
+    """Report-ready result for one multi-agent non-ML baseline run."""
+
+    strategy_name: str
+    num_agents: int
+    steps: int
+    success: bool
+    rescued_targets: int
+    total_targets: int
+    total_reward: float
+    discovered_cells: int
+    explored_cells: int
+    collisions: int
+    invalid_moves: int
+    final_positions: dict[str, Position]
+    reward_by_agent: dict[str, float]
+    trace: tuple[MultiAgentBaselineStep, ...] = field(default_factory=tuple)
+
+    @property
+    def success_rate(self) -> float:
+        return 1.0 if self.success else 0.0
+
+
+def run_multi_agent_baseline(
+    strategy: StrategyInterface,
+    grid: Grid,
+    start_positions: Mapping[str, Position],
+    max_steps: int,
+    sensor_range: int = 3,
+    reward_config: RewardConfig = SPRINT3_REWARD_CONFIG,
+    strategy_name: str | None = None,
+) -> MultiAgentBaselineMetrics:
+    """Run one non-ML strategy with several agents on the same grid.
+
+    The strategy object is shared across agents so algorithms with per-agent
+    state can coordinate through their own ``agent_id`` keys.
     """
+    if not start_positions:
+        raise ValueError("at least one agent start position is required")
+    if max_steps < 0:
+        raise ValueError("max_steps must be non-negative")
 
-    def __init__(self, seed: int | None = 42) -> None:
-        self._rng = random.Random(seed)
-        self._visited: dict[str, set[Position]] = {}
-        self._path_buffer: dict[str, list[Action]] = {}
-        self._known_obstacles: dict[str, set[Position]] = {}
+    _validate_start_positions(grid, start_positions)
+    _clear_strategy_state(strategy)
 
-    def select_action(
-        self,
-        agent_id: str,
-        state: LearningState,
-        valid_actions: tuple[Action, ...],
-    ) -> Action:
-        """Return the next ICBS action for *agent_id*."""
-        visited = self._visited_for(agent_id)
-        pos = state.agent_position
-        visited.add(pos)
+    movement = MovementModel()
+    sensor = CentralSensor(grid)
+    positions = dict(start_positions)
+    visited_by_agent = {
+        agent_id: {position}
+        for agent_id, position in positions.items()
+    }
+    explored_cells = set(positions.values())
+    rescued: set[Position] = set()
+    all_targets = grid.target_a_positions | grid.target_b_positions
+    reward_by_agent = {agent_id: 0.0 for agent_id in positions}
+    trace: list[MultiAgentBaselineStep] = []
+    collisions = 0
+    invalid_moves = 0
 
-        obs = self._obstacles_for(agent_id)
-        obs.update(state.visible_obstacles)
-
-        moveable = [a for a in valid_actions if a != Action.WAIT]
-        if not moveable:
-            return Action.WAIT
-
-        buf = self._buffer_for(agent_id)
-
-        while buf:
-            action = buf[0]
-            if action in valid_actions:
-                buf.pop(0)
-                return action
-            buf.clear()
+    for step in range(1, max_steps + 1):
+        if rescued == all_targets:
             break
 
-        targets = sorted(
-            list(
-                state.visible_target_a_positions
-                | state.visible_target_b_positions
-                | state.remaining_target_a_positions
-                | state.remaining_target_b_positions
-            ),
-            key=lambda t: abs(t.x - pos.x) + abs(t.y - pos.y)
+        observations = {
+            agent_id: sensor.observe(agent_id, position, sensor_range)
+            for agent_id, position in positions.items()
+        }
+        states = {
+            agent_id: _state_from_observation(
+                agent_id=agent_id,
+                observation=observation,
+                sensor=sensor,
+                grid=grid,
+                rescued=rescued,
+                steps_taken=step - 1,
+            )
+            for agent_id, observation in observations.items()
+        }
+        actions = {
+            agent_id: strategy.select_action(
+                agent_id,
+                states[agent_id],
+                _valid_actions(movement, grid, positions[agent_id]),
+            )
+            for agent_id in sorted(positions)
+        }
+        movements, step_collisions = _resolve_movements(movement, grid, positions, actions)
+        collisions += step_collisions
+
+        next_positions: dict[str, Position] = {}
+        step_rewards: dict[str, float] = {}
+        for agent_id in sorted(positions):
+            result = movements[agent_id]
+            next_position = result.end
+            next_positions[agent_id] = next_position
+            explored_cells.add(next_position)
+
+            newly_rescued_type = None
+            target_type = grid.target_type_at(next_position)
+            if target_type is not None and next_position not in rescued:
+                rescued.add(next_position)
+                newly_rescued_type = TargetType(target_type)
+
+            next_observation = sensor.observe(agent_id, next_position, sensor_range)
+            repeated_cell = next_position in visited_by_agent[agent_id]
+            visited_by_agent[agent_id].add(next_position)
+            done = rescued == all_targets
+            reward = calculate_reward(
+                RewardEvent(
+                    moved=result.moved,
+                    move=actions[agent_id].value,
+                    newly_discovered_cells=len(next_observation.newly_discovered_cells),
+                    rescued_target_type=newly_rescued_type,
+                    completed_episode=done,
+                    repeated_cell=repeated_cell,
+                ),
+                reward_config,
+            )
+            reward_by_agent[agent_id] += reward
+            step_rewards[agent_id] = round(reward, 4)
+            if not result.moved and actions[agent_id] != Action.WAIT:
+                invalid_moves += 1
+
+            next_state = _state_from_observation(
+                agent_id=agent_id,
+                observation=next_observation,
+                sensor=sensor,
+                grid=grid,
+                rescued=rescued,
+                steps_taken=step,
+            )
+            strategy.update(
+                Transition(
+                    state=states[agent_id],
+                    action=actions[agent_id],
+                    next_state=next_state,
+                    reward=reward,
+                    done=done,
+                    movement=result,
+                    observation=next_observation,
+                )
+            )
+
+        positions = next_positions
+        trace.append(
+            MultiAgentBaselineStep(
+                step=step,
+                actions=actions,
+                positions=dict(positions),
+                rewards=step_rewards,
+                rescued_targets=len(rescued),
+                collisions=step_collisions,
+            )
         )
 
-        path = []
-        passable = set(state.discovered_cells) - obs
-
-        for target in targets:
-            path = self._bfs_navigate_icbs(pos, target, passable)
-            if path:
-                break
-
-        if path:
-            actions = self._path_to_actions(pos, path)
-            if actions:
-                buf.extend(actions[1:])
-                return actions[0]
-
-        return self._rng.choice(moveable)
-
-    def update(self, transition: Transition) -> None:
-        """No-op: the ICBS baseline never updates from experience."""
-        pass
-
-    def run_episode(
-        self,
-        env: EnvironmentInterface,
-        max_steps: int = 500,
-        total_cells: int | None = None,
-    ) -> BaselineMetrics:
-        """Convenience wrapper around the module-level :func:`run_episode`."""
-        return run_episode(self, env, max_steps, total_cells)
-
-    def _visited_for(self, agent_id: str) -> set[Position]:
-        if agent_id not in self._visited:
-            self._visited[agent_id] = set()
-        return self._visited[agent_id]
-
-    def _buffer_for(self, agent_id: str) -> list[Action]:
-        if agent_id not in self._path_buffer:
-            self._path_buffer[agent_id] = []
-        return self._path_buffer[agent_id]
-
-    def _obstacles_for(self, agent_id: str) -> set[Position]:
-        if agent_id not in self._known_obstacles:
-            self._known_obstacles[agent_id] = set()
-        return self._known_obstacles[agent_id]
-
-    def _bfs_navigate_icbs(
-        self,
-        start: Position,
-        target: Position,
-        passable: set[Position],
-    ) -> list[Position]:
-        if start == target:
-            return [start]
-        queue: deque[tuple[Position, list[Position]]] = deque([(start, [start])])
-        seen: set[Position] = {start}
-        reachable = passable | {start, target}
-        while queue:
-            pos, path = queue.popleft()
-            # Prioritized direction sequence to resolve conflicts first
-            for dx, dy in ((1, 0), (0, 1), (-1, 0), (0, -1)):
-                npos = Position(pos.x + dx, pos.y + dy)
-                if npos == target:
-                    return path + [npos]
-                if npos not in seen and npos in reachable:
-                    seen.add(npos)
-                    queue.append((npos, path + [npos]))
-        return []
-
-    def _path_to_actions(self, start: Position, path: list[Position]) -> list[Action]:
-        actions = []
-        curr = start
-        for next_pos in path[1:]:
-            if next_pos.x > curr.x:
-                actions.append(Action.RIGHT)
-            elif next_pos.y > curr.y:
-                actions.append(Action.DOWN)
-            elif next_pos.x < curr.x:
-                actions.append(Action.LEFT)
-            elif next_pos.y < curr.y:
-                actions.append(Action.UP)
-            else:
-                actions.append(Action.WAIT)
-            curr = next_pos
-        return actions
+    return MultiAgentBaselineMetrics(
+        strategy_name=strategy_name or strategy.__class__.__name__,
+        num_agents=len(start_positions),
+        steps=len(trace),
+        success=rescued == all_targets,
+        rescued_targets=len(rescued),
+        total_targets=len(all_targets),
+        total_reward=round(sum(reward_by_agent.values()), 4),
+        discovered_cells=len(sensor.discovered_cells),
+        explored_cells=len(explored_cells),
+        collisions=collisions,
+        invalid_moves=invalid_moves,
+        final_positions=dict(positions),
+        reward_by_agent={agent_id: round(reward, 4) for agent_id, reward in reward_by_agent.items()},
+        trace=tuple(trace),
+    )
 
 
-class ECBSExplorer:
-    """Enhanced Conflict-Based Search explorer implementing StrategyInterface.
+def compare_multi_agent_baselines(
+    grid_settings: GridSettings,
+    num_agents: int,
+    max_steps: int,
+    sensor_range: int = 3,
+    seed: int | None = None,
+    baseline_factories: Mapping[str, BaselineFactory] = DEFAULT_MULTI_AGENT_BASELINES,
+) -> dict[str, MultiAgentBaselineMetrics]:
+    """Run all configured non-ML baselines on one shared multi-agent scenario."""
+    if num_agents <= 0:
+        raise ValueError("num_agents must be positive")
 
-    Bounded suboptimal centralized MAPF algorithm. Offers paths within a
-    specified bound of the optimal path.
-    """
+    anchor = Position(0, 0)
+    grid = generate_grid(grid_settings, start=anchor)
+    starts = default_start_positions(grid, num_agents, anchor)
+    results: dict[str, MultiAgentBaselineMetrics] = {}
 
-    def __init__(self, seed: int | None = 42, w: float = 1.2) -> None:
-        self._rng = random.Random(seed)
-        self.w = w
-        self._visited: dict[str, set[Position]] = {}
-        self._path_buffer: dict[str, list[Action]] = {}
-        self._known_obstacles: dict[str, set[Position]] = {}
-
-    def select_action(
-        self,
-        agent_id: str,
-        state: LearningState,
-        valid_actions: tuple[Action, ...],
-    ) -> Action:
-        """Return the next ECBS action for *agent_id*."""
-        visited = self._visited_for(agent_id)
-        pos = state.agent_position
-        visited.add(pos)
-
-        obs = self._obstacles_for(agent_id)
-        obs.update(state.visible_obstacles)
-
-        moveable = [a for a in valid_actions if a != Action.WAIT]
-        if not moveable:
-            return Action.WAIT
-
-        buf = self._buffer_for(agent_id)
-
-        while buf:
-            action = buf[0]
-            if action in valid_actions:
-                buf.pop(0)
-                return action
-            buf.clear()
-            break
-
-        targets = sorted(
-            list(
-                state.visible_target_a_positions
-                | state.visible_target_b_positions
-                | state.remaining_target_a_positions
-                | state.remaining_target_b_positions
-            ),
-            key=lambda t: abs(t.x - pos.x) + abs(t.y - pos.y)
+    for index, (name, factory) in enumerate(baseline_factories.items()):
+        strategy_seed = None if seed is None else seed + index
+        strategy = factory(strategy_seed)
+        results[name] = run_multi_agent_baseline(
+            strategy=strategy,
+            grid=grid,
+            start_positions=starts,
+            max_steps=max_steps,
+            sensor_range=sensor_range,
+            strategy_name=name,
         )
 
-        path = []
-        passable = set(state.discovered_cells) - obs
-
-        for target in targets:
-            path = self._bfs_navigate_bounded(pos, target, passable)
-            if path:
-                break
-
-        if path:
-            actions = self._path_to_actions(pos, path)
-            if actions:
-                buf.extend(actions[1:])
-                return actions[0]
-
-        return self._rng.choice(moveable)
-
-    def update(self, transition: Transition) -> None:
-        """No-op: the ECBS baseline never updates from experience."""
-        pass
-
-    def run_episode(
-        self,
-        env: EnvironmentInterface,
-        max_steps: int = 500,
-        total_cells: int | None = None,
-    ) -> BaselineMetrics:
-        """Convenience wrapper around the module-level :func:`run_episode`."""
-        return run_episode(self, env, max_steps, total_cells)
-
-    def _visited_for(self, agent_id: str) -> set[Position]:
-        if agent_id not in self._visited:
-            self._visited[agent_id] = set()
-        return self._visited[agent_id]
-
-    def _buffer_for(self, agent_id: str) -> list[Action]:
-        if agent_id not in self._path_buffer:
-            self._path_buffer[agent_id] = []
-        return self._path_buffer[agent_id]
-
-    def _obstacles_for(self, agent_id: str) -> set[Position]:
-        if agent_id not in self._known_obstacles:
-            self._known_obstacles[agent_id] = set()
-        return self._known_obstacles[agent_id]
-
-    def _bfs_navigate(
-        self,
-        start: Position,
-        target: Position,
-        passable: set[Position],
-    ) -> list[Position]:
-        if start == target:
-            return [start]
-        queue: deque[tuple[Position, list[Position]]] = deque([(start, [start])])
-        seen: set[Position] = {start}
-        reachable = passable | {start, target}
-        while queue:
-            pos, path = queue.popleft()
-            for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
-                npos = Position(pos.x + dx, pos.y + dy)
-                if npos == target:
-                    return path + [npos]
-                if npos not in seen and npos in reachable:
-                    seen.add(npos)
-                    queue.append((npos, path + [npos]))
-        return []
-
-    def _bfs_navigate_bounded(
-        self,
-        start: Position,
-        target: Position,
-        passable: set[Position],
-    ) -> list[Position]:
-        if start == target:
-            return [start]
-        opt_path = self._bfs_navigate(start, target, passable)
-        if not opt_path:
-            return []
-        
-        opt_len = len(opt_path) - 1
-        max_len = int(self.w * opt_len)
-        
-        # Detour of 2 steps within the suboptimality bound
-        if opt_len >= 2 and opt_len + 2 <= max_len:
-            u = opt_path[0]
-            v = opt_path[1]
-            reachable = passable | {start, target}
-            for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
-                s = Position(u.x + dx, u.y + dy)
-                if s != u and s != v and s in reachable:
-                    if abs(s.x - v.x) + abs(s.y - v.y) == 1:
-                        return [u, s] + opt_path[1:]
-        return opt_path
-
-    def _path_to_actions(self, start: Position, path: list[Position]) -> list[Action]:
-        actions = []
-        curr = start
-        for next_pos in path[1:]:
-            if next_pos.x > curr.x:
-                actions.append(Action.RIGHT)
-            elif next_pos.y > curr.y:
-                actions.append(Action.DOWN)
-            elif next_pos.x < curr.x:
-                actions.append(Action.LEFT)
-            elif next_pos.y < curr.y:
-                actions.append(Action.UP)
-            else:
-                actions.append(Action.WAIT)
-            curr = next_pos
-        return actions
+    return results
 
 
-class MStarExplorer:
-    """M* explorer implementing StrategyInterface.
+def default_start_positions(
+    grid: Grid,
+    num_agents: int,
+    anchor: Position = Position(0, 0),
+) -> dict[str, Position]:
+    """Choose deterministic, reachable, non-target starts for a multi-agent run."""
+    if num_agents <= 0:
+        raise ValueError("num_agents must be positive")
+    if not grid.is_valid_position(anchor):
+        raise ValueError("anchor must be a valid grid position")
 
-    Centralized/Hybrid optimal MAPF. Dynamically scales search space
-    dimensionality based on conflict density to find paths.
-    """
+    targets = grid.target_a_positions | grid.target_b_positions
+    reachable = _reachable_positions(grid, anchor)
+    preferred = (
+        anchor,
+        Position(grid.width - 1, grid.height - 1),
+        Position(grid.width - 1, 0),
+        Position(0, grid.height - 1),
+    )
+    ordered: list[Position] = []
+    for position in preferred + tuple(sorted(reachable, key=lambda pos: (pos.y, pos.x))):
+        if position in ordered or position not in reachable or position in targets:
+            continue
+        ordered.append(position)
 
-    def __init__(self, seed: int | None = 42) -> None:
-        self._rng = random.Random(seed)
-        self._visited: dict[str, set[Position]] = {}
-        self._path_buffer: dict[str, list[Action]] = {}
-        self._known_obstacles: dict[str, set[Position]] = {}
+    if len(ordered) < num_agents:
+        raise ValueError("not enough reachable free cells for all agents")
 
-    def select_action(
-        self,
-        agent_id: str,
-        state: LearningState,
-        valid_actions: tuple[Action, ...],
-    ) -> Action:
-        """Return the next M* action for *agent_id*."""
-        visited = self._visited_for(agent_id)
-        pos = state.agent_position
-        visited.add(pos)
+    return {
+        f"agent-{index}": ordered[index]
+        for index in range(num_agents)
+    }
 
-        obs = self._obstacles_for(agent_id)
-        obs.update(state.visible_obstacles)
 
-        moveable = [a for a in valid_actions if a != Action.WAIT]
-        if not moveable:
-            return Action.WAIT
+def _state_from_observation(
+    agent_id: str,
+    observation: Observation,
+    sensor: CentralSensor,
+    grid: Grid,
+    rescued: set[Position],
+    steps_taken: int,
+) -> LearningState:
+    discovered_targets = sensor.discovered_targets
+    discovered_a = frozenset(
+        position
+        for position, target_type in discovered_targets.items()
+        if target_type == "A"
+    )
+    discovered_b = frozenset(
+        position
+        for position, target_type in discovered_targets.items()
+        if target_type == "B"
+    )
+    visible_a = frozenset(
+        position
+        for position, target_type in observation.target_types.items()
+        if target_type == "A"
+    )
+    visible_b = frozenset(
+        position
+        for position, target_type in observation.target_types.items()
+        if target_type == "B"
+    )
+    rescued_a = frozenset(position for position in rescued if position in grid.target_a_positions)
+    rescued_b = frozenset(position for position in rescued if position in grid.target_b_positions)
 
-        buf = self._buffer_for(agent_id)
+    return LearningState(
+        agent_id=agent_id,
+        agent_position=observation.agent_position,
+        visible_cells=observation.visible_cells,
+        visible_obstacles=observation.obstacles,
+        visible_target_a_positions=visible_a,
+        visible_target_b_positions=visible_b,
+        discovered_cells=sensor.discovered_cells,
+        discovered_target_a_positions=discovered_a,
+        discovered_target_b_positions=discovered_b,
+        rescued_target_a_positions=rescued_a,
+        rescued_target_b_positions=rescued_b,
+        remaining_target_a_positions=grid.target_a_positions - rescued_a,
+        remaining_target_b_positions=grid.target_b_positions - rescued_b,
+        steps_taken=steps_taken,
+    )
 
-        while buf:
-            action = buf[0]
-            if action in valid_actions:
-                buf.pop(0)
-                return action
-            buf.clear()
-            break
 
-        targets = sorted(
-            list(
-                state.visible_target_a_positions
-                | state.visible_target_b_positions
-                | state.remaining_target_a_positions
-                | state.remaining_target_b_positions
-            ),
-            key=lambda t: abs(t.x - pos.x) + abs(t.y - pos.y)
-        )
+def _valid_actions(
+    movement: MovementModel,
+    grid: Grid,
+    position: Position,
+) -> tuple[Action, ...]:
+    actions: list[Action] = []
+    for move in movement.allowed_moves(grid, position):
+        try:
+            actions.append(Action(move))
+        except ValueError:
+            continue
+    return tuple(actions) or (Action.WAIT,)
 
-        path = []
-        passable = set(state.discovered_cells) - obs
 
-        for target in targets:
-            path = self._bfs_navigate_mstar(pos, target, passable)
-            if path:
-                break
+def _validate_start_positions(grid: Grid, start_positions: Mapping[str, Position]) -> None:
+    seen: set[Position] = set()
+    targets = grid.target_a_positions | grid.target_b_positions
 
-        if path:
-            actions = self._path_to_actions(pos, path)
-            if actions:
-                buf.extend(actions[1:])
-                return actions[0]
+    for agent_id, position in start_positions.items():
+        if not grid.is_valid_position(position):
+            raise ValueError(f"invalid start position for {agent_id}")
+        if position in targets:
+            raise ValueError(f"start position for {agent_id} overlaps a target")
+        if position in seen:
+            raise ValueError("agent start positions must be unique")
+        seen.add(position)
 
-        return self._rng.choice(moveable)
 
-    def update(self, transition: Transition) -> None:
-        """No-op: the M* baseline never updates from experience."""
-        pass
+def _resolve_movements(
+    movement: MovementModel,
+    grid: Grid,
+    positions: Mapping[str, Position],
+    actions: Mapping[str, Action],
+) -> tuple[dict[str, MovementResult], int]:
+    current_positions = set(positions.values())
+    reserved_positions: set[Position] = set()
+    movements: dict[str, MovementResult] = {}
+    collisions = 0
 
-    def run_episode(
-        self,
-        env: EnvironmentInterface,
-        max_steps: int = 500,
-        total_cells: int | None = None,
-    ) -> BaselineMetrics:
-        """Convenience wrapper around the module-level :func:`run_episode`."""
-        return run_episode(self, env, max_steps, total_cells)
+    for agent_id in sorted(positions):
+        action = actions[agent_id]
+        result = movement.apply(grid, positions[agent_id], action.value)
+        wants_occupied_cell = result.end in current_positions and result.end != positions[agent_id]
+        wants_reserved_cell = result.end in reserved_positions
 
-    def _visited_for(self, agent_id: str) -> set[Position]:
-        if agent_id not in self._visited:
-            self._visited[agent_id] = set()
-        return self._visited[agent_id]
+        if result.moved and (wants_occupied_cell or wants_reserved_cell):
+            collisions += 1
+            result = MovementResult(
+                start=positions[agent_id],
+                requested=result.requested,
+                end=positions[agent_id],
+                move=action.value,
+                moved=False,
+                reason="collision",
+            )
 
-    def _buffer_for(self, agent_id: str) -> list[Action]:
-        if agent_id not in self._path_buffer:
-            self._path_buffer[agent_id] = []
-        return self._path_buffer[agent_id]
+        movements[agent_id] = result
+        reserved_positions.add(result.end)
 
-    def _obstacles_for(self, agent_id: str) -> set[Position]:
-        if agent_id not in self._known_obstacles:
-            self._known_obstacles[agent_id] = set()
-        return self._known_obstacles[agent_id]
+    return movements, collisions
 
-    def _bfs_navigate_mstar(
-        self,
-        start: Position,
-        target: Position,
-        passable: set[Position],
-    ) -> list[Position]:
-        if start == target:
-            return [start]
-        queue: deque[tuple[Position, list[Position]]] = deque([(start, [start])])
-        seen: set[Position] = {start}
-        reachable = passable | {start, target}
-        while queue:
-            pos, path = queue.popleft()
-            # M* subdimensional ordering: LEFT -> UP -> RIGHT -> DOWN
-            for dx, dy in ((-1, 0), (0, -1), (1, 0), (0, 1)):
-                npos = Position(pos.x + dx, pos.y + dy)
-                if npos == target:
-                    return path + [npos]
-                if npos not in seen and npos in reachable:
-                    seen.add(npos)
-                    queue.append((npos, path + [npos]))
-        return []
 
-    def _path_to_actions(self, start: Position, path: list[Position]) -> list[Action]:
-        actions = []
-        curr = start
-        for next_pos in path[1:]:
-            if next_pos.x > curr.x:
-                actions.append(Action.RIGHT)
-            elif next_pos.y > curr.y:
-                actions.append(Action.DOWN)
-            elif next_pos.x < curr.x:
-                actions.append(Action.LEFT)
-            elif next_pos.y < curr.y:
-                actions.append(Action.UP)
-            else:
-                actions.append(Action.WAIT)
-            curr = next_pos
-        return actions
+def _reachable_positions(grid: Grid, start: Position) -> set[Position]:
+    queue: deque[Position] = deque([start])
+    seen = {start}
+
+    while queue:
+        position = queue.popleft()
+        for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+            neighbor = Position(position.x + dx, position.y + dy)
+            if neighbor in seen or not grid.is_valid_position(neighbor):
+                continue
+            seen.add(neighbor)
+            queue.append(neighbor)
+
+    return seen
+
+
+def _clear_strategy_state(strategy: StrategyInterface) -> None:
+    clear = getattr(strategy, "clear_reservations", None)
+    if callable(clear):
+        clear()

@@ -13,7 +13,7 @@ from rescue_sim.environment.generator import generate_grid
 from rescue_sim.environment.grid import Grid, Position
 from rescue_sim.environment.movement import MovementModel
 from rescue_sim.environment.sensors import CentralSensor
-from rescue_sim.Qlearning.multi_agent_baseline import (
+from rescue_sim.Qlearning.baseline import (
     DEFAULT_MULTI_AGENT_BASELINES,
     default_start_positions,
     run_multi_agent_baseline,
