@@ -89,9 +89,15 @@ class SharedFeatureEncoder(nn.Module):
     def forward(self, obs: torch.Tensor, peer_count: torch.Tensor) -> torch.Tensor:
         batch_size = obs.size(0)
         
-        # Split spatial window and flat meta slices
-        window = obs[:, :self.window_dim].view(batch_size, self.win, self.win, self.channels)
-        window = window.permute(0, 3, 1, 2)  # [Batch, Channels, Height, Width]
+        # --- Spatial window extraction ---
+        # Upstream channels-LAST layout: [H, W, C] → [H*W*C].
+        # Reconstruct and convert to channels-first for Conv2d.
+        window = (
+            obs[:, :self.window_dim]
+            .reshape(batch_size, self.win, self.win, self.channels)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )  # [Batch, C=4, H=win, W=win]
         meta = obs[:, self.window_dim:]
         
         h_spatial = self.conv(window)

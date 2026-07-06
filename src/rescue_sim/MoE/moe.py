@@ -90,11 +90,20 @@ class SharedFeatureEncoder(nn.Module):
         """
         batch_size = obs.size(0)
         
-        # Slice spatial window and reshape to [Batch, Channels, Height, Width]
-        window = obs[:, :self.window_dim].view(batch_size, self.win, self.win, self.channels)
-        window = window.permute(0, 3, 1, 2)  # [Batch, Channels, Height, Width]
-        
-        # Slice meta features and agent ID
+        # --- Spatial window extraction ---
+        # Upstream serialization (RescueEnv._agent_obs) stacks 4 channels via
+        # np.stack([blocked, target_a, target_b, other], axis=-1).reshape(-1),
+        # producing a flattened channels-LAST layout: [H, W, C] → [H*W*C].
+        # We reconstruct the spatial tensor and convert to channels-first for
+        # Conv2d in a single contiguous operation.
+        window = (
+            obs[:, :self.window_dim]
+            .reshape(batch_size, self.win, self.win, self.channels)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )  # [Batch, C=4, H=win, W=win]
+
+        # Slice meta features (scalars + agent one-hot ID)
         meta = obs[:, self.window_dim:]
         
         # Forward pass on spatial and meta layers
