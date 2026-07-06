@@ -1,41 +1,81 @@
-# Rescue Sim
+# 🚨 Rescue Sim — Multi-Agent Rescue Intelligence Platform
 
-Python simulator for the Multi-Agent Rescue Teams project.
+> **Neural Mixture-of-Experts for cooperative MARL disaster response** — from tabular baselines to attention-gated deep coordination with GRU temporal memory.
 
-The project goal is to build a damaged-area rescue simulation where agents can
-explore an environment, detect rescue targets, communicate observations, and
-improve rescue strategies over time.
+[![Python 3.12+](https://img.shields.io/badge/Python-3.12+-blue.svg)](https://python.org)
+[![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/Tests-198%20passing-brightgreen.svg)](#test-and-lint)
+[![CPU Training](https://img.shields.io/badge/GPU-Not%20Required-orange.svg)](#technology)
+
+---
+
+## ⚡ 1-Minute Quick Start
+
+```bash
+# Clone the repository
+git clone https://collaborating.tuhh.de/e16/courses/software-development/ss26/group05.git
+cd group05
+
+# Option A: Docker (recommended — zero setup)
+docker compose up --build viz
+# Open http://localhost:8000/app in your browser
+
+# Option B: Local install
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+python demo_moe.py            # Run the full MoE dashboard demonstration
+pytest                         # Verify all 198 tests pass
+```
+
+---
+
+## 🔍 The Core Problem: Partial Observability Under Communication Blackout
+
+Each agent operates within a **3-block visibility radius** — a 7×7 ego-centric observation window.  When agents drift beyond communication range (Manhattan distance ≥ 3), they enter **blackout** and must rely on temporal memory to avoid blind looping.
+
+```
+    3-BLOCK BLINDNESS CONSTRAINT              COMMUNICATION BLACKOUT RULES
+    (7x7 Ego-Centric Window)                  (Manhattan Distance Threshold)
+
+     . . . . . . . . . . .                   Agent A ◄──── d=2 ────► Agent B
+     . . . . . . . . . . .                        (CONNECTED: d < 3)
+     . . ┌───────────┐ . .                        Peer count = 2
+     . . │ . . . . . │ . .                        → Route to Expert 2 (Coordination)
+     . . │ . . . . . │ . .
+     . . │ . . A . . │ . .  ← Agent             Agent A ◄────── d=9 ──────► Agent B
+     . . │ . . . . . │ . .                        (BLACKOUT: d ≥ 3)
+     . . │ . . . . . │ . .                        Peer count = 1
+     . . └───────────┘ . .                        → Route to Expert 3 (GRU Fallback)
+     . . . . . . . . . . .                        → Temporal memory prevents looping
+     . . . . . . . . . . .
+
+    Agent sees ONLY the 7x7 box.             The Attention Router dynamically shifts
+    4 channels: blocked, target-A,           gating weights based on real-time
+    target-B, other-agent.                   peer visibility via scaled dot-product
+    Everything outside = unknown.            attention over peer latent embeddings.
+```
+
+---
 
 ## Project Status
 
-The simulator foundation (Sprint 2) is complete, and every planned learning
-strategy is implemented and tested:
+The simulator foundation is complete, and every planned learning strategy is implemented and tested:
 
-- **Classical baselines** (no learning) — frontier/DFS exploration plus the MAPF
-  planners (prioritized planning, CBS, ICBS, ECBS, M\*), runnable single-agent
-  **and** as a synchronized multi-agent team.
-- **Tabular RL** — single-agent Q-learning and a decentralized
-  **Epidemic Hysteretic Q-Learning** fleet with peer-to-peer gossip.
-- **Deep MARL (CTDE)** — MAPPO, QMIX, and TransfQMix, plus a **ValueEnsemble**
-  and a distilled student that combine the two value methods.
-- **Mixture-of-Experts** — a performance gate that lets the adaptive tabular
-  fleet take over from the frozen deep ensemble once it solves a grid better.
+- **Classical baselines** (no learning) — frontier/DFS exploration plus the MAPF planners (prioritized planning, CBS, ICBS, ECBS, M\*), runnable single-agent **and** as a synchronized multi-agent team.
+- **Tabular RL** — single-agent Q-learning and a decentralized **Epidemic Hysteretic Q-Learning** fleet with peer-to-peer gossip.
+- **Deep MARL (CTDE)** — MAPPO, QMIX, and TransfQMix, plus a **ValueEnsemble** and a distilled student that combine the two value methods.
+- **Mixture-of-Experts** — attention-gated routing across three specialized expert heads with GRU-based temporal fallback under communication blackout.
 
 The whole test suite is green and every method trains on a normal CPU.
 
 > **Legacy note.** Anything tied to the original *single-agent* flow
-> (`QLearningAgent`, `agents.SingleAgent`, the single-agent evaluation path) is
-> kept but **marked legacy** — superseded by the multi-agent line-up above. The
-> visualization **API and React frontend still drive that legacy single-agent
-> demo**; wiring them to the multi-agent models / the MoE is a separate
-> workstream for the API/frontend developer, so the live UI may not exercise the
-> new methods yet. The Python library, training scripts, and tests are the
-> source of truth for the multi-agent work.
+> (`QLearningAgent`, the single-agent evaluation path) is kept but **marked legacy** — superseded by the multi-agent line-up above. The visualization **API and React frontend still drive that legacy single-agent demo**; wiring them to the multi-agent models / the MoE is a separate workstream for the API/frontend developer, so the live UI may not exercise the new methods yet. The Python library, training scripts, and tests are the source of truth for the multi-agent work.
 
 Architecture documents:
 
 - [Architecture Design](docs/architecture.md)
 - [Requirements Specifications](docs/requirements.yaml)
+
 
 ## Current Scope
 
@@ -91,7 +131,6 @@ Main dependencies are declared in [pyproject.toml](pyproject.toml):
 |   `-- train_moe.py           # Mixture-of-Experts: deep ensemble vs. adaptive fleet
 |-- src/rescue_sim/
 |   |-- shared.py              # Project contract + shared deep-RL helpers
-|   |-- agents/                # Single-agent state and policy logic
 |   |-- config/                # YAML loading and typed settings
 |   |-- environment/           # Grid, generation, movement, sensing
 |   |-- Qlearning/             # Tabular: baselines, single-agent Q, Epidemic fleet,
@@ -100,7 +139,7 @@ Main dependencies are declared in [pyproject.toml](pyproject.toml):
 |   |-- QMIX/                  # QMIX (monotonic value decomposition, CTDE)
 |   |-- TransfQMix/            # TransfQMix (transformer value decomposition, CTDE)
 |   |-- Ensemble/              # ValueEnsemble + distillation of QMIX + TransfQMix
-|   |-- MoE/                   # Mixture-of-Experts gate (deep ensemble vs. fleet)
+|   |-- MoE/                   # Neural MoE: attention router + GRU fallback + CTDE experts
 |   |-- simulation/            # Simulation runner, evaluation, metrics
 |   `-- visualization/         # FastAPI backend + React frontend
 `-- tests/                     # Unit and integration tests
@@ -673,9 +712,6 @@ as a leaderboard, then letting the adaptive fleet climb it:
 
 - [Architecture](docs/architecture.md)
 - [Requirements](docs/requirements.yaml)
-- [Product Backlog](docs/product_backlog.md) ([PDF version](docs/product_backlog.pdf))
-- [Sprint 2 Backlog](docs/sprints/sprint_2.md) ([PDF version](docs/sprints/sprint_2.pdf))
-- [Sprint 3 Backlog](docs/sprints/sprint_3.md) ([PDF version](docs/sprints/sprint_3.pdf))
 
 ## Configuration
 
