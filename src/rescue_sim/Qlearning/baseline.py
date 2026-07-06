@@ -6,25 +6,18 @@ and producing the same BaselineMetrics output so they can be swapped directly.
 BaselineExplorer — Frontier greedy
     Scores every candidate cell locally and always picks the best one:
     +2 for an unvisited cell, +1 if the cell is on the frontier of the known
-    map (adjacent to undiscovered territory).  Ties are broken by a fixed
-    action-priority order, then by a seeded RNG.  Tends to spread outward
+    map (adjacent to undiscovered territory). Ties are broken by a fixed
+    action-priority order, then by a seeded RNG. Tends to spread outward
     evenly, giving fast area coverage.
 
-DFSExplorer — Depth-First Search
-    Maintains a per-agent LIFO stack.  Each time the agent arrives at a new
-    cell it pushes all reachable unvisited neighbours; it then always
-    navigates to the top of the stack, going deep along one branch before
-    backtracking.  Uses BFS over the accumulated known-passable map to
-    navigate to non-adjacent stack targets.  Tends to explore long corridors
-    fully before returning to explore sibling branches.
+CBSExplorer — Conflict-Based Search
+    Optimal centralized MAPF algorithm. Plans optimal paths for each agent
+    and resolves collision conflicts using a constraint tree.
 
 Shared utilities
     BaselineMetrics — frozen dataclass with the per-episode summary.
     run_episode()   — module-level helper used by both explorers so the
                       loop is written exactly once.
-
-Per-agent internal state is always keyed by agent_id so both strategies
-work correctly in multi-agent scenarios without assuming id == "0".
 """
 
 from __future__ import annotations
@@ -95,7 +88,7 @@ def run_episode(
     ----------
     strategy:
         Any object implementing ``select_action`` and ``update``
-        (i.e. BaselineExplorer or DFSExplorer).
+        (i.e. BaselineExplorer or CBSExplorer).
     env:
         Environment conforming to EnvironmentInterface.
     max_steps:
@@ -279,7 +272,7 @@ class BaselineExplorer:
 
 
 # ---------------------------------------------------------------------------
-# Strategy 2 — Depth-First Search (DFSExplorer)
+# Strategy 2 — Conflict-Based Search (CBSExplorer)
 # ---------------------------------------------------------------------------
 
 class CBSExplorer:

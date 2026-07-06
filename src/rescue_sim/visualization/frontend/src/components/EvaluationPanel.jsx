@@ -1,12 +1,7 @@
 const SAME_GRID = [
   ['epidemic_hysteretic_q', 'Q-learning gossip', 'Multi-agent Q-learning with nearby-agent gossip.'],
   ['frontier', 'Baseline', 'Greedy frontier exploration.'],
-  ['dfs', 'Baseline', 'Depth-first exploration.'],
-  ['prioritized_planning', 'Baseline', 'Sequential multi-agent path planner.'],
   ['cbs', 'Baseline', 'Conflict-Based Search planner.'],
-  ['icbs', 'Baseline', 'Improved CBS planner.'],
-  ['ecbs', 'Baseline', 'Bounded-suboptimal CBS planner.'],
-  ['mstar', 'Baseline', 'Coupled multi-agent path planner.'],
   ['trained', 'Legacy Q-learning', 'Legacy tabular comparator.'],
 ];
 
