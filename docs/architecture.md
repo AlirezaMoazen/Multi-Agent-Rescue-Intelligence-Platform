@@ -1,119 +1,78 @@
-# Architecture
+# Architecture — Multi-Agent Rescue Swarm Simulator
 
-This document describes the architecture for the Multi-Agent Rescue Teams
-simulator. The current focus is Sprint 2: the damaged-area simulator foundation.
+This document describes the design architecture for the Multi-Agent Rescue Teams simulator, incorporating the Neural Mixture of Experts (MoE) swarm design and reinforcement learning baselines.
 
-## Goal
+---
 
-The system simulates a damaged rescue area where agents can move, observe nearby
-cells, detect targets, communicate information, and later improve rescue
-strategies through learning methods.
+## System Design Paradigm
 
-The architecture is built incrementally:
+The simulator operates under the **Centralized Training, Decentralized Execution (CTDE)** paradigm:
+1. **Centralized Training**: Value-based and policy-gradient algorithms (QMIX, TransfQMix, MAPPO) access joint observations and rewards during training to optimize the parameters of the actor and critic networks.
+2. **Decentralized Execution**: During runtime, each agent acts independently, using only its local egocentric observations (a 7x7 spatial window corresponding to a 3-block visibility range) to sample actions:
+   $$\pi_i(a_i \mid o_i) = \text{Softmax}(y_i^{\text{masked}})$$
 
-1. damaged-area grid simulator
-2. single-agent exploration and learning
-3. multi-agent coordination
-4. distributed learning and uncertainty
-5. graphical/demo improvements
+---
 
-## Package Structure
+## Package Directory Structure
 
 ```text
 src/rescue_sim/
-|-- agents/          # Agent state, policies, and decision logic
-|-- config/          # Scenario and simulation settings
-|-- environment/     # Grid, obstacles, targets, movement, and sensing
-|-- learning/        # Strategy optimization and reinforcement learning
-|-- simulation/      # Scenario execution, run state, and metrics
-`-- visualization/   # Rendering and plotting helpers
+├── MoE/                # Neural Mixture of Experts (MoE) framework
+│   ├── __init__.py     # Package exports
+│   └── moe.py          # Dual-Encoder step-level policy implementation
+├── MAPPO/              # Multi-Agent PPO training and policy modules
+├── QMIX/               # Multi-Agent Value Factorization QMIX / TransfQMix
+├── Qlearning/          # Tabular Hysteretic Q-learning and heuristic explorers
+│   ├── __init__.py     # Package exports
+│   └── baseline.py     # Greedy Frontier and CBS baseline planners
+├── config/             # YAML config loader and settings classes
+├── environment/        # Spatial grid, obstacle generator, and sensor models
+├── simulation/         # Execution runners and metric collection
+└── visualization/      # Dynamic evaluation charts and web rendering api
 ```
 
-## Main Components
+---
 
-### Environment
+## Mixture of Experts (MoE) Architecture
 
-The environment represents a rescue scenario as a grid. It owns the static map
-data:
-
-- grid width and height
-- blocked cells and walls
-- obstacle positions
-- Target A positions
-- Target B positions
-
-The first implementation uses deterministic movement. A move is valid only when
-the destination is inside the grid and not blocked by an obstacle.
-
-### Scenario Generator
-
-The generator creates reproducible scenarios from configuration values:
-
-- map size
-- obstacle probability
-- Target A count
-- Target B count
-- random seed
-- agent start position
-
-The start position is kept free of obstacles and targets.
-
-### Sensor / Observation Model
-
-The sensor model returns what an agent can observe from its current position.
-In Sprint 2, this includes nearby visible cells, obstacles, and targets. Later
-increments will extend this to other agents, communication radius, and uncertain
-sensor readings.
-
-### Agent
-
-The single agent stores its current position and sensor range. Decision logic is
-kept separate from the raw agent state so different strategies can be compared
-without changing the environment model.
-
-### Learning and Strategy
-
-The `learning` package contains exploration strategies. The first milestone is a
-deterministic baseline explorer. Later milestones can add reinforcement learning
-methods and compare them against the baseline.
-
-### Simulation Runner
-
-The simulation runner coordinates one scenario:
-
-1. Load configuration.
-2. Generate the grid.
-3. Place the agent.
-4. Repeatedly collect observations.
-5. Ask the strategy for the next action.
-6. Apply movement.
-7. Record metrics until all targets are found or `max_steps` is reached.
-
-## Data Flow
+To handle communication disruptions, a **Neural MoE** is deployed to blend predictions from three specialized offline-distilled experts:
 
 ```text
-Configuration
-     |
-     v
-Scenario Generator --> Grid Environment
-     |                      |
-     v                      v
-Single Agent --------> Sensor Model
-     |                      |
-     v                      v
-Strategy / Learning --> Next Action
-     |
-     v
-Simulation Runner --> Metrics / Results
+                               +----------------------------+
+                               |     Local Agent Obs o_i    |
+                               +--------------+-------------+
+                                              |
+                                       z = Encoder(o_i)
+                                              |
+                       +----------------------+----------------------+
+                       |                      |                      |
+                       v                      v                      v
+                +──────────────+       +──────────────+       +──────────────+
+                |   Expert 1   |       |   Expert 2   |       |   Expert 3   |
+                | (Exploration |       | (Coordination|       |  (Fallback   |
+                |  Heuristic)  |       |  QMIX/MAPPO) |       |  Hysteretic) |
+                +──────┬───────+       +──────┬───────+       +──────┬───────+
+                       | y_exp0               | y_exp1               | y_exp2
+                       |                      |                      |
+                       +----------------------+----------------------+
+                                              |
+                                              v
+                              y_final = sum(g_j * y_exp_j)
+                                              |
+                                              v
+                                     [Action Selection]
 ```
 
-## Testing Strategy
+### 1. Dual-Encoder Topology
+To prevent representational drift, the MoE separates feature extraction:
+* `expert_encoder`: Extracted features feed the expert heads. Frozen during Stage 2.
+* `router_encoder`: Extracted features feed the gating router. Trainable during Stage 2.
 
-Tests should be added close to the behavior they protect:
+### 2. Expert Allocations
+* **Expert 1 (Exploration)**: Distilled from the greedy `BaselineExplorer` to maximize area coverage.
+* **Expert 2 (Coordination)**: Distilled from the team's decentralized `QMIX` or `MAPPO` algorithms to coordinate collision-free paths.
+* **Expert 3 (Fallback)**: Distilled from decentralized `Epidemic Hysteretic Q-learning` to handle isolated movement.
 
-- environment generation keeps start cells valid
-- movement rejects blocked or out-of-bounds cells
-- sensor observations match visible nearby cells
-- runner stops when all targets are found
-- baseline strategy produces deterministic results for fixed seeds
-
+### 3. Gating Router
+A single linear layer maps the `router_encoder` embedding to 3 gating probabilities using Softmax. Under blackouts ($d \ge 3$), a **Conditional Indicator Mask Penalty** forces the weights to favor the fallback expert:
+$$\mathcal{L}_{\text{penalty}} = \lambda \cdot \mathbb{I}(\text{peer\_count} == 1.0) \cdot (1.0 - g_{\text{fallback}})^2$$
