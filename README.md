@@ -32,11 +32,10 @@ The whole test suite is green and every method trains on a normal CPU.
 > new methods yet. The Python library, training scripts, and tests are the
 > source of truth for the multi-agent work.
 
-Planning documents:
+Architecture documents:
 
-- [Product Backlog](docs/product_backlog.md) ([PDF version](docs/product_backlog.pdf))
-- [Sprint 2 Backlog](docs/sprints/sprint_2.md) ([PDF version](docs/sprints/sprint_2.pdf))
-- [Sprint 3 Backlog](docs/sprints/sprint_3.md) ([PDF version](docs/sprints/sprint_3.pdf))
+- [Architecture Design](docs/architecture.md)
+- [Requirements Specifications](docs/requirements.yaml)
 
 ## Current Scope
 
@@ -809,5 +808,13 @@ To check the codebase with Ruff:
 ```bash
 docker compose run --rm lint
 ```
+
+## License & Academic Attribution
+
+This project is licensed under the Apache License, Version 2.0. See the [LICENSE](LICENSE) file for the full license text.
+
+* **Author**: Alireza Moazen ([alirezamoazen.com](http://alirezamoazen.com))
+* **Institution**: Developed within Group 5 at the Hamburg University of Technology (TUHH)
+* **Academic Supervision**: Prof. Dr. Rainer Marrone
 
 

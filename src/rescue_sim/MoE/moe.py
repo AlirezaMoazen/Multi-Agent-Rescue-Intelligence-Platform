@@ -1,3 +1,10 @@
+# Copyright 2026 Alireza Moazen (alirezamoazen.com)
+# Licensed under the Apache License, Version 2.0 (the "License");
+# Developed within Group 5 at the Hamburg University of Technology (TUHH)
+# Under the academic supervision of Prof. Dr. Rainer Marrone.
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+
 from __future__ import annotations
 
 import random
