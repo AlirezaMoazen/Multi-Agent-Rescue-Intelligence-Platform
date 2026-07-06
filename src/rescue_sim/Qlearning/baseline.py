@@ -84,7 +84,7 @@ class BaselineMetrics:
 # ---------------------------------------------------------------------------
 
 def run_episode(
-    strategy: BaselineExplorer | DFSExplorer,
+    strategy: StrategyInterface,
     env: EnvironmentInterface,
     max_steps: int = 500,
     total_cells: int | None = None,

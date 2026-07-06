@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 import random
-from typing import Dict, List, Tuple
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
-from rescue_sim.shared import Action, Position
 
 
 class SharedFeatureEncoder(nn.Module):
@@ -198,14 +194,14 @@ class NeuralMoEPolicy(nn.Module):
             y_final: [Batch_Size, Num_Agents, action_dim] blended action logits with invalid action masking.
             weights: [Batch_Size, Num_Agents, 3] expert allocation weights.
         """
-        B, A, O = obs.shape
+        B, A, obs_dim = obs.shape
         assert A == self.num_agents, f"Expected {self.num_agents} agents, got {A}"
         
         # Standardize peer matrix to get pooled permutation-invariant peer count
         peer_count = torch.sum(peer_matrix, dim=-1, keepdim=True)  # [B, A, 1]
         
         # Flatten first two dimensions for spatial encoder processing
-        obs_flat = obs.view(B * A, O)
+        obs_flat = obs.view(B * A, obs_dim)
         peer_count_flat = peer_count.view(B * A, 1)
         
         # Feature extraction from the frozen expert brain (no-grad offline)
@@ -331,10 +327,10 @@ def distill_expert_heads(
                 peer_matrix_batch = torch.stack([b[1] for b in batch])  # [B, A, A]
                 act_batch = torch.stack([b[2] for b in batch])          # [B, A]
                 
-                B, A, O = obs_batch.shape
+                B, A, obs_dim = obs_batch.shape
                 peer_count = torch.sum(peer_matrix_batch, dim=-1, keepdim=True)  # [B, A, 1]
                 
-                obs_flat = obs_batch.view(B * A, O)
+                obs_flat = obs_batch.view(B * A, obs_dim)
                 peer_count_flat = peer_count.view(B * A, 1)
                 act_flat = act_batch.view(B * A).long()
                 

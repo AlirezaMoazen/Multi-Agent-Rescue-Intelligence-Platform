@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 import numpy as np
 import torch
-import torch.nn as nn
 
 pytest.importorskip("torch")
 
