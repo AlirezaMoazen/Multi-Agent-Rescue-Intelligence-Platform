@@ -24,7 +24,7 @@ from torch import nn
 from torch.distributions import Categorical
 
 from rescue_sim.config.settings import MappoSettings
-from rescue_sim.shared import RunningMeanStd, orthogonal_init
+from rescue_sim.shared import RunningMeanStd, orthogonal_init, resolve_device
 from rescue_sim.MAPPO.environment import RescueEnv
 
 
@@ -68,12 +68,20 @@ class ActorCritic(nn.Module):
 class MAPPO:
     """Collects rollouts from a RescueEnv and trains a shared actor-critic."""
 
-    def __init__(self, env: RescueEnv, settings: MappoSettings = MappoSettings()) -> None:
+    def __init__(
+        self,
+        env: RescueEnv,
+        settings: MappoSettings = MappoSettings(),
+        device: str | None = None,
+    ) -> None:
         self.env = env
         self.cfg = settings
         if settings.random_seed is not None:
             torch.manual_seed(settings.random_seed)
-        self.net = ActorCritic(env.obs_dim, env.state_dim, env.n_actions, settings.hidden_dim)
+        self.device = resolve_device(device)
+        self.net = ActorCritic(
+            env.obs_dim, env.state_dim, env.n_actions, settings.hidden_dim
+        ).to(self.device)
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=settings.learning_rate)
         self.value_norm = RunningMeanStd() if settings.normalize_value else None
 
@@ -102,6 +110,7 @@ class MAPPO:
         """Load weights into an already-created MAPPO trainer."""
         checkpoint = torch.load(Path(path), map_location="cpu")
         self.net.load_state_dict(checkpoint["network"])
+        self.net.to(self.device)
         if "optimizer" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
         stats = checkpoint.get("value_norm")
@@ -120,14 +129,14 @@ class MAPPO:
         episodes: list[dict] = []
 
         for _ in range(cfg.rollout_steps):
-            obs_t = torch.as_tensor(obs)
-            mask_t = torch.as_tensor(self.env.valid_action_mask())
-            state_t = torch.as_tensor(self.env.global_state())
+            obs_t = torch.as_tensor(obs).to(self.device)
+            mask_t = torch.as_tensor(self.env.valid_action_mask()).to(self.device)
+            state_t = torch.as_tensor(self.env.global_state()).to(self.device)
             action, logp = self.net.act(obs_t, mask_t)
             # Rollout values are constants for GAE / value-clipping -> detach.
             value = self.net.value(state_t).detach()
 
-            next_obs, reward, done, info = self.env.step(action.numpy())
+            next_obs, reward, done, info = self.env.step(action.cpu().numpy())
 
             buf_obs.append(obs_t)
             buf_mask.append(mask_t)
@@ -144,7 +153,9 @@ class MAPPO:
                 obs = self.env.reset()
 
         # Bootstrap value of the final state for GAE.
-        last_value = self.net.value(torch.as_tensor(self.env.global_state())).detach()
+        last_value = self.net.value(
+            torch.as_tensor(self.env.global_state()).to(self.device)
+        ).detach()
         rollout = {
             "obs": torch.stack(buf_obs),                       # (T, n, obs)
             "mask": torch.stack(buf_mask),                     # (T, n, A)
@@ -152,8 +163,8 @@ class MAPPO:
             "logp": torch.stack(buf_logp),                     # (T, n)
             "state": torch.stack(buf_state),                   # (T, state)
             "val": torch.stack(buf_val),                       # (T,)
-            "rew": torch.as_tensor(buf_rew, dtype=torch.float32),   # (T,)
-            "done": torch.as_tensor(buf_done, dtype=torch.float32), # (T,)
+            "rew": torch.as_tensor(buf_rew, dtype=torch.float32).to(self.device),   # (T,)
+            "done": torch.as_tensor(buf_done, dtype=torch.float32).to(self.device), # (T,)
             "last_value": last_value,
         }
         return rollout, episodes
@@ -220,8 +231,18 @@ class MAPPO:
             stats["entropy"] = float(entropy.mean().detach())
         return stats
 
-    def train(self, num_updates: int, log_every: int = 1) -> list[dict]:
-        """Run `num_updates` rollout+update cycles; returns per-update metrics."""
+    def train(
+        self,
+        num_updates: int,
+        log_every: int = 1,
+        eval_hook=None,
+        hook_every: int = 0,
+    ) -> list[dict]:
+        """Run `num_updates` rollout+update cycles; returns per-update metrics.
+
+        ``eval_hook`` (called every ``hook_every`` updates) may return True to
+        stop training early (e.g. on a wall-clock budget).
+        """
         history: list[dict] = []
         for update in range(1, num_updates + 1):
             rollout, episodes = self._collect()
@@ -242,6 +263,9 @@ class MAPPO:
                     f"| success {success:5.2f} | rescued {rescued:4.1f} "
                     f"| pi {stats['policy_loss']:+.3f} | v {stats['value_loss']:.3f}"
                 )
+            if eval_hook and hook_every and update % hook_every == 0:
+                if eval_hook(update):
+                    break
         return history
 
     @torch.no_grad()
@@ -252,10 +276,10 @@ class MAPPO:
             obs = self.env.reset()
             done = False
             while not done:
-                mask_t = torch.as_tensor(self.env.valid_action_mask())
-                logits = self.net.actor(torch.as_tensor(obs)).masked_fill(~mask_t, -1e8)
+                mask_t = torch.as_tensor(self.env.valid_action_mask()).to(self.device)
+                logits = self.net.actor(torch.as_tensor(obs).to(self.device)).masked_fill(~mask_t, -1e8)
                 action = logits.argmax(dim=-1)
-                obs, _, done, info = self.env.step(action.numpy())
+                obs, _, done, info = self.env.step(action.cpu().numpy())
             successes.append(info["success"])
             rescued.append(info["rescued"])
             steps.append(info["steps"])

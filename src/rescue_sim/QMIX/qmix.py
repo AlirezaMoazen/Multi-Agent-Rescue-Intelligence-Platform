@@ -29,7 +29,7 @@ from torch import nn
 
 from rescue_sim.config.settings import QmixSettings
 from rescue_sim.MAPPO.environment import RescueEnv
-from rescue_sim.shared import ReplayBuffer, hard_update
+from rescue_sim.shared import ReplayBuffer, RunningMeanStd, hard_update, resolve_device
 
 
 class AgentQNet(nn.Module):
@@ -78,17 +78,23 @@ class MixingNetwork(nn.Module):
 class QMIX:
     """Trains a shared agent Q-network and a monotonic mixer on a RescueEnv."""
 
-    def __init__(self, env: RescueEnv, settings: QmixSettings = QmixSettings()) -> None:
+    def __init__(
+        self,
+        env: RescueEnv,
+        settings: QmixSettings = QmixSettings(),
+        device: str | None = None,
+    ) -> None:
         self.env = env
         self.cfg = settings
         self.rng = Random(settings.random_seed)
         if settings.random_seed is not None:
             torch.manual_seed(settings.random_seed)
 
-        self.agent = AgentQNet(env.obs_dim, env.n_actions, settings.hidden_dim)
-        self.mixer = MixingNetwork(env.num_agents, env.state_dim, settings.mixing_embed_dim)
-        self.target_agent = AgentQNet(env.obs_dim, env.n_actions, settings.hidden_dim)
-        self.target_mixer = MixingNetwork(env.num_agents, env.state_dim, settings.mixing_embed_dim)
+        self.device = resolve_device(device)
+        self.agent = AgentQNet(env.obs_dim, env.n_actions, settings.hidden_dim).to(self.device)
+        self.mixer = MixingNetwork(env.num_agents, env.state_dim, settings.mixing_embed_dim).to(self.device)
+        self.target_agent = AgentQNet(env.obs_dim, env.n_actions, settings.hidden_dim).to(self.device)
+        self.target_mixer = MixingNetwork(env.num_agents, env.state_dim, settings.mixing_embed_dim).to(self.device)
         self._sync_targets()
 
         params = list(self.agent.parameters()) + list(self.mixer.parameters())
@@ -96,14 +102,18 @@ class QMIX:
         self.buffer = ReplayBuffer(settings.buffer_size, self.rng)
         self.epsilon = settings.epsilon_start
         self.learn_steps = 0
+        # Value-target normalization (the same stabilization MAPPO uses): the
+        # team reward spans hundreds per rescue, so the mixer regresses
+        # *standardized* TD targets instead of raw-magnitude returns.
+        self.value_norm = RunningMeanStd() if settings.normalize_value else None
 
     # -- action selection ---------------------------------------------------
 
     @torch.no_grad()
     def select_actions(self, obs: np.ndarray, avail: np.ndarray, greedy: bool = False) -> np.ndarray:
-        q = self.agent(torch.as_tensor(obs).float())
-        q = q.masked_fill(~torch.as_tensor(avail), -float("inf"))
-        greedy_actions = q.argmax(dim=-1).numpy()
+        q = self.agent(torch.as_tensor(obs).float().to(self.device))
+        q = q.masked_fill(~torch.as_tensor(avail).to(self.device), -float("inf"))
+        greedy_actions = q.argmax(dim=-1).cpu().numpy()
         if greedy:
             return greedy_actions
         actions = greedy_actions.copy()
@@ -123,6 +133,13 @@ class QMIX:
         """Save model weights and training state for later visualization/API use."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        value_norm = None
+        if self.value_norm is not None:
+            value_norm = {
+                "mean": self.value_norm.mean,
+                "var": self.value_norm.var,
+                "count": self.value_norm.count,
+            }
         torch.save(
             {
                 "settings": asdict(self.cfg),
@@ -133,6 +150,7 @@ class QMIX:
                 "optimizer": self.optimizer.state_dict(),
                 "epsilon": self.epsilon,
                 "learn_steps": self.learn_steps,
+                "value_norm": value_norm,
             },
             path,
         )
@@ -148,10 +166,18 @@ class QMIX:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.epsilon = float(checkpoint.get("epsilon", self.epsilon))
         self.learn_steps = int(checkpoint.get("learn_steps", self.learn_steps))
+        stats = checkpoint.get("value_norm")
+        if self.value_norm is not None and stats is not None:
+            self.value_norm.mean = float(stats["mean"])
+            self.value_norm.var = float(stats["var"])
+            self.value_norm.count = float(stats["count"])
+        for net in (self.agent, self.mixer, self.target_agent, self.target_mixer):
+            net.to(self.device)
 
     def _learn(self) -> float:
         cfg = self.cfg
         batch = self.buffer.sample(cfg.batch_size)
+        batch = {k: v.to(self.device) for k, v in batch.items()}
 
         # Current Q_tot for the actions actually taken.
         q = self.agent(batch["obs"])                                    # (B, n, A)
@@ -169,7 +195,15 @@ class QMIX:
             else:
                 next_q = target_q.max(dim=2).values
             q_tot_next = self.target_mixer(next_q, batch["next_state"])
+            if self.value_norm is not None:
+                # The networks predict *normalized* values: unnormalize the
+                # bootstrap, build the raw Bellman target, then regress its
+                # standardized form so the loss scale stays O(1).
+                q_tot_next = q_tot_next * self.value_norm.std + self.value_norm.mean
             y = batch["reward"] + cfg.gamma * (1 - batch["done"]) * q_tot_next
+            if self.value_norm is not None:
+                self.value_norm.update(y)
+                y = (y - self.value_norm.mean) / self.value_norm.std
 
         loss = ((q_tot - y) ** 2).mean()
         self.optimizer.zero_grad()
@@ -211,8 +245,18 @@ class QMIX:
         info["loss"] = loss_sum / n_learn if n_learn else 0.0
         return info
 
-    def train(self, num_episodes: int, log_every: int = 10) -> list[dict]:
-        """Run `num_episodes` of collect+learn; returns per-episode metrics."""
+    def train(
+        self,
+        num_episodes: int,
+        log_every: int = 10,
+        eval_hook=None,
+        hook_every: int = 0,
+    ) -> list[dict]:
+        """Run `num_episodes` of collect+learn; returns per-episode metrics.
+
+        If ``eval_hook`` is given it is called every ``hook_every`` episodes with
+        the episode index; returning True stops training early (e.g. time budget).
+        """
         cfg = self.cfg
         history: list[dict] = []
         for episode in range(1, num_episodes + 1):
@@ -236,6 +280,9 @@ class QMIX:
                     f"| steps {info['steps']:>3} | loss {info['loss']:.3f} "
                     f"| eps {self.epsilon:.2f}"
                 )
+            if eval_hook and hook_every and episode % hook_every == 0:
+                if eval_hook(episode):
+                    break
         return history
 
     @torch.no_grad()

@@ -95,6 +95,7 @@ class QmixSettings:
     target_update_interval: int = 200  # learn steps between hard target syncs
     max_grad_norm: float = 10.0
     double_q: bool = True          # Double-DQN target (reduces overestimation)
+    normalize_value: bool = True   # value-target normalization (MAPPO trick #1)
     random_seed: int | None = None
 
 

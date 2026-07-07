@@ -32,7 +32,7 @@ from torch import nn
 
 from rescue_sim.config.settings import TransfQmixSettings
 from rescue_sim.MAPPO.environment import RescueEnv
-from rescue_sim.shared import ReplayBuffer, hard_update
+from rescue_sim.shared import ReplayBuffer, hard_update, resolve_device
 
 # Entity-token features: [blocked, target-A, target-B, other-agent,
 #                         rel_x, rel_y, is_self, step_frac, remaining_frac]
@@ -128,17 +128,23 @@ class TransformerMixer(nn.Module):
 class TransfQMIX:
     """Trains transformer agent + transformer mixer on an EntityRescueEnv."""
 
-    def __init__(self, env: EntityRescueEnv, settings: TransfQmixSettings = TransfQmixSettings()):
+    def __init__(
+        self,
+        env: EntityRescueEnv,
+        settings: TransfQmixSettings = TransfQmixSettings(),
+        device: str | None = None,
+    ):
         self.env = env
         self.cfg = settings
         self.rng = Random(settings.random_seed)
         if settings.random_seed is not None:
             torch.manual_seed(settings.random_seed)
 
-        self.agent = AgentTransformer(env.token_dim, env.n_actions, settings)
-        self.mixer = TransformerMixer(env.state_dim, settings)
-        self.target_agent = AgentTransformer(env.token_dim, env.n_actions, settings)
-        self.target_mixer = TransformerMixer(env.state_dim, settings)
+        self.device = resolve_device(device)
+        self.agent = AgentTransformer(env.token_dim, env.n_actions, settings).to(self.device)
+        self.mixer = TransformerMixer(env.state_dim, settings).to(self.device)
+        self.target_agent = AgentTransformer(env.token_dim, env.n_actions, settings).to(self.device)
+        self.target_mixer = TransformerMixer(env.state_dim, settings).to(self.device)
         self._sync_targets()
 
         params = list(self.agent.parameters()) + list(self.mixer.parameters())
@@ -151,9 +157,9 @@ class TransfQMIX:
 
     @torch.no_grad()
     def select_actions(self, tokens: np.ndarray, avail: np.ndarray, greedy: bool = False):
-        q, _ = self.agent(torch.as_tensor(tokens).float())
-        q = q.masked_fill(~torch.as_tensor(avail), -float("inf"))
-        greedy_actions = q.argmax(dim=-1).numpy()
+        q, _ = self.agent(torch.as_tensor(tokens).float().to(self.device))
+        q = q.masked_fill(~torch.as_tensor(avail).to(self.device), -float("inf"))
+        greedy_actions = q.argmax(dim=-1).cpu().numpy()
         if greedy:
             return greedy_actions
         actions = greedy_actions.copy()
@@ -197,6 +203,8 @@ class TransfQMIX:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.epsilon = float(checkpoint.get("epsilon", self.epsilon))
         self.learn_steps = int(checkpoint.get("learn_steps", self.learn_steps))
+        for net in (self.agent, self.mixer, self.target_agent, self.target_mixer):
+            net.to(self.device)
 
     def _agent_forward(self, net: AgentTransformer, tokens: torch.Tensor):
         """Apply a per-agent transformer to a (B, N, T, D) batch."""
@@ -208,6 +216,7 @@ class TransfQMIX:
     def _learn(self) -> float:
         cfg = self.cfg
         batch = self.buffer.sample(cfg.batch_size)
+        batch = {k: v.to(self.device) for k, v in batch.items()}
 
         q, h = self._agent_forward(self.agent, batch["obs"])           # (B,N,A), (B,N,d)
         chosen = q.gather(2, batch["actions"].unsqueeze(2)).squeeze(2)  # (B,N)
@@ -268,8 +277,18 @@ class TransfQMIX:
         info["loss"] = loss_sum / n_learn if n_learn else 0.0
         return info
 
-    def train(self, num_episodes: int, log_every: int = 10) -> list[dict]:
-        """Run `num_episodes` of collect+learn; returns per-episode metrics."""
+    def train(
+        self,
+        num_episodes: int,
+        log_every: int = 10,
+        eval_hook=None,
+        hook_every: int = 0,
+    ) -> list[dict]:
+        """Run `num_episodes` of collect+learn; returns per-episode metrics.
+
+        ``eval_hook`` (called every ``hook_every`` episodes) may return True to
+        stop training early (e.g. on a wall-clock budget).
+        """
         cfg = self.cfg
         history: list[dict] = []
         for episode in range(1, num_episodes + 1):
@@ -292,6 +311,9 @@ class TransfQMIX:
                     f"| steps {info['steps']:>3} | loss {info['loss']:.3f} "
                     f"| eps {self.epsilon:.2f}"
                 )
+            if eval_hook and hook_every and episode % hook_every == 0:
+                if eval_hook(episode):
+                    break
         return history
 
     @torch.no_grad()

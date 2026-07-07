@@ -624,6 +624,54 @@ class GossipConfig:
 # visualization, and baseline code import `shared` but never need torch.
 
 
+def resolve_device(device: str | None = None):
+    """Selects the compute device: explicit override, else CUDA if available, else CPU.
+
+    The deep-RL networks here are small and the wall-clock cost is dominated by
+    CPU-side environment stepping, so a GPU helps only modestly (most on the
+    TransfQMix transformer) -- but honoring one when present is free and keeps
+    the trainers portable to a CUDA host.
+    """
+    import torch
+
+    if device is not None and device != "auto":
+        return torch.device(device)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def make_eval_hook(trainer, checkpoint_path, time_budget_s: float, eval_episodes: int = 20):
+    """Periodic-eval hook for the deep-RL trainers.
+
+    RL performance is noisy and can regress, so this saves a checkpoint only
+    when greedy eval improves (`avg_rescued`, tie-broken by `success_rate`) and
+    signals the training loop to stop once ``time_budget_s`` wall-clock elapses.
+    Returns ``(hook, state)``; pass ``hook`` as ``eval_hook`` to ``train()``.
+    """
+    import time
+
+    state = {"best_rescued": -1.0, "best_success": -1.0, "start": time.time(), "saved": 0}
+
+    def hook(step: int) -> bool:
+        metrics = trainer.evaluate(episodes=eval_episodes)
+        score = (metrics["avg_rescued"], metrics["success_rate"])
+        improved = score > (state["best_rescued"], state["best_success"])
+        if improved:
+            state["best_rescued"], state["best_success"] = score
+            trainer.save_checkpoint(checkpoint_path)
+            state["saved"] += 1
+        elapsed = time.time() - state["start"]
+        print(
+            f"  [eval @ {step:>5}] success {metrics['success_rate']:.2f} "
+            f"rescued {metrics['avg_rescued']:.2f} steps {metrics['avg_steps']:.0f} "
+            f"| best_rescued {state['best_rescued']:.2f} | {elapsed / 60:.1f}min"
+            + ("  <== saved best" if improved else ""),
+            flush=True,
+        )
+        return elapsed >= time_budget_s  # True => stop training
+
+    return hook, state
+
+
 def orthogonal_init(layer, gain: float = 2 ** 0.5):
     """Orthogonal weights + zero bias -- a standard PPO/DQN stability trick."""
     from torch import nn
