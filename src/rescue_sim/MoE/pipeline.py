@@ -300,12 +300,53 @@ class FallbackTeacher(_RescueTeacher):
         return actions
 
 
-Teacher = Union[ExplorationTeacher, CoordinationTeacher, FallbackTeacher]
+class EnsembleTeacher(_RescueTeacher):
+    """Expert 2 teacher driven by the trained QMIX+TransfQMix+MAPPO ensemble.
+
+    Replaces the heuristic ``CoordinationTeacher``: instead of a hand-written
+    dispersal/cohesion rule, the coordination label comes from a genuinely
+    trained cooperative policy (``PolicyEnsemble``), so the distilled E2 head
+    behaves like the deep MARL agents rather than a copy of E1/E3.
+
+    Following the same visible-target convention as the other teachers, an agent
+    that can see a target steps greedily toward it; otherwise it takes the
+    ensemble's argmax action. Must run on an ``EntityRescueEnv`` so TransfQMix
+    gets entity tokens.
+    """
+
+    def __init__(self, rng: np.random.Generator, ensemble) -> None:
+        super().__init__(rng)
+        self.ensemble = ensemble
+
+    def act(self, env: RescueEnv, valid_mask: np.ndarray) -> np.ndarray:
+        flat_obs = env._observations()      # (A, obs_dim) — same tensor the MoE clones on
+        tokens = env.entity_obs()           # (A, n_tokens, token_dim) — needs EntityRescueEnv
+        probs = self.ensemble.action_probs(flat_obs, tokens).numpy()  # (A, n_actions)
+
+        actions = np.zeros(env.num_agents, dtype=np.int64)
+        for i in range(env.num_agents):
+            target = self._visible_target(env, i)
+            if target is not None:
+                actions[i] = self._step_toward(env, i, target, valid_mask)
+                continue
+            masked = np.where(valid_mask[i], probs[i], -np.inf)
+            actions[i] = int(np.argmax(masked))
+        return actions
 
 
-def make_teachers(rng: np.random.Generator) -> list[Teacher]:
-    """The three teachers in expert-head order (exploration, coordination, fallback)."""
-    return [ExplorationTeacher(rng), CoordinationTeacher(rng), FallbackTeacher(rng)]
+Teacher = Union[ExplorationTeacher, CoordinationTeacher, FallbackTeacher, EnsembleTeacher]
+
+
+def make_teachers(rng: np.random.Generator, ensemble=None) -> list[Teacher]:
+    """The three teachers in expert-head order (exploration, coordination, fallback).
+
+    When ``ensemble`` is provided, Expert 2's heuristic ``CoordinationTeacher``
+    is replaced by the trained ``EnsembleTeacher``.
+    """
+    coordination = (
+        EnsembleTeacher(rng, ensemble) if ensemble is not None else CoordinationTeacher(rng)
+    )
+    return [ExplorationTeacher(rng), coordination, FallbackTeacher(rng)]
 
 
 def collect_expert_dataset(
@@ -626,6 +667,45 @@ def run_router_optimization(
     return {"loss": loss_value}
 
 
+def _build_ensemble_env(env: RescueEnv, checkpoint_dir: str, seed: int):
+    """Builds an ``EntityRescueEnv`` mirror of ``env`` and the trained ensemble.
+
+    Returns ``(collect_env, ensemble)`` on success, or ``(env, None)`` if the
+    checkpoints are missing or their dimensions don't match ``env`` (so the
+    caller transparently falls back to the heuristic coordination teacher).
+    """
+    from pathlib import Path
+
+    try:
+        from rescue_sim.Ensemble.ensemble import PolicyEnsemble
+        from rescue_sim.TransfQMix.transf_qmix import EntityRescueEnv
+
+        paths = {n: Path(checkpoint_dir) / f"{n}.pt" for n in ("qmix", "transfqmix", "mappo")}
+        if not all(p.exists() for p in paths.values()):
+            print(f"[MoE] ensemble checkpoints missing in {checkpoint_dir}/; "
+                  "using heuristic CoordinationTeacher")
+            return env, None
+
+        collect_env = EntityRescueEnv(
+            env.grid_settings,
+            num_agents=env.num_agents,
+            max_steps=env.max_steps,
+            view_radius=env.view_radius,
+            seed=seed,
+        )
+        ensemble = PolicyEnsemble.from_checkpoints(
+            collect_env,
+            qmix_path=str(paths["qmix"]),
+            transf_path=str(paths["transfqmix"]),
+            mappo_path=str(paths["mappo"]),
+            device="cpu",
+        )
+        return collect_env, ensemble
+    except Exception as exc:  # noqa: BLE001 - any load/dim error -> safe fallback
+        print(f"[MoE] ensemble teacher unavailable ({exc}); using heuristic CoordinationTeacher")
+        return env, None
+
+
 def train_moe_policy(
     env: RescueEnv,
     episodes_per_head: int = 6,
@@ -640,6 +720,9 @@ def train_moe_policy(
     on_router_step: Optional[ProgressCallback] = None,
     policy: Optional[NeuralMoEPolicy] = None,
     device: Optional[str] = None,
+    use_ensemble: bool = True,
+    checkpoint_dir: str = "checkpoints",
+    e2_gated: bool = False,
 ) -> NeuralMoEPolicy:
     """End-to-end pipeline: collect teacher trajectories, clone experts, tune router.
 
@@ -675,10 +758,27 @@ def train_moe_policy(
         fresh.load_state_dict(policy.state_dict())
         policy = fresh
     policy = policy.to(dev)
+
+    # Expert 2's teacher is the trained QMIX+TransfQMix+MAPPO ensemble when its
+    # checkpoints load cleanly; otherwise fall back to the heuristic teacher so
+    # training never crashes (e.g. missing checkpoints or a dim mismatch).
+    collect_env, ensemble = env, None
+    if use_ensemble:
+        collect_env, ensemble = _build_ensemble_env(env, checkpoint_dir, seed)
     datasets = [
-        collect_expert_dataset(env, teacher, episodes_per_head, collect_steps)
-        for teacher in make_teachers(rng)
+        collect_expert_dataset(collect_env, teacher, episodes_per_head, collect_steps)
+        for teacher in make_teachers(rng, ensemble)
     ]
     run_expert_distillation(policy, datasets, epochs, batch_size, lr, seed, on_distill_epoch)
+
+    # Optional: refine Expert 2 with State-Conditioned Gated Teacher Selection
+    # (per-teacher calibrated temperatures + reverse-KL). Requires the entity
+    # env + loaded ensemble; the encoder is already trained by the BC stage.
+    if e2_gated and ensemble is not None and hasattr(collect_env, "entity_obs"):
+        from rescue_sim.MoE.gated_distill import train_gated_expert2
+        metrics = train_gated_expert2(policy, collect_env, checkpoint_dir=checkpoint_dir, seed=seed)
+        print(f"[MoE] gated E2 distillation: acc={metrics['acc']:.1f}% "
+              f"weights={metrics['teacher_weights']}")
+
     run_router_optimization(policy, datasets, router_steps, router_batch, lr, seed, on_router_step)
     return policy
