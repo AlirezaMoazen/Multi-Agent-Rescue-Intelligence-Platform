@@ -74,8 +74,18 @@ The simulator foundation is complete, and every planned learning strategy is imp
 
 The whole test suite is green and every method trains on a normal CPU.
 
+> **Live web dashboard.** The visualization API and React frontend drive the
+> multi-agent methods directly: pick **Epidemic Fleet** (tabular hysteretic
+> Q-learning with gossip) or **Neural MoE** (three experts blended by the
+> attention router) in the UI. The MoE mode streams its training progress
+> live, then solves the *same* fixed grid over repeated tries — agents are
+> colored by their dominant expert, isolated agents get a dashed blackout
+> radius and a BLACKOUT badge, and the router panel shows each agent's
+> softmax routing vector in real time.
+>
 > **Legacy note.** Anything tied to the original *single-agent* flow
-> (`QLearningAgent`, the single-agent evaluation path) is kept but **marked legacy** — superseded by the multi-agent line-up above. The visualization **API and React frontend still drive that legacy single-agent demo**; wiring them to the multi-agent models / the MoE is a separate workstream for the API/frontend developer, so the live UI may not exercise the new methods yet. The Python library, training scripts, and tests are the source of truth for the multi-agent work.
+> (`QLearningAgent`, the single-agent evaluation path) is kept but **marked
+> legacy** — superseded by the multi-agent line-up above.
 
 Architecture documents:
 
@@ -656,6 +666,13 @@ The demo trains on the real 20×20 `RescueEnv` (full behavioral-cloning epochs +
 router optimization), renders the live ASCII grid and telemetry dashboard, and
 finishes by running `pytest tests/test_moe.py` as an integration gate.
 A module-level deep dive lives in [README_moe.md](README_moe.md).
+
+The same pipeline (shared via `rescue_sim/MoE/pipeline.py`) powers the **web
+dashboard's Neural MoE mode** (`docker compose up --build viz`, then select
+*Neural MoE* and press Start): training progress streams into the browser,
+and the rollout runs repeated tries on one fixed 20×20 / 4-agent / 4-goal
+grid with live per-agent routing vectors, expert-colored agents, and blackout
+badges.
 
 ### Indicative results (short CPU training runs)
 

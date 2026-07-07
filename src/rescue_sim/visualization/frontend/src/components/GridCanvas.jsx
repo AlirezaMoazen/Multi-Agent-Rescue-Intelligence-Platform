@@ -9,11 +9,20 @@ const AGENT_COLORS = [
   '#fb923c', // orange
 ];
 
+// In neural MoE mode agents are colored by their dominant expert instead,
+// so routing flips are visible directly on the map.
+const EXPERT_COLORS = {
+  exploration: '#22d3ee',  // E1 heuristic explorer
+  coordination: '#34d399', // E2 deep coordination
+  fallback: '#fbbf24',     // E3 local hysteretic Q (isolated)
+};
+const COMM_RADIUS = 3;
+
 /**
  * GridCanvas — renders the rescue grid on a <canvas> element.
  * Walls = dark, empty = slightly lighter, targets = red glow, agents = colored dots.
  */
-export default function GridCanvas({ grid, agents, rescued, trails }) {
+export default function GridCanvas({ grid, agents, rescued, trails, moe }) {
   const canvasRef = useRef(null);
 
   // Build a lookup set for rescued positions
@@ -143,10 +152,31 @@ export default function GridCanvas({ grid, agents, rescued, trails }) {
 
     // Draw agents
     (agents || []).forEach((agent, idx) => {
-      const color = AGENT_COLORS[idx % AGENT_COLORS.length];
+      const color = agent.expert
+        ? EXPERT_COLORS[agent.expert] || AGENT_COLORS[idx % AGENT_COLORS.length]
+        : AGENT_COLORS[idx % AGENT_COLORS.length];
       const cx = agent.x * cellSize + cellSize / 2;
       const cy = agent.y * cellSize + cellSize / 2;
       const r  = Math.max(3, cellSize * 0.35);
+
+      // Communication blackout: dashed Manhattan diamond (the 3-block radius)
+      const isolated = moe && moe.peer_count && moe.peer_count[idx] <= 1;
+      if (isolated) {
+        const d = COMM_RADIUS * cellSize;
+        ctx.save();
+        ctx.strokeStyle = EXPERT_COLORS.fallback;
+        ctx.setLineDash([4, 4]);
+        ctx.globalAlpha = 0.6;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy - d);
+        ctx.lineTo(cx + d, cy);
+        ctx.lineTo(cx, cy + d);
+        ctx.lineTo(cx - d, cy);
+        ctx.closePath();
+        ctx.stroke();
+        ctx.restore();
+      }
 
       // Glow
       ctx.save();
@@ -168,7 +198,7 @@ export default function GridCanvas({ grid, agents, rescued, trails }) {
       }
     });
 
-  }, [grid, agents, rescuedSet, trails]);
+  }, [grid, agents, rescuedSet, trails, moe]);
 
   if (!grid) {
     return (

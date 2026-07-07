@@ -5,6 +5,7 @@ import GridCanvas from './components/GridCanvas';
 import ControlPanel from './components/ControlPanel';
 import ParameterPanel from './components/ParameterPanel';
 import MetricsChart from './components/MetricsChart';
+import MoePanel, { EXPERT_META } from './components/MoePanel';
 import EvaluationPanel from './components/EvaluationPanel';
 
 export default function App() {
@@ -12,6 +13,7 @@ export default function App() {
   const sim = useSimulation();
 
   const isRunning = sim.status === 'running';
+  const isMoe = (config?.algorithm || 'epidemic_fleet') === 'neural_moe';
   const isComplete = sim.status === 'complete';
   const configReady = config !== null;
 
@@ -133,7 +135,7 @@ export default function App() {
               )}
             </div>
             <div className="grid-wrapper">
-              <GridCanvas grid={sim.grid} agents={sim.agents} rescued={sim.rescued} trails={sim.trails} />
+              <GridCanvas grid={sim.grid} agents={sim.agents} rescued={sim.rescued} trails={sim.trails} moe={sim.moe} />
             </div>
             <div className="legend">
               <div className="legend-item">
@@ -148,9 +150,17 @@ export default function App() {
               <div className="legend-item">
                 <span className="legend-swatch" style={{ background: 'rgba(52,211,153,0.4)' }} /> Rescued
               </div>
-              <div className="legend-item">
-                <span className="legend-swatch" style={{ background: '#22d3ee', borderRadius: '50%' }} /> Agent
-              </div>
+              {isMoe ? (
+                Object.values(EXPERT_META).map((meta) => (
+                  <div key={meta.label} className="legend-item">
+                    <span className="legend-swatch" style={{ background: meta.color, borderRadius: '50%' }} /> {meta.label}
+                  </div>
+                ))
+              ) : (
+                <div className="legend-item">
+                  <span className="legend-swatch" style={{ background: '#22d3ee', borderRadius: '50%' }} /> Agent
+                </div>
+              )}
             </div>
           </div>
 
@@ -171,6 +181,9 @@ export default function App() {
         <div className="side-panel">
           {configReady && (
             <ParameterPanel config={config} onChange={setConfig} disabled={isRunning} />
+          )}
+          {isMoe && (
+            <MoePanel moe={sim.moe} training={sim.moeTraining} status={sim.status} />
           )}
           <MetricsChart metrics={sim.episodeMetrics} />
         </div>

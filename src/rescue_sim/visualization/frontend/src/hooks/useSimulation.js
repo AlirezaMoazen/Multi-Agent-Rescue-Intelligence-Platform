@@ -40,6 +40,8 @@ export default function useSimulation() {
   const [totalReward, setTotalReward] = useState(0);
   const [explorationRate, setExplorationRate] = useState(1.0);
   const [baselineComparison, setBaselineComparison] = useState(null);
+  const [moe, setMoe] = useState(null);                 // latest per-step MoE routing payload
+  const [moeTraining, setMoeTraining] = useState(null); // streamed MoE training progress
 
   const connectFn = useRef(null);
 
@@ -108,6 +110,7 @@ export default function useSimulation() {
           setStep(msg.step);
           setRescued(msg.rescued);
           setActiveTargets(msg.active_targets);
+          if (msg.moe) setMoe(msg.moe);
 
           // Append to trails
           setTrails(prev => {
@@ -149,6 +152,10 @@ export default function useSimulation() {
 
         case 'baseline_comparison':
           setBaselineComparison(msg.report);
+          break;
+
+        case 'moe_training':
+          setMoeTraining(msg);
           break;
 
         case 'stopped':
@@ -207,6 +214,8 @@ export default function useSimulation() {
     setError(null);
     setTrails({});
     setBaselineComparison(null);
+    setMoe(null);
+    setMoeTraining(null);
     setStatus('running');
     if (config) {
       send({ type: 'config', data: config });
@@ -241,6 +250,8 @@ export default function useSimulation() {
     totalReward,
     explorationRate,
     baselineComparison,
+    moe,
+    moeTraining,
     trails,
     error,
     start,

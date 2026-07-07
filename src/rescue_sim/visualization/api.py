@@ -120,6 +120,7 @@ class SimConfig(BaseModel):
     exploration_rate: float = 1.0
     speed_ms: int = 100  # delay between steps in ms
     run_mode: str = "train"  # train | evaluate | instant_train
+    algorithm: str = "epidemic_fleet"  # epidemic_fleet | neural_moe
 
 
 # ── Global state ────────────────────────────────────────────────────────────
@@ -127,6 +128,8 @@ current_config = SimConfig()
 trained_visual_fleet: EpidemicHystereticQLearning | None = None
 trained_visual_seed: int | None = None
 trained_visual_shape: tuple[int, int, int] | None = None
+trained_moe_policy: object | None = None
+trained_moe_shape: tuple[int, int, int, int] | None = None
 
 
 # ── REST endpoints ──────────────────────────────────────────────────────────
@@ -216,6 +219,10 @@ async def simulation_ws(websocket: WebSocket):
                         "message": "At least 1 agent is required.",
                     }
                 )
+                continue
+
+            if config.algorithm == "neural_moe":
+                await _run_moe_simulation(websocket, config, run_mode)
                 continue
 
             episode_metrics: list[dict] = []
@@ -534,6 +541,390 @@ async def simulation_ws(websocket: WebSocket):
             await websocket.send_json({"type": "error", "message": f"Simulation error: {error!s}"})
         except Exception:
             pass
+
+
+# ── Neural MoE simulation mode ──────────────────────────────────────────────
+#
+# Three experts drive every step, blended by the attention router:
+#   exploration  — behavioral-cloned from the non-AI frontier heuristic
+#   coordination — behavioral-cloned from the target-greedy deep-RL style teacher
+#   fallback     — recurrent (GRU) local head for isolated agents, the
+#                  neural counterpart of the Hysteretic Q baseline
+_MOE_EXPERT_LABELS = ("exploration", "coordination", "fallback")
+_MOE_BASELINES = {
+    "hysteretic_alpha": 0.1,
+    "hysteretic_beta": 0.01,
+    "frontier_decay": 0.95,
+}
+
+
+async def _run_moe_simulation(websocket: WebSocket, config: SimConfig, run_mode: str) -> None:
+    """Trains (if needed) and rolls out the neural MoE on one fixed grid.
+
+    Unlike the fleet mode, training is offline (behavioral cloning + router
+    optimization) and streams as ``moe_training`` progress messages. The
+    rendered rollout then runs ``num_episodes`` tries on the *same* grid so
+    the routing evolution is comparable try-to-try.
+    """
+    global trained_moe_policy, trained_moe_shape
+
+    try:
+        from rescue_sim.MoE.pipeline import FixedGridRescueEnv  # noqa: F401 (torch probe)
+    except ModuleNotFoundError as error:
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": f"Neural MoE needs the optional torch dependency: {error!s}",
+            }
+        )
+        return
+
+    seed = _DEFAULT_GRID.get("random_seed", 42)
+    target_a = math.ceil(config.target_count / 2)
+    target_b = config.target_count - target_a
+    settings = GridSettings(
+        width=config.grid_width,
+        height=config.grid_height,
+        obstacle_probability=config.obstacle_probability,
+        target_a_count=target_a,
+        target_b_count=target_b,
+        random_seed=seed,
+    )
+    view_radius = max(1, config.sensor_range)
+    expected_shape = (config.grid_width, config.grid_height, config.num_agents, view_radius)
+
+    if run_mode == "evaluate":
+        if trained_moe_policy is None or trained_moe_shape != expected_shape:
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "message": (
+                        "No compatible trained MoE policy is available yet. "
+                        "Run Train first with the same grid size, agent count, and sensor range."
+                    ),
+                }
+            )
+            return
+        policy = trained_moe_policy
+    else:
+        policy = await _train_moe_policy_async(websocket, settings, config, view_radius, seed)
+        if policy is None:
+            return
+        trained_moe_policy = policy
+        trained_moe_shape = expected_shape
+
+    if run_mode == "instant_train":
+        await websocket.send_json(
+            {
+                "type": "training_complete",
+                "total_episodes": 0,
+                "final_success_rate": 0.0,
+                "metrics": [],
+            }
+        )
+        return
+
+    await _run_moe_rollout(websocket, policy, settings, config, view_radius)
+
+
+async def _train_moe_policy_async(
+    websocket: WebSocket,
+    settings: GridSettings,
+    config: SimConfig,
+    view_radius: int,
+    seed: int,
+):
+    """Runs the MoE training pipeline in a worker thread, streaming progress.
+
+    Progress callbacks fire on the worker thread and are forwarded to the
+    websocket as ``moe_training`` messages via a thread-safe queue. A "stop"
+    message from the client abandons the result (the small training job is
+    left to finish in the background).
+    """
+    from rescue_sim.MAPPO import RescueEnv
+    from rescue_sim.MoE.pipeline import train_moe_policy
+
+    loop = asyncio.get_running_loop()
+    progress: asyncio.Queue = asyncio.Queue()
+
+    def stage_reporter(stage: str, every: int = 1):
+        def report(current: int, total: int, loss: float, acc: float, grad_norm: float) -> None:
+            if current == 1 or current % every == 0 or current == total:
+                loop.call_soon_threadsafe(
+                    progress.put_nowait,
+                    {
+                        "type": "moe_training",
+                        "stage": stage,
+                        "epoch": current,
+                        "total": total,
+                        "loss": round(loss, 6),
+                        "accuracy": round(acc, 2),
+                    },
+                )
+        return report
+
+    def train():
+        env = RescueEnv(
+            settings,
+            num_agents=config.num_agents,
+            max_steps=80,
+            view_radius=view_radius,
+            seed=seed,
+        )
+        return train_moe_policy(
+            env,
+            episodes_per_head=4,
+            collect_steps=60,
+            epochs=12,
+            router_steps=80,
+            seed=seed,
+            on_distill_epoch=stage_reporter("distillation"),
+            on_router_step=stage_reporter("router", every=10),
+        )
+
+    task = asyncio.create_task(asyncio.to_thread(train))
+    stopped = False
+    while not task.done():
+        try:
+            update = await asyncio.wait_for(progress.get(), timeout=0.15)
+            await websocket.send_json(update)
+        except asyncio.TimeoutError:
+            pass
+        if not stopped:
+            try:
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=0.001)
+                if json.loads(raw).get("type") == "stop":
+                    stopped = True
+            except asyncio.TimeoutError:
+                pass
+    if stopped:
+        await websocket.send_json({"type": "stopped"})
+        return None
+    while not progress.empty():
+        await websocket.send_json(progress.get_nowait())
+    try:
+        return await task
+    except ValueError as error:
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": (
+                    f"Environment generation error: {error!s}. "
+                    "Try reducing target count or obstacles."
+                ),
+            }
+        )
+        return None
+
+
+async def _run_moe_rollout(
+    websocket: WebSocket,
+    policy,
+    settings: GridSettings,
+    config: SimConfig,
+    view_radius: int,
+) -> None:
+    """Streams ``num_episodes`` policy-driven tries on the same fixed grid.
+
+    Every step message carries a ``moe`` payload with the per-agent softmax
+    routing vector, dominant expert, peer links, and GRU hidden norm, so the
+    frontend can show routing flips the moment agents leave the 3-block
+    communication radius.
+    """
+    global current_config
+
+    import torch
+
+    from rescue_sim.MoE.pipeline import FixedGridRescueEnv, build_peer_matrix
+
+    try:
+        env = FixedGridRescueEnv(
+            settings,
+            num_agents=config.num_agents,
+            max_steps=config.max_steps,
+            view_radius=view_radius,
+            grid_seed=settings.random_seed or 0,
+        )
+        obs = env.reset()
+    except ValueError as error:
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": (
+                    f"Environment generation error: {error!s}. "
+                    "Try reducing target count or obstacles."
+                ),
+            }
+        )
+        return
+
+    grid = env.grid
+    obstacles = [{"x": p.x, "y": p.y} for p in grid.obstacles]
+    targets = [{"x": p.x, "y": p.y, "type": "A"} for p in grid.target_a_positions]
+    targets += [{"x": p.x, "y": p.y, "type": "B"} for p in grid.target_b_positions]
+    total_targets = len(targets)
+
+    num_agents = env.num_agents
+    episode_metrics: list[dict] = []
+    should_stop = False
+
+    for episode in range(max(1, config.num_episodes)):
+        obs = env.reset()  # identical grid every try (fixed competition grid)
+        hidden = None      # GRU temporal memory resets per try
+        rescued_records: list[dict] = []
+        rescued_seen: set[Position] = set()
+        total_reward = 0.0
+        explore_sum = 0.0
+        explore_samples = 0
+        info = {"rescued": 0, "targets": total_targets, "success": False, "steps": 0}
+
+        await websocket.send_json(
+            {
+                "type": "episode_start",
+                "episode": episode,
+                "grid": {
+                    "width": config.grid_width,
+                    "height": config.grid_height,
+                    "obstacles": obstacles,
+                    "targets": targets,
+                },
+                "agents": [
+                    {"id": i, "x": p.x, "y": p.y} for i, p in enumerate(env.positions)
+                ],
+                "algorithm": "neural_moe",
+            }
+        )
+
+        for step in range(1, config.max_steps + 1):
+            # Cancellation / live config (speed) updates
+            try:
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=0.001)
+                cancel_msg = json.loads(raw)
+                if cancel_msg.get("type") == "stop":
+                    await websocket.send_json({"type": "stopped"})
+                    should_stop = True
+                    break
+                if cancel_msg.get("type") == "config":
+                    new_cfg = SimConfig(**cancel_msg.get("data", {}))
+                    current_config = new_cfg
+                    config = new_cfg
+            except asyncio.TimeoutError:
+                pass
+
+            peer_np = build_peer_matrix(env.positions)
+            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+            peer_t = torch.tensor(peer_np, dtype=torch.float32).unsqueeze(0)
+            mask_t = torch.tensor(env.valid_action_mask(), dtype=torch.bool).unsqueeze(0)
+
+            # Tensor shape assertions before the routing step
+            assert obs_t.shape == (1, num_agents, env.obs_dim), f"obs shape {obs_t.shape}"
+            assert peer_t.shape == (1, num_agents, num_agents), f"peer shape {peer_t.shape}"
+            assert mask_t.shape == (1, num_agents, policy.action_dim), f"mask shape {mask_t.shape}"
+
+            with torch.no_grad():
+                y_final, weights, hidden = policy(obs_t, peer_t, mask_t, hidden)
+                probs = torch.softmax(y_final, dim=-1)
+                actions = torch.multinomial(
+                    probs.view(num_agents, policy.action_dim), num_samples=1
+                ).squeeze(-1)
+
+            obs, reward, done, info = env.step(actions.numpy())
+            total_reward += float(reward)
+
+            for pos in env.positions:
+                if grid.has_target(pos) and pos not in rescued_seen:
+                    rescued_seen.add(pos)
+                    rescued_records.append(
+                        {"x": pos.x, "y": pos.y, "step": step, "type": grid.target_type_at(pos)}
+                    )
+
+            weights_step = weights.squeeze(0)                    # [A, 3]
+            dominant = torch.argmax(weights_step, dim=-1).tolist()
+            gru_norm = torch.norm(hidden.squeeze(0), dim=-1)     # [A]
+            peer_counts = peer_np.sum(axis=1).astype(int).tolist()
+            explore_sum += float(weights_step[:, 0].mean().item())
+            explore_samples += 1
+
+            agent_states = [
+                {
+                    "id": i,
+                    "x": env.positions[i].x,
+                    "y": env.positions[i].y,
+                    "action": CARDINAL_ACTIONS[int(actions[i])].value,
+                    "reward": round(float(reward) / num_agents, 2),
+                    "expert": _MOE_EXPERT_LABELS[dominant[i]],
+                }
+                for i in range(num_agents)
+            ]
+            moe_payload = {
+                "weights": [
+                    [round(float(w), 4) for w in weights_step[i]] for i in range(num_agents)
+                ],
+                "active_expert": [_MOE_EXPERT_LABELS[d] for d in dominant],
+                "peer_count": peer_counts,
+                "peers": [
+                    [j for j in range(num_agents) if j != i and peer_np[i, j] > 0]
+                    for i in range(num_agents)
+                ],
+                "gru_norm": [round(float(gru_norm[i].item()), 3) for i in range(num_agents)],
+                "baselines": _MOE_BASELINES,
+            }
+
+            await websocket.send_json(
+                {
+                    "type": "step",
+                    "episode": episode,
+                    "step": step,
+                    "agents": agent_states,
+                    "rescued": rescued_records,
+                    "active_targets": int(info["targets"] - info["rescued"]),
+                    "moe": moe_payload,
+                }
+            )
+            await asyncio.sleep(config.speed_ms / 1000.0)
+            if done:
+                break
+
+        if should_stop:
+            break
+
+        metric = {
+            "episode": episode,
+            "steps": int(info["steps"]),
+            "rescued_count": len(rescued_records),
+            "target_count": total_targets,
+            "success": bool(info["success"]),
+            "total_reward": round(total_reward, 2),
+            # For the MoE the "exploration rate" is the mean exploration
+            # gating weight over the try — comparable across tries.
+            "exploration_rate": round(explore_sum / max(explore_samples, 1), 4),
+        }
+        episode_metrics.append(metric)
+        success_rate = sum(1 for m in episode_metrics if m["success"]) / len(episode_metrics)
+        await websocket.send_json(
+            {
+                "type": "episode_end",
+                **metric,
+                "success_rate": round(success_rate, 4),
+                "avg_steps": round(
+                    sum(m["steps"] for m in episode_metrics) / len(episode_metrics), 1
+                ),
+            }
+        )
+
+    if not should_stop:
+        await websocket.send_json(
+            {
+                "type": "training_complete",
+                "total_episodes": len(episode_metrics),
+                "final_success_rate": round(
+                    sum(1 for m in episode_metrics if m["success"])
+                    / max(len(episode_metrics), 1),
+                    4,
+                ),
+                "metrics": episode_metrics,
+            }
+        )
 
 
 def _agent_payloads(positions: dict[str, Position]) -> list[dict]:
