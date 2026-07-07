@@ -18,15 +18,12 @@ Covers:
 
 from __future__ import annotations
 
-from typing import Optional
-
-import pytest
 import numpy as np
-import torch
+import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
-from rescue_sim.MoE.moe import (
+from rescue_sim.MoE.moe import (  # noqa: E402
     AttentionGatingRouter,
     NeuralMoEPolicy,
     RecurrentFallbackHead,
@@ -34,7 +31,7 @@ from rescue_sim.MoE.moe import (
     distill_expert_heads,
     train_gating_router,
 )
-from rescue_sim.shared import Position
+from rescue_sim.shared import Position  # noqa: E402
 
 
 class MockEnv:

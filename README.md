@@ -124,7 +124,7 @@ Main dependencies are declared in [pyproject.toml](pyproject.toml):
 .
 |-- .gitlab-ci.yml             # GitLab CI pipeline (ruff + pytest)
 |-- Dockerfile                 # Container image (backend + built frontend + CPU torch)
-|-- docker-compose.yml         # viz / dev / test / lint / train-* / compare-all / train-moe
+|-- docker-compose.yml         # viz / dev / test / lint / train-* / compare-all / demo-moe
 |-- configs/
 |   `-- default_scenario.yaml  # Example YAML scenario configuration
 |-- docs/                      # Architecture, backlog, requirements, sprint planning
@@ -133,8 +133,7 @@ Main dependencies are declared in [pyproject.toml](pyproject.toml):
 |   |-- train_mappo.py         # Train MAPPO
 |   |-- train_qmix.py          # Train QMIX
 |   |-- train_transfqmix.py    # Train TransfQMix
-|   |-- compare_all.py         # Train all -> ensemble -> distill -> compare table
-|   `-- train_moe.py           # (legacy) portfolio-gate MoE runner — superseded by demo_moe.py
+|   `-- compare_all.py         # Train all -> ensemble -> distill -> compare table
 |-- src/rescue_sim/
 |   |-- shared.py              # Project contract + shared deep-RL helpers
 |   |-- config/                # YAML loading and typed settings
@@ -656,6 +655,7 @@ python demo_moe.py                     # or: docker compose run --rm demo-moe
 The demo trains on the real 20×20 `RescueEnv` (full behavioral-cloning epochs +
 router optimization), renders the live ASCII grid and telemetry dashboard, and
 finishes by running `pytest tests/test_moe.py` as an integration gate.
+A module-level deep dive lives in [README_moe.md](README_moe.md).
 
 ### Indicative results (short CPU training runs)
 
@@ -783,14 +783,12 @@ python -m pip install -e ".[dev]"
 
 ## Run
 
-The scenario runner is prepared as the command-line entry point:
+The scenario runner is the command-line entry point for a single damaged-area
+scenario with metrics and text output:
 
 ```bash
 python scripts/run_scenario.py
 ```
-
-Sprint 2 work will turn this into a runnable damaged-area scenario with basic
-metrics and visual/text output.
 
 ## Test and Lint
 

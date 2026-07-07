@@ -224,10 +224,9 @@ def collect_expert_dataset(
     """
     dataset: list[Transition] = []
     for _ in range(episodes):
-        env.reset()
+        obs = env.reset()  # [A, obs_dim]
         teacher.reset(env)
         for _ in range(max_steps):
-            obs = env._observations()  # [A, obs_dim] — current-state observation
             valid_mask = env.valid_action_mask()
             actions = teacher.act(env, valid_mask)
             peer = build_peer_matrix(env.positions)
@@ -238,7 +237,7 @@ def collect_expert_dataset(
                 torch.tensor(actions, dtype=torch.int64),
             ))
 
-            _, _, done, _ = env.step(actions)
+            obs, _, done, _ = env.step(actions)
             if isinstance(teacher, CoordinationTeacher):
                 teacher.observe(env)
             if done:

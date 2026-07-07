@@ -1,7 +1,7 @@
 [project]
 name = "rescue-sim"
 version = "0.1.0"
-description = "Multi-agent rescue-team simulator: classical baselines + deep MARL (QMIX, TransfQMix, MAPPO) for ST04."
+description = "Multi-agent rescue-team simulator: classical baselines, deep MARL (QMIX, TransfQMix, MAPPO), and a neural Mixture-of-Experts with attention routing."
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 dependencies = [

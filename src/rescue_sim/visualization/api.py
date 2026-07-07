@@ -6,10 +6,11 @@ Uses the environment modules directly:
   - rescue_sim.environment.grid.Grid, Position
   - rescue_sim.environment.movement.MovementModel
   - rescue_sim.environment.sensors.CentralSensor
-  - rescue_sim.agents.single_agent.SingleAgent
+  - rescue_sim.Qlearning.q_learning.EpidemicHystereticQLearning
 
 No simulation logic is duplicated — the API simply drives the existing
-environment layer and streams the state to the frontend over WebSocket.
+environment layer (an Epidemic Hysteretic Q-learning fleet) and streams the
+state to the frontend over WebSocket.
 """
 
 import asyncio
@@ -49,12 +50,19 @@ from rescue_sim.shared import (
 
 app = FastAPI(title="Rescue Sim Visualization API")
 
-# TODO(security): Restrict allow_origins to the actual frontend origin
-# instead of wildcard once a deployment domain is determined.
+# No cookies/auth are used, so credentials stay disabled — the wildcard
+# origin + credentials combination is rejected by browsers and flagged by
+# security scanners. Restrict allow_origins to the deployment domain via
+# RESCUE_SIM_CORS_ORIGINS once one is determined.
+_CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("RESCUE_SIM_CORS_ORIGINS", "*").split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_CORS_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -119,7 +127,6 @@ current_config = SimConfig()
 trained_visual_fleet: EpidemicHystereticQLearning | None = None
 trained_visual_seed: int | None = None
 trained_visual_shape: tuple[int, int, int] | None = None
-trained_hybrid_policy: dict | None = None
 
 
 # ── REST endpoints ──────────────────────────────────────────────────────────
@@ -210,9 +217,6 @@ async def simulation_ws(websocket: WebSocket):
                     }
                 )
                 continue
-
-            await _run_hybrid_simulation(websocket, config)
-            continue
 
             episode_metrics: list[dict] = []
             should_stop = False
@@ -532,343 +536,6 @@ async def simulation_ws(websocket: WebSocket):
             pass
 
 
-async def _run_hybrid_simulation(websocket: WebSocket, config: SimConfig) -> None:
-    global trained_hybrid_policy
-
-    seed = _DEFAULT_GRID.get("random_seed", 42)
-    target_a = math.ceil(config.target_count / 2)
-    target_b = config.target_count - target_a
-    settings = GridSettings(
-        width=config.grid_width,
-        height=config.grid_height,
-        obstacle_probability=config.obstacle_probability,
-        target_a_count=target_a,
-        target_b_count=target_b,
-        random_seed=seed,
-    )
-    start_pos = Position(_DEFAULT_AGENT.get("start_x", 0), _DEFAULT_AGENT.get("start_y", 0))
-
-    try:
-        grid = generate_grid(settings, start_pos)
-        starts = default_start_positions(grid, config.num_agents, start_pos)
-    except ValueError as error:
-        await websocket.send_json(
-            {
-                "type": "error",
-                "message": f"Environment generation error: {error!s}. Try reducing target count or obstacles.",
-            }
-        )
-        return
-
-    obstacles = [{"x": p.x, "y": p.y} for p in grid.obstacles]
-    targets = [{"x": p.x, "y": p.y, "type": "A"} for p in grid.target_a_positions]
-    targets += [{"x": p.x, "y": p.y, "type": "B"} for p in grid.target_b_positions]
-
-    if config.run_mode not in {"evaluate", "instant_train"}:
-        await websocket.send_json(
-            {
-                "type": "episode_start",
-                "episode": 0,
-                "grid": {
-                    "width": config.grid_width,
-                    "height": config.grid_height,
-                    "obstacles": obstacles,
-                    "targets": targets,
-                },
-                "agents": _agent_payloads(starts),
-                "algorithm": "hybrid_moe:building",
-            }
-        )
-        await asyncio.sleep(0)
-
-    expected_shape = (config.grid_width, config.grid_height, config.num_agents)
-    if config.run_mode == "evaluate":
-        if trained_hybrid_policy is None or trained_hybrid_policy.get("shape") != expected_shape:
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "message": (
-                        "No compatible trained hybrid policy is available yet. "
-                        "Run Train first with the same grid size and agent count."
-                    ),
-                }
-            )
-            return
-        hybrid = trained_hybrid_policy
-        grid = hybrid["grid"]
-        settings = hybrid["settings"]
-        starts = hybrid["starts"]
-        obstacles = [{"x": p.x, "y": p.y} for p in grid.obstacles]
-        targets = [{"x": p.x, "y": p.y, "type": "A"} for p in grid.target_a_positions]
-        targets += [{"x": p.x, "y": p.y, "type": "B"} for p in grid.target_b_positions]
-    else:
-        try:
-            hybrid = await _build_live_hybrid_policy_async(
-                websocket, settings, grid, starts, config, seed
-            )
-            if hybrid is None:
-                return
-        except ModuleNotFoundError as error:
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "message": f"Hybrid/MoE needs the optional torch dependency: {error!s}",
-                }
-            )
-            return
-        except FileNotFoundError as error:
-            await websocket.send_json({"type": "error", "message": str(error)})
-            return
-        except RuntimeError as error:
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "message": (
-                        "Hybrid checkpoints could not be loaded. "
-                        "They may have been trained with different agents/view radius/settings. "
-                        f"Details: {error!s}"
-                    ),
-                }
-            )
-            return
-        if config.run_mode in {"train", "instant_train"}:
-            trained_hybrid_policy = {**hybrid, "shape": expected_shape}
-
-    if config.run_mode == "instant_train":
-        await websocket.send_json(
-            {
-                "type": "training_complete",
-                "total_episodes": 1,
-                "final_success_rate": 0.0,
-                "metrics": [],
-            }
-        )
-        return
-
-    moe = hybrid["moe"]
-    leader = hybrid["leader"]
-    policy = hybrid["policy"]
-    env = moe.env
-    flat_obs = env.reset()
-
-    if config.run_mode == "evaluate":
-        await websocket.send_json(
-            {
-                "type": "episode_start",
-                "episode": 0,
-                "grid": {
-                    "width": config.grid_width,
-                    "height": config.grid_height,
-                    "obstacles": obstacles,
-                    "targets": targets,
-                },
-                "agents": _agent_payloads(starts),
-                "algorithm": f"hybrid_moe:{leader}",
-            }
-        )
-
-    rescued: list[dict] = []
-    rescued_positions: set[Position] = set()
-    total_reward = 0.0
-    info = {"success": False, "rescued": 0, "targets": config.target_count, "steps": 0}
-
-    for step in range(1, config.max_steps + 1):
-        actions = _select_hybrid_actions(moe, leader, policy, flat_obs)
-        flat_obs, reward, done, info = env.step(actions)
-        total_reward += float(reward)
-
-        agent_states = []
-        for index, position in enumerate(env.positions):
-            target_type = grid.target_type_at(position)
-            if target_type is not None and position not in rescued_positions:
-                rescued_positions.add(position)
-                rescued.append({"x": position.x, "y": position.y, "step": step, "type": target_type})
-            agent_states.append(
-                {
-                    "id": index,
-                    "x": position.x,
-                    "y": position.y,
-                    "action": CARDINAL_ACTIONS[int(actions[index])].value,
-                    "reward": round(float(reward) / max(config.num_agents, 1), 2),
-                }
-            )
-
-        await websocket.send_json(
-            {
-                "type": "step",
-                "episode": 0,
-                "step": step,
-                "agents": agent_states,
-                "rescued": rescued,
-                "active_targets": max(config.target_count - len(rescued_positions), 0),
-                "algorithm": f"hybrid_moe:{leader}",
-            }
-        )
-        if done:
-            break
-        await asyncio.sleep(config.speed_ms / 1000.0)
-
-    success = bool(info.get("success", False))
-    metric = {
-        "episode": 0,
-        "steps": int(info.get("steps", step)),
-        "rescued_count": int(info.get("rescued", len(rescued_positions))),
-        "target_count": int(info.get("targets", config.target_count)),
-        "success": success,
-        "total_reward": round(total_reward, 2),
-        "exploration_rate": round(float(moe.fleet.epsilon), 4),
-    }
-    await websocket.send_json(
-        {
-            "type": "episode_end",
-            **metric,
-            "success_rate": 1.0 if success else 0.0,
-            "avg_steps": metric["steps"],
-            "algorithm": f"hybrid_moe:{leader}",
-        }
-    )
-    await websocket.send_json(
-        {
-            "type": "baseline_comparison",
-            "report": _build_run_comparison_report(
-                grid=grid,
-                grid_settings=settings,
-                starts=starts,
-                config=config,
-                hybrid_report=hybrid.get("report"),
-            ),
-        }
-    )
-    await websocket.send_json(
-        {
-            "type": "training_complete",
-            "total_episodes": 1,
-            "final_success_rate": 1.0 if success else 0.0,
-            "metrics": [metric],
-        }
-    )
-
-
-def _build_live_hybrid_policy(settings, grid, starts, config, seed):
-    from rescue_sim.config.settings import MappoSettings, MoeSettings, QmixSettings, TransfQmixSettings
-    from rescue_sim.Ensemble import ValueEnsemble, performance_weights
-    from rescue_sim.MAPPO import MAPPO, RescueEnv
-    from rescue_sim.MoE import MixtureOfExperts
-    from rescue_sim.MoE.moe import FLEET
-    from rescue_sim.QMIX import QMIX
-    from rescue_sim.TransfQMix import EntityRescueEnv, TransfQMIX
-
-    episodes = max(1, int(config.num_episodes))
-    view_radius = max(1, int(config.sensor_range))
-    _require_hybrid_checkpoints()
-
-    def env():
-        return EntityRescueEnv(
-            settings,
-            num_agents=config.num_agents,
-            max_steps=config.max_steps,
-            view_radius=view_radius,
-            seed=seed,
-        )
-
-    qmix = QMIX(env(), QmixSettings(num_agents=config.num_agents, random_seed=seed))
-    qmix.load_checkpoint(_CHECKPOINTS["qmix"])
-
-    transf = TransfQMIX(env(), TransfQmixSettings(num_agents=config.num_agents, random_seed=seed))
-    transf.load_checkpoint(_CHECKPOINTS["transfqmix"])
-
-    mappo = MAPPO(
-        RescueEnv(
-            settings,
-            num_agents=config.num_agents,
-            max_steps=config.max_steps,
-            view_radius=view_radius,
-            seed=seed,
-        ),
-        MappoSettings(num_agents=config.num_agents, random_seed=seed),
-    )
-    mappo.load_checkpoint(_CHECKPOINTS["mappo"])
-
-    w_qmix, w_transf = performance_weights(
-        qmix.evaluate(episodes=2)["success_rate"],
-        transf.evaluate(episodes=2)["success_rate"],
-    )
-    ensemble = ValueEnsemble(qmix, transf, env(), w_qmix, w_transf)
-
-    moe = MixtureOfExperts.from_models(
-        qmix=qmix,
-        transf=transf,
-        mappo=mappo,
-        ensemble=ensemble,
-        settings=MoeSettings(
-            num_trials=episodes,
-            random_seed=seed,
-            grid_seed=seed,
-            comm_radius=float(config.sensor_range),
-            epsilon_start=float(config.exploration_rate),
-            alpha=float(config.learning_rate),
-            discount_factor=float(config.discount_factor),
-        ),
-        grid=grid,
-        baselines={},
-        start_positions=starts,
-    )
-    report = moe.run(num_trials=episodes)
-    leader = report.final_leader or FLEET
-    policy = None if leader == FLEET else moe.deep_experts[leader]
-    return {
-        "moe": moe,
-        "leader": leader,
-        "policy": policy,
-        "report": report.to_dict(),
-        "grid": grid,
-        "settings": settings,
-        "starts": starts,
-    }
-
-
-def _require_hybrid_checkpoints() -> None:
-    missing = [path for path in _CHECKPOINTS.values() if not path.exists()]
-    if not missing:
-        return
-    commands = (
-        "Missing hybrid checkpoints: "
-        + ", ".join(str(path) for path in missing)
-        + ". Run: python scripts/train_qmix.py --checkpoint checkpoints/qmix.pt; "
-        "python scripts/train_transfqmix.py --checkpoint checkpoints/transfqmix.pt; "
-        "python scripts/train_mappo.py --checkpoint checkpoints/mappo.pt"
-    )
-    raise FileNotFoundError(commands)
-
-
-def _select_hybrid_actions(moe, leader, policy, flat_obs):
-    from rescue_sim.MoE.moe import FLEET
-
-    if leader == FLEET:
-        policies = {agent_id: moe.fleet.greedy_policy(agent_id) for agent_id in moe.agent_ids}
-        return [
-            int(policies[moe.agent_ids[i]][moe.env.positions[i].y, moe.env.positions[i].x])
-            for i in range(moe.num_agents)
-        ]
-    return policy(moe.env, flat_obs)
-
-
-async def _build_live_hybrid_policy_async(websocket, settings, grid, starts, config, seed):
-    task = asyncio.create_task(
-        asyncio.to_thread(_build_live_hybrid_policy, settings, grid, starts, config, seed)
-    )
-    while not task.done():
-        try:
-            raw = await asyncio.wait_for(websocket.receive_text(), timeout=0.2)
-            msg = json.loads(raw)
-            if msg.get("type") == "stop":
-                await websocket.send_json({"type": "stopped"})
-                return None
-        except asyncio.TimeoutError:
-            pass
-    return await task
-
-
 def _agent_payloads(positions: dict[str, Position]) -> list[dict]:
     return [
         {"id": int(agent_id.split("-")[-1]), "x": position.x, "y": position.y}
@@ -881,7 +548,6 @@ def _build_run_comparison_report(
     grid_settings: GridSettings,
     starts: dict[str, Position],
     config: SimConfig,
-    hybrid_report: dict | None = None,
 ) -> dict:
     if grid is None or grid_settings is None or starts is None:
         raise ValueError("evaluation comparison needs a completed simulation grid")
@@ -899,24 +565,45 @@ def _build_run_comparison_report(
         grid=grid,
         start_positions=starts,
     ).__dict__
-    if hybrid_report:
-        report["hybrid_report"] = hybrid_report
-        report["deep_benchmark"] = _deep_rows_from_hybrid_report(
-            hybrid_report,
-            config.num_agents,
-        )
-        report["deep_benchmark_note"] = (
-            "Deep RL metrics come from the loaded checkpoint models scored by the MoE "
-            "on this same live grid."
-        )
+    report["deep_benchmark"] = _deep_benchmark_rows(grid_settings, config)
+    report["deep_benchmark_note"] = (
+        "Deep RL rows are greedy evaluations of the saved checkpoints on fresh "
+        "grids with the same settings as this run. Train them first: "
+        "docker compose run --rm train-qmix / train-transfqmix / train-mappo."
+    )
     return report
 
 
-def _deep_rows_from_hybrid_report(hybrid_report: dict, num_agents: int) -> list[dict]:
+def _deep_benchmark_rows(grid_settings: GridSettings, config: SimConfig) -> list[dict]:
+    """Greedy checkpoint evaluations of the deep MARL models (QMIX/TransfQMix/MAPPO).
+
+    Each model is loaded from its saved checkpoint and evaluated on fresh grids
+    generated with the same settings as the live run. Models without a matching
+    checkpoint (or with an incompatible one) produce an "unavailable" row with
+    the reason instead of failing the whole report.
+    """
     rows = []
-    leaderboard = hybrid_report.get("leaderboard", {})
-    for name in ("MAPPO", "QMIX", "TransfQMix", "Ensemble", "Distilled"):
-        metrics = leaderboard.get(name)
+    for name, key, service in (
+        ("QMIX", "qmix", "train-qmix"),
+        ("TransfQMix", "transfqmix", "train-transfqmix"),
+        ("MAPPO", "mappo", "train-mappo"),
+    ):
+        path = _CHECKPOINTS[key]
+        error: str | None = None
+        metrics: dict | None = None
+        if not path.exists():
+            error = f"No checkpoint at {path}. Train it: docker compose run --rm {service}"
+        else:
+            try:
+                metrics = _evaluate_deep_checkpoint(name, path, grid_settings, config)
+            except ModuleNotFoundError as exc:
+                error = f"Deep RL needs the optional torch dependency: {exc!s}"
+            except Exception as exc:  # incompatible agents/sensor settings, corrupt file
+                error = (
+                    "Checkpoint could not be evaluated with the current agent count / "
+                    f"sensor range: {exc!s}"
+                )
+
         if metrics is None:
             rows.append(
                 {
@@ -925,23 +612,56 @@ def _deep_rows_from_hybrid_report(hybrid_report: dict, num_agents: int) -> list[
                     "status": "unavailable",
                     "success_rate": None,
                     "average_steps": None,
-                    "average_accumulated_reward": None,
                     "average_rescued_targets": None,
-                    "num_agents": num_agents,
-                    "error": "No checkpoint-backed MoE metrics for this algorithm.",
+                    "average_accumulated_reward": None,
+                    "num_agents": config.num_agents,
+                    "error": error,
                 }
             )
-            continue
-        rows.append(
-            {
-                "agent_name": name,
-                "algorithm_group": "deep_rl_benchmark",
-                "status": "ok",
-                "success_rate": 1.0 if metrics.get("success") else 0.0,
-                "average_steps": float(metrics.get("steps", 0)),
-                "average_accumulated_reward": float(metrics.get("score", 0.0)),
-                "average_rescued_targets": float(metrics.get("rescued", 0)),
-                "num_agents": num_agents,
-            }
-        )
+        else:
+            rows.append(
+                {
+                    "agent_name": name,
+                    "algorithm_group": "deep_rl_benchmark",
+                    "status": "ok",
+                    "success_rate": metrics["success_rate"],
+                    "average_steps": metrics["avg_steps"],
+                    "average_rescued_targets": metrics["avg_rescued"],
+                    "average_accumulated_reward": None,
+                    "num_agents": config.num_agents,
+                }
+            )
     return rows
+
+
+def _evaluate_deep_checkpoint(
+    name: str,
+    path: Path,
+    grid_settings: GridSettings,
+    config: SimConfig,
+    episodes: int = 3,
+) -> dict:
+    """Loads one deep-model checkpoint and runs greedy evaluation episodes."""
+    from rescue_sim.config.settings import MappoSettings, QmixSettings, TransfQmixSettings
+    from rescue_sim.MAPPO import MAPPO, RescueEnv
+    from rescue_sim.QMIX import QMIX
+    from rescue_sim.TransfQMix import EntityRescueEnv, TransfQMIX
+
+    view_radius = max(1, config.sensor_range)
+    seed = grid_settings.random_seed
+
+    if name == "QMIX":
+        env = RescueEnv(grid_settings, num_agents=config.num_agents,
+                        max_steps=config.max_steps, view_radius=view_radius, seed=seed)
+        trainer = QMIX(env, QmixSettings(num_agents=config.num_agents, random_seed=seed))
+    elif name == "TransfQMix":
+        env = EntityRescueEnv(grid_settings, num_agents=config.num_agents,
+                              max_steps=config.max_steps, view_radius=view_radius, seed=seed)
+        trainer = TransfQMIX(env, TransfQmixSettings(num_agents=config.num_agents, random_seed=seed))
+    else:
+        env = RescueEnv(grid_settings, num_agents=config.num_agents,
+                        max_steps=config.max_steps, view_radius=view_radius, seed=seed)
+        trainer = MAPPO(env, MappoSettings(num_agents=config.num_agents, random_seed=seed))
+
+    trainer.load_checkpoint(path)
+    return trainer.evaluate(episodes=episodes)
