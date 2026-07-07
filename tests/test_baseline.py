@@ -17,7 +17,7 @@ from rescue_sim.Qlearning.baseline import (
     BaselineExplorer,
     BaselineMetrics,
     run_episode,
-    CBSExplorer,
+    APFExplorer,
 )
 from rescue_sim.shared import (
     Action,
@@ -314,11 +314,11 @@ class TestRunEpisodeFunction:
         assert isinstance(m, BaselineMetrics)
         assert m.steps >= 1
 
-    def test_cbs_explorer_run(self) -> None:
+    def test_apf_explorer_run(self) -> None:
         grid = Grid(width=5, height=5, obstacles=frozenset(),
                     target_a_positions=frozenset({Position(2,2)}),
                     target_b_positions=frozenset())
-        m = run_episode(CBSExplorer(seed=0),
+        m = run_episode(APFExplorer(seed=0),
                         _SimpleEnv(grid, Position(0,0), ep_max=50), max_steps=50)
         assert isinstance(m, BaselineMetrics)
         assert m.steps >= 1

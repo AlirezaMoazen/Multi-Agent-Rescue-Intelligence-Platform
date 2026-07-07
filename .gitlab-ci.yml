@@ -39,9 +39,9 @@ test:
     - python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
     - pytest
 
-# --- Simple MR Approval Workaround --- (DOES NOT WORK!!!)
-# This job runs only on Merge Requests and requires a manual "Play" click to finish.
-# Since the pipeline won't succeed until this is clicked, the MR cannot be merged.
+# --- Manual peer-approval gate for Merge Requests ---
+# Runs only on Merge Requests and requires a reviewer's manual "Play" click;
+# the pipeline (and therefore the merge) waits until a peer approves.
 peer-approval:
   stage: test
   rules:

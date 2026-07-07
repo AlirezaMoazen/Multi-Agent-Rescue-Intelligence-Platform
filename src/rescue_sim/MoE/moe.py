@@ -1,4 +1,5 @@
-# Copyright 2026 Alireza Moazen (alirezamoazen.com)
+# Copyright 2026 TUHH Group 05 — A. Herrero Callejo, C. Marcos Alonso,
+# M. M. Orfany, A. Moazzen (alirezamoazen.com)
 # Licensed under the Apache License, Version 2.0 (the "License");
 # Developed within Group 5 at the Hamburg University of Technology (TUHH)
 # Under the academic supervision of Prof. Dr. Rainer Marrone.
@@ -322,6 +323,14 @@ class NeuralMoEPolicy(nn.Module):
         self.action_dim = action_dim
         self.num_agents = num_agents
         self.latent_dim = latent_dim
+        # Gate sharpening temperature: 1.0 = soft blend; <1 pushes routing
+        # toward winner-take-all so the MoE acts like its best expert per
+        # state instead of a logit compromise. Set by outcome-based router
+        # training; persisted by save_moe_policy.
+        self.gate_tau = 1.0
+        # Optional per-expert routing bias [3] (log-space), set at rollout time
+        # by the online scoreboard adaptation. None = no bias. Not persisted.
+        self.route_bias: Optional[torch.Tensor] = None
 
         # Dual-Encoder Topology
         self.expert_encoder = SharedFeatureEncoder(obs_dim, num_agents, view_radius, latent_dim)
@@ -418,6 +427,18 @@ class NeuralMoEPolicy(nn.Module):
         z_ego = z_router  # already [B*A, D]
 
         weights_flat = self.router(z_ego, z_peers, peer_mask)  # [B*A, 3]
+
+        # Optional gate sharpening (near winner-take-all routing).
+        if self.gate_tau != 1.0:
+            weights_flat = torch.softmax(
+                torch.log(weights_flat.clamp_min(1e-8)) / self.gate_tau, dim=-1
+            )
+
+        # Online scoreboard adaptation: bias routing toward experts that are
+        # actually delivering rescues on the current grid (rollout-only).
+        if self.route_bias is not None:
+            biased = weights_flat * torch.exp(self.route_bias.to(weights_flat.device))
+            weights_flat = biased / biased.sum(dim=-1, keepdim=True).clamp_min(1e-8)
 
         # Actor-Critic Logit Blending: y_final = sum(g_j * y_j)
         y_final_flat = (

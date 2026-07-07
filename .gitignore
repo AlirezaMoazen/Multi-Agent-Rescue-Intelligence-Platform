@@ -1,3 +1,6 @@
+# OS cruft
+.DS_Store
+
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -8,6 +11,13 @@ venv/
 build/
 dist/
 *.egg-info/
+
+# Checkpoint backups (the .pt checkpoints themselves are tracked)
+checkpoints/*.bak
+checkpoints/*.pt.bak
+
+# Local tool settings
+.claude/
 
 # Frontend
 node_modules/

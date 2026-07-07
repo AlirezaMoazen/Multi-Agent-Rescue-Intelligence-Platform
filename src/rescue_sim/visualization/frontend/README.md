@@ -1,16 +1,46 @@
-# React + Vite
+# Rescue Sim — Visualization Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React + Vite dashboard for the rescue simulation. It connects to the FastAPI
+backend (`src/rescue_sim/visualization/api.py`) over WebSocket and renders the
+live grid, agent trails, MoE expert routing, per-try metrics, and the
+Experts-vs-MoE comparison panel.
 
-Currently, two official plugins are available:
+## Development
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+```bash
+npm install
+npm run dev        # Vite dev server on :5173, proxying the API on :8000
+```
 
-## React Compiler
+Run the backend alongside it:
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+```bash
+uvicorn src.rescue_sim.visualization.api:app --reload --port 8000
+```
 
-## Expanding the ESLint configuration
+## Production build
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+```bash
+npm run build      # outputs to dist/
+```
+
+The Docker image (`Dockerfile` at the repo root) runs this build and serves
+`dist/` from the backend at `/app`, so in Docker you never need to run npm
+yourself — `docker compose up --build viz` does everything.
+
+## Layout
+
+```text
+src/
+├── App.jsx                 # page layout, run-mode buttons, config wiring
+├── hooks/useSimulation.js  # WebSocket client + simulation state
+└── components/
+    ├── GridCanvas.jsx      # canvas renderer: grid, agents, trails, rescues
+    ├── ControlPanel.jsx    # start/stop/restart, speed, skip-to-results
+    ├── ParameterPanel.jsx  # scenario summary
+    ├── StatsBar.jsx        # live episode/step/rescued counters
+    ├── MoePanel.jsx        # expert routing weights, tries, adaptation board
+    ├── MetricsChart.jsx    # per-episode reward/steps chart
+    ├── PolicyComparison.jsx# Experts vs. MoE head-to-head (REST)
+    └── EvaluationPanel.jsx # baseline comparison table (fleet mode)
+```

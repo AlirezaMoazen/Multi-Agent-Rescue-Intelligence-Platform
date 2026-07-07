@@ -286,11 +286,45 @@ body {
   transform: none;
 }
 
+.skip-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 10px 14px;
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-sm);
+  background: var(--bg-glass);
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  user-select: none;
+  transition: all var(--transition-fast);
+}
+.skip-toggle:hover {
+  border-color: var(--border-hover);
+  color: var(--text-primary);
+}
+.skip-toggle input {
+  accent-color: var(--accent-cyan);
+  cursor: pointer;
+}
+.skip-toggle:has(input:checked) {
+  border-color: var(--accent-cyan);
+  color: var(--accent-cyan);
+}
+
 .speed-control {
   display: flex;
   align-items: center;
   gap: 10px;
   margin-left: auto;
+}
+
+.speed-slider:disabled {
+  opacity: 0.35;
 }
 
 .speed-control label {
@@ -926,24 +960,6 @@ body {
   align-items: center;
 }
 
-.moe-trained-badge {
-  padding: 2px 8px;
-  border-radius: 4px;
-  border: 1px solid var(--border-glass);
-  background: var(--bg-glass);
-  color: var(--text-muted);
-  font-size: 0.62rem;
-  font-weight: 800;
-  letter-spacing: 0.03em;
-  text-transform: none;
-}
-
-.moe-trained-badge.trained {
-  border-color: rgba(52, 211, 153, 0.35);
-  background: var(--accent-green-dim);
-  color: var(--accent-green);
-}
-
 .moe-section-label {
   margin: 12px 0 8px;
   padding-top: 10px;
@@ -965,6 +981,60 @@ body {
 
 .moe-share-seg {
   height: 100%;
+}
+
+.moe-share-seg + .moe-share-seg {
+  border-left: 2px solid var(--bg-glass);
+}
+
+.moe-adaptation {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+.moe-adapt-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.7rem;
+}
+
+.moe-adapt-label {
+  width: 20px;
+  color: var(--text-secondary, #94a3b8);
+}
+
+.moe-adapt-track {
+  position: relative;
+  flex: 1;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--bg-glass);
+  overflow: hidden;
+}
+
+.moe-adapt-fill {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border-radius: 4px;
+}
+
+.moe-adapt-zero {
+  position: absolute;
+  left: 50%;
+  top: -1px;
+  bottom: -1px;
+  width: 1px;
+  background: rgba(148, 163, 184, 0.5);
+}
+
+.moe-adapt-value {
+  width: 40px;
+  text-align: right;
+  color: var(--text-secondary, #94a3b8);
+  font-variant-numeric: tabular-nums;
 }
 
 .moe-tries {
@@ -1097,3 +1167,8 @@ body {
   background: linear-gradient(90deg, #3b82f6, #10b981, #f59e0b, #8b5cf6);
 }
 .cmp-skel-text { text-align: center; color: var(--text-muted); font-size: 0.72rem; }
+
+.moe-usage-chart {
+  height: 140px;
+  margin-bottom: 10px;
+}

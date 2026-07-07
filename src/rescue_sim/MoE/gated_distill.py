@@ -1,4 +1,5 @@
-# Copyright 2026 Alireza Moazen (alirezamoazen.com)
+# Copyright 2026 TUHH Group 05 — A. Herrero Callejo, C. Marcos Alonso,
+# M. M. Orfany, A. Moazzen (alirezamoazen.com)
 # Licensed under the Apache License, Version 2.0 (the "License");
 # Developed within Group 5 at the Hamburg University of Technology (TUHH).
 #
@@ -419,3 +420,132 @@ def train_gated_expert2(policy, env, checkpoint_dir: str = "checkpoints",
     metrics["temperatures"] = {"qmix": round(bank.tau["qmix"], 3),
                                "transf": round(bank.tau["transf"], 3)}
     return metrics
+
+
+# ---------------------------------------------------------------------------
+# Outcome-labeled MoE router training (real-MoE gate, not rule-based)
+# ---------------------------------------------------------------------------
+def train_outcome_router(
+    policy,
+    env,
+    checkpoint_dir: str = "checkpoints",
+    seed: int = 0,
+    episodes: int = 4,
+    max_steps: int = 70,
+    steps: int = 200,
+    batch_size: int = 64,
+    lr: float = 1e-3,
+    gate_tau: float = 0.25,
+) -> dict:
+    """Retrains the MoE gating router on OUTCOME labels instead of hand rules.
+
+    For every state the MoE itself visits, each expert head proposes its greedy
+    action, and the proposals are judged by the calibrated teacher mixture's
+    probability for that action — the router learns to hand each state to the
+    expert whose action the trained deep-RL models rate best. Isolated agents
+    (no peers) are always labelled fallback, since coordination needs comms.
+    The expert heads stay frozen throughout. Finally the gate temperature is
+    sharpened (``gate_tau``) so routing is near winner-take-all rather than a
+    logit blend of incompatible scales.
+
+    Returns ``{"acc": ..., "gate_tau": ..., "n_states": ..., "expert_share": ...}``.
+    """
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    bank = TeacherBank.from_checkpoints(env, checkpoint_dir)
+    A = env.num_agents
+    neg = -1e9
+
+    # -- collect (state, best-expert) pairs by rolling the current MoE -------
+    obs_buf, peer_buf, label_buf = [], [], []
+    policy.gate_tau = 1.0  # soft gate while labelling (sharpened at the end)
+    policy.eval()
+    for _ in range(episodes):
+        env.reset()
+        hidden = None
+        for _ in range(max_steps):
+            flat = np.asarray(env._observations(), dtype=np.float32)     # [A, obs]
+            tokens = env.entity_obs().astype(np.float32)
+            mask_np = env.valid_action_mask()
+            peer = build_peer_matrix(env.positions)                       # [A, A]
+
+            obs_t = torch.as_tensor(flat).unsqueeze(0)
+            peer_t = torch.as_tensor(peer, dtype=torch.float32).unsqueeze(0)
+            mask_t = torch.as_tensor(mask_np, dtype=torch.bool).unsqueeze(0)
+
+            with torch.no_grad():
+                # Per-head greedy proposals (same frozen encoder + GRU state).
+                peer_count = peer_t.sum(-1).view(A, 1)
+                z = policy.expert_encoder(obs_t.view(A, -1), peer_count)
+                y0 = policy.expert_exploration(z)
+                y1 = policy.expert_coordination(z)
+                h_flat = hidden.view(A, -1) if hidden is not None else None
+                y2, _ = policy.expert_fallback(z, h_flat)
+                m = mask_t.view(A, -1)
+                proposals = torch.stack([
+                    y0.masked_fill(~m, neg).argmax(-1),
+                    y1.masked_fill(~m, neg).argmax(-1),
+                    y2.masked_fill(~m, neg).argmax(-1),
+                ], dim=1)                                                 # [A, 3]
+
+                # Judge proposals with the calibrated teacher mixture.
+                dists = bank.dists(torch.as_tensor(flat), torch.as_tensor(tokens))
+                p_mix = dists.mean(dim=0)                                 # [A, n_act]
+                scores = p_mix.gather(1, proposals)                       # [A, 3]
+                labels = scores.argmax(dim=1)                             # [A]
+                labels[peer_t.view(A, A).sum(-1) <= 1.0] = 2              # comms rule
+
+                # Step with the MoE's own greedy action (distribution match).
+                y_final, _w, hidden = policy(obs_t, peer_t, mask_t, hidden)
+                actions = y_final.view(A, -1).masked_fill(~m, neg).argmax(-1)
+
+            obs_buf.append(flat)
+            peer_buf.append(peer.astype(np.float32))
+            label_buf.append(labels.numpy())
+            _, _, done, _ = env.step(actions.numpy())
+            if done:
+                break
+
+    obs_all = torch.as_tensor(np.stack(obs_buf))                          # [N, A, obs]
+    peer_all = torch.as_tensor(np.stack(peer_buf))                        # [N, A, A]
+    lab_all = torch.as_tensor(np.stack(label_buf), dtype=torch.long)      # [N, A]
+    n_states = obs_all.shape[0]
+
+    # -- train only the router branch on the outcome labels ------------------
+    for p in policy.parameters():
+        p.requires_grad = False
+    router_params = list(policy.router_encoder.parameters()) + list(policy.router.parameters())
+    for p in router_params:
+        p.requires_grad = True
+    opt = torch.optim.Adam(router_params, lr=lr)
+
+    acc = 0.0
+    policy.train()
+    for _ in range(steps):
+        idx = rng.integers(0, n_states, size=min(batch_size, n_states))
+        ob, pe, lb = obs_all[idx], peer_all[idx], lab_all[idx]
+        mask = torch.ones(len(idx), A, policy.action_dim, dtype=torch.bool)
+        _, weights, _ = policy(ob, pe, mask)
+        loss = F.nll_loss(torch.log(weights.reshape(-1, 3) + _EPS), lb.reshape(-1))
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        acc = float((weights.reshape(-1, 3).argmax(-1) == lb.reshape(-1)).float().mean() * 100)
+
+    for p in policy.parameters():
+        p.requires_grad = True
+    policy.gate_tau = gate_tau
+    policy.eval()
+
+    share = torch.bincount(lab_all.reshape(-1), minlength=3).float()
+    share = (share / share.sum()).tolist()
+    return {
+        "acc": acc,
+        "gate_tau": gate_tau,
+        "n_states": int(n_states),
+        "expert_share": {
+            "explore": round(share[0], 3),
+            "coord": round(share[1], 3),
+            "fallback": round(share[2], 3),
+        },
+    }

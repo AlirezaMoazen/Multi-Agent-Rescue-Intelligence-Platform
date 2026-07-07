@@ -67,7 +67,7 @@ Each agent operates within a **3-block visibility radius** — a 7×7 ego-centri
 
 The simulator foundation is complete, and every planned learning strategy is implemented and tested:
 
-- **Classical baselines** (no learning) — frontier/DFS exploration plus the MAPF planners (prioritized planning, CBS, ICBS, ECBS, M\*), runnable single-agent **and** as a synchronized multi-agent team.
+- **Classical baselines** (no learning) — frontier-greedy exploration and Artificial Potential Fields (APF) swarm navigation, runnable single-agent **and** as a synchronized multi-agent team.
 - **Tabular RL** — single-agent Q-learning and a decentralized **Epidemic Hysteretic Q-Learning** fleet with peer-to-peer gossip.
 - **Deep MARL (CTDE)** — MAPPO, QMIX, and TransfQMix, plus a **ValueEnsemble** and a distilled student that combine the two value methods.
 - **Mixture-of-Experts** — attention-gated routing across three specialized expert heads with GRU-based temporal fallback under communication blackout.
@@ -166,7 +166,7 @@ The project compares a ladder of rescue strategies against non-learning
 baselines. They all share one contract — the same `Action` set, `Grid`,
 observation, and `calculate_reward` — so the numbers are directly comparable.
 
-**Status:** ✅ all implemented — **Baselines** (frontier/DFS + MAPF planners, single- and multi-agent), **Q-Learning** (single-agent), **Epidemic Hysteretic Q-Learning** (decentralized multi-agent), **MAPPO** (deep, policy-gradient, CTDE), **QMIX** (deep, value-decomposition, CTDE), **TransfQMix** (deep, transformer-based, CTDE), a **ValueEnsemble** + distilled student, and a **Mixture-of-Experts** gate.
+**Status:** ✅ all implemented — **Baselines** (frontier greedy + APF potential fields, single- and multi-agent), **Q-Learning** (single-agent), **Epidemic Hysteretic Q-Learning** (decentralized multi-agent), **MAPPO** (deep, policy-gradient, CTDE), **QMIX** (deep, value-decomposition, CTDE), **TransfQMix** (deep, transformer-based, CTDE), a **ValueEnsemble** + distilled student, and a **Mixture-of-Experts** gate.
 
 > **Reading guide for juniors.** Each section below states *what problem the
 > method solves*, *the key equation in plain symbols*, and *how it differs from
@@ -182,16 +182,11 @@ observation, and `calculate_reward` — so the numbers are directly comparable.
 Defined in `src/rescue_sim/Qlearning/baseline.py`. None of these use a reward
 signal — they are the **performance floor** every learning method must beat.
 
-*Exploration heuristics:*
+*Non-learning strategies (both honestly decentralized — every decision comes
+from the agent's own sensing):*
 
 - **BaselineExplorer** (`frontier`) — frontier-greedy: scores candidate moves +2 for unvisited cells and +1 for frontier adjacency; always picks the best score.
-- **DFSExplorer** (`dfs`) — depth-first search: a LIFO stack of unvisited neighbors, with BFS over the discovered map to reach non-adjacent targets.
-
-*Classical multi-agent path-finding (MAPF) planners:*
-
-- **PrioritizedPlanningExplorer** (`prioritized_planning`) — plans agents one at a time in priority order; each treats higher-priority agents' paths as moving obstacles.
-- **CBSExplorer** / **ICBSExplorer** / **ECBSExplorer** (`cbs`/`icbs`/`ecbs`) — Conflict-Based Search: plan each agent independently, detect the first conflict, branch by adding a constraint to one agent, and re-plan. ICBS improves conflict selection; ECBS is the bounded-suboptimal, faster variant.
-- **MStarExplorer** (`mstar`) — M\*: searches the joint configuration space but only "couples" agents where their individual optimal paths actually collide, keeping the branching factor low.
+- **APFExplorer** (`apf`) — Artificial Potential Fields (Khatib 1986): per-agent force sum of target attraction, teammate separation (spreads the swarm's joint sensor footprint), obstacle repulsion, and open-space attraction. Also serves as the teacher for the MoE's Expert 1 and as the **"Non-AI (APF)"** competitor in the dashboard's head-to-head panel — the gap between it and the ML policies quantifies what learning buys. (The earlier centralized CBS planner was removed: a central plan cannot be executed from local observations, so it fits neither the CTDE setting nor the MoE.)
 
 **Multi-agent runner.** `run_multi_agent_baseline` /
 `compare_multi_agent_baselines` (`src/rescue_sim/Qlearning/multi_agent_baseline.py`)
@@ -550,7 +545,7 @@ src/rescue_sim/
 │                        #   ReplayBuffer, RunningMeanStd, orthogonal_init, hard_update
 │                        #   (torch is imported lazily so shared.py stays import-light)
 ├── Qlearning/
-│   ├── baseline.py            # frontier/DFS + MAPF planners (CBS/ICBS/ECBS/M*)
+│   ├── baseline.py            # frontier greedy + APF potential fields (non-AI)
 │   ├── q_learning.py          # single-agent Q + Epidemic Hysteretic fleet
 │   ├── communications.py      # Default/Resilient gossip buses (the channel)
 │   └── multi_agent_baseline.py# run any baseline as a synchronized team
@@ -636,6 +631,21 @@ trajectory history and escapes dead-ends instead of blind looping:
 
 $$h_t = \operatorname{GRU}(z_t,\ h_{t-1}), \qquad y^{(3)} = W_o\,h_t$$
 
+**Expert teachers (what each head is distilled from).** E1 clones the
+**APF baseline** (`Qlearning/baseline.py::APFExplorer`) — the real non-AI
+swarm algorithm. E2 is distilled from **all three trained deep-RL
+checkpoints** (MAPPO + QMIX + TransfQMix) via calibrated-temperature gated
+reverse-KL (`MoE/gated_distill.py`), and the router is then retrained on
+**outcome labels** (which expert's action the trained teachers rate best per
+visited state) with a sharpened, near winner-take-all gate. E3's GRU head
+clones a learnable sweep policy for cold-start — and during dashboard
+rollouts the **real Epidemic Hysteretic Q fleet runs live**: it learns from
+every transition, gossips Q-tables through the comms layer, persists its
+tables across tries on the fixed grid, and takes control whenever the router
+selects the fallback expert. (Distilling the epidemic learner offline was
+tried and measured at 0-8% MoE success vs ~57% — its policy is keyed to a
+per-grid Q-table that local observations cannot expose, so it must run live.)
+
 **Logit blending mechanics.** The final policy logits are the gate-weighted sum
 of the three expert heads, then invalid moves are masked before the softmax:
 
@@ -720,6 +730,15 @@ full production pipeline on the real 20×20 grid and prints the numbers live:
   <https://arxiv.org/abs/2409.03052>
 - **Policy distillation** (used by the Ensemble's `Distiller`) — Rusu et al.,
   *Policy Distillation*, ICLR 2016 — <https://arxiv.org/abs/1511.06295>
+- **Knowledge distillation / temperature softening** (TeacherBank calibration in
+  `MoE/gated_distill.py`) — Hinton, Vinyals & Dean, *Distilling the Knowledge in
+  a Neural Network*, NeurIPS-W 2015 — <https://arxiv.org/abs/1503.02531>
+- **Reverse-KL distillation** (the gated E2 objective) — Agarwal et al.,
+  *On-Policy Distillation of Language Models (GKD)*, ICLR 2024 —
+  <https://arxiv.org/abs/2306.13649>
+- **Value-target normalization** (PopArt-style stabilization applied to
+  QMIX/TransfQMix TD targets) — van Hasselt et al., *Learning values across
+  many orders of magnitude*, NeurIPS 2016 — <https://arxiv.org/abs/1602.07714>
 - **Mixture-of-Experts** (the gating idea behind `MoE/`) — Jacobs, Jordan,
   Nowlan & Hinton, *Adaptive Mixtures of Local Experts*, Neural Computation 1991;
   sparsely-gated modern form: Shazeer et al., ICLR 2017 — <https://arxiv.org/abs/1701.06538>
@@ -727,9 +746,9 @@ full production pipeline on the real 20×20 grid and prints the numbers live:
   algorithm selection) — Rice, *The Algorithm Selection Problem*, 1976; SATzilla:
   Xu, Hutter, Hoos & Leyton-Brown, *Portfolio-based Algorithm Selection for SAT*,
   JAIR 2008 — <https://arxiv.org/abs/1111.2249>
-- **MAPF baselines** — CBS: Sharon et al., *Conflict-Based Search for Optimal
-  Multi-Agent Pathfinding*, AIJ 2015; M\*: Wagner & Choset, *Subdimensional
-  Expansion for Multirobot Path Planning*, AIJ 2015.
+- **Artificial Potential Fields** (the `apf` baseline and Expert 1's teacher) —
+  Khatib, *Real-Time Obstacle Avoidance for Manipulators and Mobile Robots*,
+  ICRA 1985 / IJRR 1986.
 
 ---
 
@@ -872,8 +891,12 @@ docker compose run --rm lint
 
 This project is licensed under the Apache License, Version 2.0. See the [LICENSE](LICENSE) file for the full license text.
 
-* **Author**: Alireza Moazen ([alirezamoazen.com](http://alirezamoazen.com))
-* **Institution**: Developed within Group 5 at the Hamburg University of Technology (TUHH)
-* **Academic Supervision**: Prof. Dr. Rainer Marrone
+* **Authors (Group 05)**:
+  * Adriana Herrero Callejo
+  * Cristina Marcos Alonso
+  * Mohammad Mustafa Orfany
+  * Alireza Moazzen ([alirezamoazen.com](http://alirezamoazen.com))
+* **Institution**: Hamburg University of Technology (TUHH) — Software Development SS26
+* **Supervisor**: Rainer Marrone
 
 

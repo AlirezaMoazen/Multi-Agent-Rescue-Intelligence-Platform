@@ -1,4 +1,5 @@
-# Copyright 2026 Alireza Moazen (alirezamoazen.com)
+# Copyright 2026 TUHH Group 05 — A. Herrero Callejo, C. Marcos Alonso,
+# M. M. Orfany, A. Moazzen (alirezamoazen.com)
 # Licensed under the Apache License, Version 2.0 (the "License");
 # Developed within Group 5 at the Hamburg University of Technology (TUHH)
 # Under the academic supervision of Prof. Dr. Rainer Marrone.
@@ -194,40 +195,59 @@ class _RescueTeacher:
 
 
 class ExplorationTeacher(_RescueTeacher):
-    """Expert 1 (non-AI explorer): rescue what you see, otherwise spread out.
+    """Expert 1 teacher: the real APF baseline (``Qlearning.baseline.APFExplorer``).
 
-    Moving away from visible teammates maximizes joint sensor coverage, and
-    the teammate positions are in the observation, so the rule is learnable.
+    Thin adapter that builds per-agent ``LearningState``s from the ego window
+    and delegates action choice to the Artificial Potential Fields strategy —
+    so E1 behaviorally clones the project's actual non-AI multi-robot
+    algorithm rather than an ad-hoc rule. Every APF force term is computable
+    from the window, which keeps the policy learnable by the feed-forward head.
     """
 
+    def _reset_state(self, env: RescueEnv) -> None:
+        from rescue_sim.Qlearning.baseline import APFExplorer
+
+        self._apf = APFExplorer(seed=int(self.rng.integers(0, 2**31 - 1)))
+
     def act(self, env: RescueEnv, valid_mask: np.ndarray) -> np.ndarray:
+        from rescue_sim.shared import LearningState
+
+        assert env.grid is not None
+        r = env.view_radius
         actions = np.zeros(env.num_agents, dtype=np.int64)
         for i, pos in enumerate(env.positions):
-            target = self._visible_target(env, i)
-            if target is not None:
-                actions[i] = self._step_toward(env, i, target, valid_mask)
+            window = [
+                Position(cx, cy)
+                for cy in range(pos.y - r, pos.y + r + 1)
+                for cx in range(pos.x - r, pos.x + r + 1)
+                if env.grid.contains(Position(cx, cy))
+            ]
+            live_visible = frozenset(
+                t for t in self.remaining
+                if abs(t.x - pos.x) <= r and abs(t.y - pos.y) <= r
+            )
+            state = LearningState(
+                agent_id=f"a{i}",
+                agent_position=pos,
+                visible_cells=frozenset(window),
+                visible_obstacles=frozenset(
+                    c for c in window if env.grid.is_blocked(c)
+                ),
+                visible_target_a_positions=live_visible,
+            )
+            valid = tuple(
+                CARDINAL_ACTIONS[a]
+                for a in range(len(CARDINAL_ACTIONS))
+                if valid_mask[i, a]
+            )
+            if not valid:
+                actions[i] = 0
                 continue
-            teammates = self._visible_teammates(env, i)
-            if teammates:
-                # Disperse: pick the valid move that gains the most distance
-                best_gain, best_actions = -(10 ** 9), []
-                for a, (dx, dy) in enumerate(ACTION_DELTAS):
-                    if not valid_mask[i, a]:
-                        continue
-                    gain = sum(
-                        abs(t.x - (pos.x + dx)) + abs(t.y - (pos.y + dy))
-                        for t in teammates
-                    )
-                    if gain > best_gain:
-                        best_gain, best_actions = gain, [a]
-                    elif gain == best_gain:
-                        best_actions.append(a)
-                actions[i] = (
-                    int(self.rng.choice(best_actions)) if best_actions
-                    else self._toward_open_space(env, i, valid_mask)
-                )
-            else:
-                actions[i] = self._toward_open_space(env, i, valid_mask)
+            chosen = self._apf.select_action(f"a{i}", state, valid)
+            if chosen in CARDINAL_ACTIONS:
+                actions[i] = CARDINAL_ACTIONS.index(chosen)
+            else:  # WAIT fallback: take any valid move
+                actions[i] = int(np.flatnonzero(valid_mask[i])[0])
         return actions
 
 
@@ -263,12 +283,18 @@ class CoordinationTeacher(_RescueTeacher):
 
 
 class FallbackTeacher(_RescueTeacher):
-    """Expert 3 (local hysteretic Q style): a competent lone wolf.
+    """Expert 3 BC teacher: a learnable lone-wolf sweep for the GRU head.
 
     Rescues any target it sees; otherwise keeps its heading and rotates
-    clockwise on walls (wall-following). The persistence is temporal state,
-    which is exactly what the GRU fallback head can represent — so an
-    isolated agent sweeps the map instead of blind looping.
+    clockwise on walls (wall-following). Every decision is inferable from the
+    ego window + short memory, so behavioral cloning works. Distilling the
+    *real* epidemic hysteretic Q policy was tried and measured at 0-8% MoE
+    success (vs ~57%): its greedy policy is keyed to a converged per-grid
+    Q-table the local observation cannot expose. The genuine epidemic
+    Q-learner instead runs LIVE during dashboard rollouts (see
+    visualization/api.py::_run_moe_rollout), where it learns the fixed
+    competition grid across tries — tabular learning needs grid persistence,
+    not distillation.
     """
 
     def _reset_state(self, env: RescueEnv) -> None:
@@ -781,4 +807,113 @@ def train_moe_policy(
               f"weights={metrics['teacher_weights']}")
 
     run_router_optimization(policy, datasets, router_steps, router_batch, lr, seed, on_router_step)
+
+    # Final stage: retrain the gate on outcome labels (which expert's action
+    # the trained teachers rate best per visited state) and sharpen it toward
+    # winner-take-all. Rule-based optimization above serves as initialization.
+    if e2_gated and ensemble is not None and hasattr(collect_env, "entity_obs"):
+        try:
+            from rescue_sim.MoE.gated_distill import train_outcome_router
+
+            rm = train_outcome_router(policy, collect_env, checkpoint_dir=checkpoint_dir, seed=seed)
+            print(f"[MoE] outcome router: acc={rm['acc']:.1f}% tau={rm['gate_tau']} "
+                  f"share={rm['expert_share']} (n={rm['n_states']})")
+        except Exception as exc:  # noqa: BLE001 - gate refinement must not kill training
+            print(f"[MoE] outcome router skipped ({exc})")
     return policy
+
+
+# ── Persistence: pretrained MoE checkpoint (checkpoints/moe.pt) ─────────────
+
+def save_moe_policy(
+    policy: NeuralMoEPolicy,
+    path: str,
+    obs_dim: int,
+    view_radius: int,
+    shape: tuple,
+    epochs: int,
+) -> None:
+    """Save the trained MoE with everything needed to rebuild it at load time.
+
+    ``shape`` is the dashboard compatibility key (grid_w, grid_h, num_agents,
+    view_radius); a loaded policy is only reused when the requested config
+    matches it exactly.
+    """
+    from pathlib import Path
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "state_dict": policy.state_dict(),
+            "obs_dim": obs_dim,
+            "num_agents": policy.num_agents,
+            "view_radius": view_radius,
+            "action_dim": policy.action_dim,
+            "latent_dim": policy.latent_dim,
+            "shape": tuple(shape),
+            "epochs": int(epochs),
+            "gate_tau": float(getattr(policy, "gate_tau", 1.0)),
+        },
+        target,
+    )
+
+
+def load_moe_policy(path: str) -> tuple[NeuralMoEPolicy, tuple, int] | None:
+    """Load a pretrained MoE checkpoint; returns (policy, shape, epochs) or None."""
+    from pathlib import Path
+
+    source = Path(path)
+    if not source.is_file():
+        return None
+    ckpt = torch.load(source, map_location="cpu", weights_only=False)
+    policy = NeuralMoEPolicy(
+        ckpt["obs_dim"],
+        ckpt["num_agents"],
+        ckpt["view_radius"],
+        ckpt["action_dim"],
+        ckpt["latent_dim"],
+    )
+    policy.load_state_dict(ckpt["state_dict"])
+    policy.gate_tau = float(ckpt.get("gate_tau", 1.0))
+    policy.eval()
+    return policy, tuple(ckpt["shape"]), int(ckpt["epochs"])
+
+
+def evaluate_moe_policy(
+    policy: NeuralMoEPolicy,
+    env: RescueEnv,
+    episodes: int = 15,
+) -> dict:
+    """Greedy full-MoE rollouts; returns success_rate / avg_rescued / avg_steps.
+
+    Uses the env's own RNG stream, so seeding the env fixes the grid sequence —
+    pass a freshly constructed env for a reproducible validation set.
+    """
+    policy.eval()
+    successes, rescued, steps = [], [], []
+    for _ in range(episodes):
+        obs = env.reset()
+        hidden = None
+        done = False
+        info = {"success": False, "rescued": 0, "steps": 0}
+        while not done:
+            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+            peer_t = torch.tensor(
+                build_peer_matrix(env.positions), dtype=torch.float32
+            ).unsqueeze(0)
+            mask_t = torch.tensor(env.valid_action_mask(), dtype=torch.bool).unsqueeze(0)
+            with torch.no_grad():
+                y_final, _weights, hidden = policy(obs_t, peer_t, mask_t, hidden)
+            logits = y_final.squeeze(0).masked_fill(~mask_t.squeeze(0), -1e9)
+            actions = torch.argmax(logits, dim=-1)
+            obs, _reward, done, info = env.step(actions.numpy())
+        successes.append(bool(info["success"]))
+        rescued.append(int(info["rescued"]))
+        steps.append(int(info["steps"]))
+    n = max(len(successes), 1)
+    return {
+        "success_rate": sum(successes) / n,
+        "avg_rescued": sum(rescued) / n,
+        "avg_steps": sum(steps) / n,
+    }

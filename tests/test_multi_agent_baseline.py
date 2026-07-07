@@ -5,7 +5,7 @@ from rescue_sim.Qlearning.baseline import (
     compare_multi_agent_baselines,
     default_start_positions,
     run_multi_agent_baseline,
-    CBSExplorer,
+    APFExplorer,
 )
 from rescue_sim.shared import Action, LearningState, Transition
 
@@ -90,11 +90,11 @@ def test_compare_multi_agent_baselines_runs_existing_non_ml_strategies() -> None
         seed=3,
         baseline_factories={
             "frontier": BaselineExplorer,
-            "cbs": CBSExplorer,
+            "apf": APFExplorer,
         },
     )
 
-    assert set(results) == {"frontier", "cbs"}
+    assert set(results) == {"frontier", "apf"}
     assert all(metrics.num_agents == 2 for metrics in results.values())
     assert all(metrics.total_targets == 2 for metrics in results.values())
     assert all(metrics.steps <= 20 for metrics in results.values())

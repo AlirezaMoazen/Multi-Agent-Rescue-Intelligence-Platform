@@ -1,30 +1,45 @@
 # Contributing Guide
 
-Welcome to our project! Since we are a small university team, we use a very simple and lightweight workflow to make sure code is reviewed before it gets merged into `main`.
+Thanks for your interest in the project! Contributions of any size are
+welcome — bug reports, doc fixes, new experiments, frontend polish.
 
-## 1. Branching
-When starting a new task, create a branch from `main`:
+## Getting set up
+
 ```bash
-git checkout main
-git pull
-git checkout -b your-feature-name
+git clone <your-fork-url>
+cd group05
+pip install -e ".[dev]"                 # Python package + pytest + ruff
+pip install torch --index-url https://download.pytorch.org/whl/cpu  # deep RL / MoE
 ```
 
-## 2. Opening a Merge Request (MR)
-When your feature is done, push your branch and open an MR on GitLab.
-- The default MR template will load automatically.
-- Fill out the template explaining what you did and how to test it.
-- **Do not merge your own code immediately.**
+Or use Docker for everything: `docker compose up --build viz`.
 
-## 3. Peer Review & Approval
-Because GitLab Free does not have an "Enforce Approvals" setting, we use a custom CI workaround.
-When you open an MR, the pipeline will run tests and then **stop** on a manual job called `peer-approval`.
+## Workflow
 
-**For the Reviewer:**
-1. Read the code changes in the MR.
-2. If everything looks good, go to the **Pipelines** tab of the MR.
-3. Find the `peer-approval` job and click the **Play (▶️)** button.
-4. The pipeline will now succeed, and the MR can be merged!
+1. **Branch** from `main`:
+   ```bash
+   git checkout -b your-feature-name
+   ```
+2. **Make your change.** Keep it focused — one topic per branch.
+3. **Check it passes what CI runs:**
+   ```bash
+   ruff check src tests scripts
+   pytest
+   ```
+   If you touched the frontend, also make sure it builds:
+   ```bash
+   cd src/rescue_sim/visualization/frontend && npm run build
+   ```
+4. **Open a merge/pull request** describing what you changed and how you
+   tested it. A maintainer reviews it before merge — please don't merge your
+   own unreviewed changes.
 
-## 4. Merging
-Once the pipeline has succeeded (because your reviewer clicked Play), you can click **Merge** to bring your changes into `main`.
+## Guidelines
+
+- Match the style of the surrounding code; `ruff` (line length 100) is the
+  source of truth for Python formatting issues.
+- Add or update tests under `tests/` for behavior changes.
+- Update the relevant docs (`README.md`, `docs/architecture.md`) when you
+  change how something works or is run.
+- Retrained checkpoints (`checkpoints/*.pt`) should only be committed when
+  the training change that produced them is part of the same request.

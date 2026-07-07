@@ -114,11 +114,12 @@ class SimConfig(BaseModel):
     num_agents: int = _DEFAULT_FLEET.num_agents
     sensor_range: int = _DEFAULT_AGENT.get("sensor_range", 3)
     max_steps: int = _DEFAULT_SIMULATION.get("max_steps", 500)
-    num_episodes: int = 20
+    num_episodes: int = 30
     learning_rate: float = 0.1
     discount_factor: float = 0.9
     exploration_rate: float = 1.0
     speed_ms: int = 100  # delay between steps in ms
+    skip_playback: bool = False  # skip per-step animation: run at full speed, stream only per-try results
     run_mode: str = "train"  # train | evaluate | instant_train
     algorithm: str = "neural_moe"  # neural_moe | epidemic_fleet
 
@@ -131,6 +132,30 @@ trained_visual_shape: tuple[int, int, int] | None = None
 trained_moe_policy: object | None = None
 trained_moe_shape: tuple[int, int, int, int] | None = None
 trained_moe_epochs: int = 0
+
+# Pretrained MoE persistence: loaded at startup, re-saved after every Train
+# press so the policy keeps improving across sessions/restarts.
+_MOE_CKPT_PATH = os.environ.get("MOE_CHECKPOINT", "checkpoints/moe.pt")
+
+
+def _load_pretrained_moe() -> None:
+    global trained_moe_policy, trained_moe_shape, trained_moe_epochs
+    try:
+        from rescue_sim.MoE.pipeline import load_moe_policy
+
+        loaded = load_moe_policy(_MOE_CKPT_PATH)
+    except Exception as exc:  # noqa: BLE001 - missing torch / stale ckpt
+        print(f"[MoE] pretrained checkpoint unavailable ({exc})")
+        return
+    if loaded is not None:
+        trained_moe_policy, trained_moe_shape, trained_moe_epochs = loaded
+        print(
+            f"[MoE] loaded pretrained policy from {_MOE_CKPT_PATH} "
+            f"(shape={trained_moe_shape}, epochs={trained_moe_epochs})"
+        )
+
+
+_load_pretrained_moe()
 
 
 # ── REST endpoints ──────────────────────────────────────────────────────────
@@ -162,7 +187,8 @@ async def health():
 
 # Fixed labels + brand colors shared with the frontend comparison panel.
 _COMPARE_POLICIES = [
-    ("Expert 1", 0, "#3b82f6"),      # exploration / frontier
+    ("Non-AI (APF)", "apf", "#94a3b8"),  # raw potential-fields baseline (no ML)
+    ("Expert 1", 0, "#3b82f6"),      # exploration (APF clone)
     ("Expert 2", 1, "#10b981"),      # ensemble coordination
     ("Expert 3", 2, "#f59e0b"),      # GRU fallback / hysteretic
     ("MoE", "moe", "#8b5cf6"),       # attention-router blend
@@ -197,7 +223,8 @@ def _policy_mode_actions(policy, mode, obs_t, peer_t, mask_t, hidden):
     return torch.argmax(logits, dim=-1), hidden
 
 
-def _evaluate_policy_mode(policy, settings, num_agents, max_steps, view_radius, mode, episodes):
+def _evaluate_policy_mode(policy, settings, num_agents, max_steps, view_radius, mode, episodes,
+                          seed=_COMPARE_SEED):
     """Greedy rollouts of one policy mode on a fixed seeded grid sequence."""
     import torch
 
@@ -205,28 +232,46 @@ def _evaluate_policy_mode(policy, settings, num_agents, max_steps, view_radius, 
     from rescue_sim.MoE.pipeline import build_peer_matrix
 
     env = RescueEnv(settings, num_agents=num_agents, max_steps=max_steps,
-                    view_radius=view_radius, seed=_COMPARE_SEED)
+                    view_radius=view_radius, seed=seed)
     successes, rescued, steps = [], [], []
     connected_steps, agent_steps = 0, 0
     total_targets = settings.target_a_count + settings.target_b_count
 
+    # mode "apf": drive the raw non-ML Artificial Potential Fields baseline
+    # (E1's teacher) so the panel shows how far no-ML gets on the same grids.
+    apf_teacher = None
+    if mode == "apf":
+        import numpy as np
+
+        from rescue_sim.MoE.pipeline import ExplorationTeacher
+
+        apf_teacher = ExplorationTeacher(np.random.default_rng(seed))
+
     for _ in range(episodes):
         obs = env.reset()
+        if apf_teacher is not None:
+            apf_teacher.reset(env)
         hidden = None
         done = False
         info = {"success": False, "rescued": 0, "steps": 0}
         while not done:
-            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
             peer_np = build_peer_matrix(env.positions)
-            peer_t = torch.tensor(peer_np, dtype=torch.float32).unsqueeze(0)
-            mask_t = torch.tensor(env.valid_action_mask(), dtype=torch.bool).unsqueeze(0)
-            with torch.no_grad():
-                actions, hidden = _policy_mode_actions(policy, mode, obs_t, peer_t, mask_t, hidden)
+            if apf_teacher is not None:
+                act_np = apf_teacher.act(env, env.valid_action_mask())
+            else:
+                obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+                peer_t = torch.tensor(peer_np, dtype=torch.float32).unsqueeze(0)
+                mask_t = torch.tensor(env.valid_action_mask(), dtype=torch.bool).unsqueeze(0)
+                with torch.no_grad():
+                    actions, hidden = _policy_mode_actions(policy, mode, obs_t, peer_t, mask_t, hidden)
+                act_np = actions.numpy()
             # Connectivity: an agent is "connected" when it has >=1 peer (row sum > 1).
             peer_counts = peer_np.sum(axis=1)
             connected_steps += int((peer_counts > 1).sum())
             agent_steps += num_agents
-            obs, _reward, done, info = env.step(actions.numpy())
+            obs, _reward, done, info = env.step(act_np)
+            if apf_teacher is not None:
+                apf_teacher.observe(env)
         successes.append(bool(info["success"]))
         rescued.append(int(info["rescued"]))
         steps.append(int(info["steps"]))
@@ -273,11 +318,14 @@ async def compare_policies(episodes: int = 30):
     cfg = current_config
     target_a = min(cfg.target_count // 2, cfg.target_count)
     target_b = cfg.target_count - target_a
+    # New random grid sequence on every Compare press; the same seed is shared
+    # by all four policies within a press, so the comparison stays fair.
+    compare_seed = random.randint(0, 2**31 - 1)
     settings = GridSettings(
         width=cfg.grid_width, height=cfg.grid_height,
         obstacle_probability=cfg.obstacle_probability,
         target_a_count=target_a, target_b_count=target_b,
-        random_seed=_COMPARE_SEED,
+        random_seed=compare_seed,
     )
     view_radius = max(1, cfg.sensor_range)
     # Comparison rollouts need far fewer steps than a full training episode;
@@ -290,6 +338,7 @@ async def compare_policies(episodes: int = 30):
             metrics = await asyncio.to_thread(
                 _evaluate_policy_mode, trained_moe_policy, settings,
                 cfg.num_agents, compare_steps, view_radius, mode, episodes,
+                compare_seed,
             )
             policies.append({"name": name, "color": color, **metrics})
 
@@ -512,9 +561,10 @@ async def simulation_ws(websocket: WebSocket):
                     if not active_targets:
                         break
 
-                    # Check for cancellation or speed update (throttled in instant_train to avoid latency)
+                    # Check for cancellation or speed update (throttled when not
+                    # animating — instant_train / skip_playback — to avoid latency)
                     check_cancel = True
-                    if run_mode == "instant_train" and step % 20 != 0:
+                    if (run_mode == "instant_train" or config.skip_playback) and step % 20 != 0:
                         check_cancel = False
 
                     if check_cancel:
@@ -607,21 +657,40 @@ async def simulation_ws(websocket: WebSocket):
                     steps = step + 1
 
                     if run_mode != "instant_train":
-                        await websocket.send_json(
-                            {
-                                "type": "step",
-                                "episode": episode,
-                                "step": steps,
-                                "agents": agent_states,
-                                "rescued": rescued,
-                                "active_targets": len(active_targets),
-                            }
-                        )
+                        if config.skip_playback:
+                            # Results-only mode: no per-step stream, no pacing —
+                            # just yield so stop/config messages still get through.
+                            await asyncio.sleep(0)
+                        else:
+                            await websocket.send_json(
+                                {
+                                    "type": "step",
+                                    "episode": episode,
+                                    "step": steps,
+                                    "agents": agent_states,
+                                    "rescued": rescued,
+                                    "active_targets": len(active_targets),
+                                }
+                            )
 
-                        await asyncio.sleep(config.speed_ms / 1000.0)
+                            await asyncio.sleep(config.speed_ms / 1000.0)
 
                 if should_stop:
                     break
+
+                # Skipped playback still gets one snapshot per episode so the
+                # grid shows the final positions and rescued targets.
+                if run_mode != "instant_train" and config.skip_playback and steps:
+                    await websocket.send_json(
+                        {
+                            "type": "step",
+                            "episode": episode,
+                            "step": steps,
+                            "agents": agent_states,
+                            "rescued": rescued,
+                            "active_targets": len(active_targets),
+                        }
+                    )
 
                 success = not active_targets
                 metric = {
@@ -706,6 +775,8 @@ async def simulation_ws(websocket: WebSocket):
 #   fallback     — recurrent (GRU) local head for isolated agents, the
 #                  neural counterpart of the Hysteretic Q baseline
 _MOE_EXPERT_LABELS = ("exploration", "coordination", "fallback")
+# CARDINAL_ACTIONS order is (UP, DOWN, RIGHT, LEFT): index of each action's reverse.
+_REVERSE_ACTION = (1, 0, 3, 2)
 _MOE_BASELINES = {
     "hysteretic_alpha": 0.1,
     "hysteretic_beta": 0.01,
@@ -734,7 +805,9 @@ async def _run_moe_simulation(websocket: WebSocket, config: SimConfig, run_mode:
         )
         return
 
-    seed = _DEFAULT_GRID.get("random_seed", 42)
+    # Fresh random grid on every run/restart; tries within one run still share
+    # the grid so routing evolution stays comparable try-to-try.
+    seed = random.randint(0, 2**31 - 1)
     target_a = math.ceil(config.target_count / 2)
     target_b = config.target_count - target_a
     settings = GridSettings(
@@ -778,11 +851,30 @@ async def _run_moe_simulation(websocket: WebSocket, config: SimConfig, run_mode:
         trained_moe_policy = policy
         trained_moe_shape = expected_shape
 
+        # Persist so restarts (and future sessions) start from this policy.
+        try:
+            from rescue_sim.MAPPO import RescueEnv as _ObsEnv
+            from rescue_sim.MoE.pipeline import save_moe_policy
+
+            _obs_env = _ObsEnv(
+                settings, num_agents=config.num_agents,
+                max_steps=80, view_radius=view_radius, seed=seed,
+            )
+            save_moe_policy(
+                policy, _MOE_CKPT_PATH, _obs_env.obs_dim,
+                view_radius, expected_shape, trained_moe_epochs,
+            )
+            print(f"[MoE] saved trained policy -> {_MOE_CKPT_PATH}")
+        except Exception as exc:  # noqa: BLE001 - saving must never kill a run
+            print(f"[MoE] could not save policy ({exc})")
+
     await websocket.send_json(
         {"type": "moe_status", "trained_epochs": trained_moe_epochs}
     )
 
     if run_mode == "instant_train":
+        # "Train More": accumulate training only — no rollout. Running is the
+        # main button's job (evaluate mode, pure playback of the saved policy).
         await websocket.send_json(
             {
                 "type": "training_complete",
@@ -962,11 +1054,72 @@ async def _run_moe_rollout(
     should_stop = False
 
     rollout_rng = random.Random(settings.random_seed)
-    rollout_steps = min(config.max_steps, _MOE_ROLLOUT_MAX_STEPS)
+    rollout_steps = config.max_steps  # honor the scenario's step budget
+
+    # Live Expert 3: a genuine Epidemic Hysteretic Q fleet on THIS grid. The
+    # grid is fixed across tries, so tabular Q-learning compounds: the fleet
+    # learns from every transition (whoever is in control), gossips Q-tables
+    # when agents meet, and keeps its Q across tries — by the later tries it
+    # is near-certain on this map. Whenever the router routes an agent to the
+    # fallback expert, the live learner acts instead of the frozen GRU clone.
+    live_fleet = None
+    comms_bus = None
+    fleet_ids: list[str] = []
+    try:
+        from rescue_sim.Qlearning.communications import DefaultCommsBus
+        from rescue_sim.Qlearning.q_learning import EpidemicHystereticQLearning
+        from rescue_sim.shared import GossipConfig, HystereticConfig
+
+        live_fleet = EpidemicHystereticQLearning(
+            grid,
+            HystereticConfig(epsilon=0.3),
+            GossipConfig(),
+            max_agents=num_agents,
+            seed=settings.random_seed or 0,
+        )
+        fleet_ids = [f"a{i}" for i in range(num_agents)]
+        for i, aid in enumerate(fleet_ids):
+            live_fleet.add_agent(aid, env.positions[i], fresh=True)
+        comms_bus = DefaultCommsBus()
+    except Exception as exc:  # noqa: BLE001 - live E3 is an enhancement, not a dependency
+        print(f"[MoE] live E3 epidemic fleet unavailable ({exc})")
+
+    # Online scoreboard adaptation (learns WITHIN a run, like E3's Q-table):
+    # log-space per-expert routing bias, updated after every try from who
+    # actually delivered rescues on THIS grid. E2 starts with a positive
+    # prior — it carries the distilled deep-RL knowledge and tends to be
+    # under-routed by the generic gate.
+    import torch as _torch
+
+    # E2 gets a strong prior (it carries the distilled deep-RL knowledge and
+    # the generic gate under-routes it); E1 a slight negative one — dispersal
+    # is only valuable early, and the scoreboard restores it if it delivers.
+    # bias = prior + mean-centered score: centering keeps trust RELATIVE, so
+    # one expert collecting every rescue can't run away to the cap.
+    expert_prior = [-0.2, 0.6, 0.0]
+    expert_score = [0.0, 0.0, 0.0]
+    adapt_bias = list(expert_prior)
 
     for episode in range(max(1, config.num_episodes)):
         obs = env.reset()  # identical grid every try (fixed competition grid)
         hidden = None      # GRU temporal memory resets per try
+        last_action: list[int | None] = [None] * num_agents
+        policy.route_bias = _torch.tensor(adapt_bias, dtype=_torch.float32)
+        last_rescue_step = 0
+        fleet_base_eps = live_fleet.epsilon if live_fleet is not None else 0.0
+        # Rolling routing history per agent: rescue credit goes to the experts
+        # that steered the APPROACH (last 8 steps), not just the final step —
+        # otherwise whoever holds the wheel at the finish line steals credit.
+        recent_dominant: list[list[int]] = [[] for _ in range(num_agents)]
+        if live_fleet is not None:
+            # Q-tables PERSIST across tries (that's the point of tabular
+            # learning on a fixed grid); only positions and exploration reset.
+            live_fleet.reset_positions(
+                {aid: env.positions[i] for i, aid in enumerate(fleet_ids)}
+            )
+            live_fleet.decay_epsilon(
+                0.3 / max(1, config.num_episodes), floor=0.02
+            )
         rescued_records: list[dict] = []
         rescued_seen: set[Position] = set()
         total_reward = 0.0
@@ -977,6 +1130,7 @@ async def _run_moe_rollout(
         switches = 0
         prev_dominant: list[int] | None = None
         info = {"rescued": 0, "targets": total_targets, "success": False, "steps": 0}
+        step_message: dict | None = None
 
         await websocket.send_json(
             {
@@ -996,20 +1150,22 @@ async def _run_moe_rollout(
         )
 
         for step in range(1, rollout_steps + 1):
-            # Cancellation / live config (speed) updates
-            try:
-                raw = await asyncio.wait_for(websocket.receive_text(), timeout=0.001)
-                cancel_msg = json.loads(raw)
-                if cancel_msg.get("type") == "stop":
-                    await websocket.send_json({"type": "stopped"})
-                    should_stop = True
-                    break
-                if cancel_msg.get("type") == "config":
-                    new_cfg = SimConfig(**cancel_msg.get("data", {}))
-                    current_config = new_cfg
-                    config = new_cfg
-            except asyncio.TimeoutError:
-                pass
+            # Cancellation / live config (speed) updates (throttled when the
+            # per-step animation is skipped, to keep the fast path fast)
+            if not config.skip_playback or step % 20 == 1:
+                try:
+                    raw = await asyncio.wait_for(websocket.receive_text(), timeout=0.001)
+                    cancel_msg = json.loads(raw)
+                    if cancel_msg.get("type") == "stop":
+                        await websocket.send_json({"type": "stopped"})
+                        should_stop = True
+                        break
+                    if cancel_msg.get("type") == "config":
+                        new_cfg = SimConfig(**cancel_msg.get("data", {}))
+                        current_config = new_cfg
+                        config = new_cfg
+                except asyncio.TimeoutError:
+                    pass
 
             peer_np = build_peer_matrix(env.positions)
             obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
@@ -1023,20 +1179,77 @@ async def _run_moe_rollout(
 
             with torch.no_grad():
                 y_final, weights, hidden = policy(obs_t, peer_t, mask_t, hidden)
-                actions = torch.argmax(y_final.squeeze(0), dim=-1)  # greedy [A]
+                logits = y_final.squeeze(0).clone()               # [A, act]
+
+            # No-backtrack rule: mask the exact reverse of each agent's
+            # previous move (feed-forward heads have no memory, so without
+            # this they ping-pong east/west forever). Skipped when the
+            # reverse is the only valid option.
+            valid_np = mask_t.squeeze(0).numpy()
+            for i in range(num_agents):
+                prev = last_action[i]
+                if prev is None:
+                    continue
+                rev = _REVERSE_ACTION[prev]
+                if valid_np[i, rev] and int(valid_np[i].sum()) > 1:
+                    logits[i, rev] = -1e9
+            actions = torch.argmax(logits, dim=-1)                # greedy [A]
+
+            # Stuck detector: rescued some targets but no progress for 60
+            # steps -> the last target is hiding; re-open exploration.
+            stuck = (
+                len(rescued_seen) > 0
+                and len(rescued_seen) < total_targets
+                and step - last_rescue_step > 60
+            )
+            if live_fleet is not None:
+                live_fleet.epsilon = 0.25 if stuck else fleet_base_eps
 
             # Small epsilon keeps tries from being carbon copies of each
-            # other and breaks feed-forward oscillation loops.
-            valid_np = mask_t.squeeze(0).numpy()
+            # other and breaks feed-forward oscillation loops (raised while
+            # stuck so the team actually widens its search).
+            jitter = 0.25 if stuck else 0.1
             act_np = actions.numpy().copy()
             for i in range(num_agents):
-                if rollout_rng.random() < 0.1:
+                if rollout_rng.random() < jitter:
                     valid = [a for a in range(policy.action_dim) if valid_np[i, a]]
                     if valid:
                         act_np[i] = rollout_rng.choice(valid)
 
             weights_step = weights.squeeze(0)                    # [A, 3]
             dominant = torch.argmax(weights_step, dim=-1).tolist()
+
+            # Live E3 takes over agents the router assigns to the fallback
+            # expert: the tabular fleet acts from its (ever-improving) Q-table.
+            if live_fleet is not None:
+                live_fleet.reset_positions(
+                    {aid: env.positions[i] for i, aid in enumerate(fleet_ids)}
+                )
+                fleet_actions = live_fleet.select_actions()
+                for i, aid in enumerate(fleet_ids):
+                    if dominant[i] == 2 and aid in fleet_actions:
+                        a = int(fleet_actions[aid])
+                        # Mission-aware fix for position-keyed tabular Q: the
+                        # table still holds +10 routes to targets already
+                        # rescued THIS try. If the chosen move walks into a
+                        # rescued cell, re-pick the best Q action that doesn't.
+                        if live_fleet.peek_next(aid, a) in rescued_seen:
+                            slot = live_fleet._id_to_slot[aid]
+                            p = env.positions[i]
+                            alt, alt_q = None, -float("inf")
+                            for b in range(policy.action_dim):
+                                if not valid_np[i, b]:
+                                    continue
+                                if live_fleet.peek_next(aid, b) in rescued_seen:
+                                    continue
+                                qv = float(live_fleet.q[slot, p.y, p.x, b])
+                                if qv > alt_q:
+                                    alt, alt_q = b, qv
+                            if alt is not None:
+                                a = alt
+                        if valid_np[i, a]:
+                            act_np[i] = a
+
             gru_norm = torch.norm(hidden.squeeze(0), dim=-1)     # [A]
             peer_counts = peer_np.sum(axis=1).astype(int).tolist()
             explore_sum += float(weights_step[:, 0].mean().item())
@@ -1046,17 +1259,40 @@ async def _run_moe_rollout(
             if prev_dominant is not None:
                 switches += sum(1 for a, b in zip(prev_dominant, dominant) if a != b)
             prev_dominant = dominant
+            for i in range(num_agents):
+                recent_dominant[i].append(dominant[i])
+                if len(recent_dominant[i]) > 8:
+                    recent_dominant[i].pop(0)
 
             obs, reward, done, info = env.step(act_np)
             total_reward += float(reward)
+            last_action = [int(a) for a in act_np]
 
+            newly_rescued: set[int] = set()
             for i, pos in enumerate(env.positions):
                 if grid.has_target(pos) and pos not in rescued_seen:
                     rescued_seen.add(pos)
+                    newly_rescued.add(i)
+                    last_rescue_step = step
                     rescued_records.append(
                         {"x": pos.x, "y": pos.y, "step": step, "type": grid.target_type_at(pos)}
                     )
-                    rescues_by_expert[_MOE_EXPERT_LABELS[dominant[i]]] += 1
+                    window = recent_dominant[i] or [dominant[i]]
+                    for d in window:
+                        rescues_by_expert[_MOE_EXPERT_LABELS[d]] += 1.0 / len(window)
+
+            # Live E3 learns from EVERY transition (whichever expert drove),
+            # then runs one epidemic gossip round over the comms layer — so
+            # its map knowledge compounds across steps and tries.
+            if live_fleet is not None:
+                live_fleet.record_transitions(
+                    {aid: int(act_np[i]) for i, aid in enumerate(fleet_ids)},
+                    {aid: (10.0 if i in newly_rescued else -0.05)
+                     for i, aid in enumerate(fleet_ids)},
+                    {aid: env.positions[i] for i, aid in enumerate(fleet_ids)},
+                )
+                if comms_bus is not None:
+                    comms_bus.exchange(live_fleet)
 
             agent_states = [
                 {
@@ -1083,25 +1319,50 @@ async def _run_moe_rollout(
                 "baselines": _MOE_BASELINES,
             }
 
-            await websocket.send_json(
-                {
-                    "type": "step",
-                    "episode": episode,
-                    "step": step,
-                    "agents": agent_states,
-                    "rescued": rescued_records,
-                    "active_targets": int(info["targets"] - info["rescued"]),
-                    "moe": moe_payload,
-                }
-            )
-            await asyncio.sleep(config.speed_ms / 1000.0)
+            step_message = {
+                "type": "step",
+                "episode": episode,
+                "step": step,
+                "agents": agent_states,
+                "rescued": rescued_records,
+                "active_targets": int(info["targets"] - info["rescued"]),
+                "moe": moe_payload,
+            }
+            if config.skip_playback:
+                # Results-only mode: no per-step stream, no pacing — just
+                # yield so stop/config messages still get through.
+                await asyncio.sleep(0)
+            else:
+                await websocket.send_json(step_message)
+                await asyncio.sleep(config.speed_ms / 1000.0)
             if done:
                 break
 
         if should_stop:
             break
 
+        # Skipped playback still gets one snapshot per try so the grid shows
+        # the final positions/rescues and the MoE panel gets routing weights.
+        if config.skip_playback and step_message is not None:
+            await websocket.send_json(step_message)
+
         usage_total = max(sum(usage.values()), 1)
+
+        # Scoreboard update: credit experts that steered rescues this try;
+        # debit experts that consumed routing share in a failed try. Scores
+        # are mean-centered (relative trust) and added onto the fixed priors,
+        # feeding back into routing from the next try on.
+        for j, name in enumerate(_MOE_EXPERT_LABELS):
+            expert_score[j] += 0.25 * rescues_by_expert[name]
+            if not info["success"]:
+                expert_score[j] -= 0.4 * (usage[name] / usage_total)
+        score_mean = sum(expert_score) / len(expert_score)
+        expert_score = [s - score_mean for s in expert_score]
+        adapt_bias = [
+            max(-1.2, min(1.2, expert_prior[j] + expert_score[j]))
+            for j in range(len(_MOE_EXPERT_LABELS))
+        ]
+
         metric = {
             "episode": episode,
             "steps": int(info["steps"]),
@@ -1117,7 +1378,13 @@ async def _run_moe_rollout(
                     name: round(count / usage_total, 3) for name, count in usage.items()
                 },
                 "switches": switches,
-                "rescues_by_expert": rescues_by_expert,
+                "rescues_by_expert": {
+                    name: round(v, 1) for name, v in rescues_by_expert.items()
+                },
+                "adaptation_bias": {
+                    name: round(adapt_bias[j], 3)
+                    for j, name in enumerate(_MOE_EXPERT_LABELS)
+                },
             },
         }
         episode_metrics.append(metric)
@@ -1133,6 +1400,10 @@ async def _run_moe_rollout(
             }
         )
 
+    # The scoreboard bias is per-run knowledge; never leak it into the cached
+    # policy used by Compare / later runs.
+    policy.route_bias = None
+
     if not should_stop:
         n = max(len(episode_metrics), 1)
         moe_summary = {
@@ -1146,7 +1417,9 @@ async def _run_moe_rollout(
                 for name in _MOE_EXPERT_LABELS
             },
             "rescues_by_expert": {
-                name: sum(m["moe"]["rescues_by_expert"][name] for m in episode_metrics)
+                name: round(
+                    sum(m["moe"]["rescues_by_expert"][name] for m in episode_metrics), 1
+                )
                 for name in _MOE_EXPERT_LABELS
             },
             "avg_switches": round(sum(m["moe"]["switches"] for m in episode_metrics) / n, 1),

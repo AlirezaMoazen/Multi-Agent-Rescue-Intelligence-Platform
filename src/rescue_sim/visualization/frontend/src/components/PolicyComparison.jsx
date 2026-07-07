@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -13,6 +13,7 @@ ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip, Legend);
 
 // Brand colors, per policy (must match the backend _COMPARE_POLICIES).
 const COLORS = {
+  'Non-AI (APF)': '#94a3b8',
   'Expert 1': '#3b82f6',
   'Expert 2': '#10b981',
   'Expert 3': '#f59e0b',
@@ -55,11 +56,12 @@ function Skeleton({ progress }) {
   );
 }
 
-export default function PolicyComparison({ episodes = 30 }) {
+export default function PolicyComparison({ episodes = 30, autoRunToken = 0 }) {
   const [state, setState] = useState('idle'); // idle | loading | done | error
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [progress, setProgress] = useState(0);
+  const seenToken = useRef(autoRunToken);
 
   const run = async () => {
     setState('loading');
@@ -84,6 +86,16 @@ export default function PolicyComparison({ episodes = 30 }) {
       setState('error');
     }
   };
+
+  // Auto-run when the parent bumps the token (skip-playback runs jump
+  // straight to the comparison). Runs after every render; the ref guard
+  // makes it fire once per bump.
+  useEffect(() => {
+    if (autoRunToken > seenToken.current) {
+      seenToken.current = autoRunToken;
+      if (state !== 'loading') run();
+    }
+  });
 
   const maxSteps = data
     ? Math.max(...data.policies.map((p) => p.avg_steps), 1)
@@ -137,10 +149,10 @@ export default function PolicyComparison({ episodes = 30 }) {
 
       {state === 'idle' && (
         <div className="cmp-empty">
-          Runs greedy rollouts of each standalone expert head (E2 = the MAPPO + QMIX +
-          TransfQMix distilled coordinator) and the blended MoE on the
-          <strong> same {episodes} grids</strong>, then compares success, rescues, connectivity
-          and efficiency. Train the MoE first.
+          Runs greedy rollouts of the raw non-AI APF baseline, each standalone expert head
+          (E2 = the MAPPO + QMIX + TransfQMix distilled coordinator) and the blended MoE on the
+          <strong> same {episodes} grids</strong> — so the gap between "Non-AI (APF)" and the
+          rest is exactly what ML buys. Train the MoE first.
         </div>
       )}
 

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import useSimulation from './hooks/useSimulation';
 import StatsBar from './components/StatsBar';
 import GridCanvas from './components/GridCanvas';
@@ -17,6 +17,23 @@ export default function App() {
   const isMoe = (config?.algorithm || 'neural_moe') === 'neural_moe';
   const isComplete = sim.status === 'complete';
   const configReady = config !== null;
+  const skipPlayback = config?.skip_playback ?? false;
+
+  // When playback was skipped, jump straight to the head-to-head comparison:
+  // bump a token on the running -> complete transition so PolicyComparison
+  // auto-runs without a Compare press.
+  const [compareToken, setCompareToken] = useState(0);
+  const prevStatus = useRef(sim.status);
+  useEffect(() => {
+    const was = prevStatus.current;
+    prevStatus.current = sim.status;
+    if (
+      was !== 'complete' && sim.status === 'complete' &&
+      skipPlayback && isMoe && sim.episodeMetrics.length > 0
+    ) {
+      setCompareToken((t) => t + 1);
+    }
+  }, [sim.status, skipPlayback, isMoe, sim.episodeMetrics.length]);
 
   useEffect(() => {
     let cancelled = false;
@@ -35,7 +52,10 @@ export default function App() {
 
   const handleStart = () => {
     if (!configReady) return;
-    const nextConfig = { ...config, run_mode: 'train' };
+    // MoE mode: the main button is pure playback of the saved policy (the
+    // live E3 Q-learner still learns during the tries); training has its own
+    // button. Fleet mode keeps train-and-run.
+    const nextConfig = { ...config, run_mode: isMoe ? 'evaluate' : 'train' };
     setConfig(nextConfig);
     sim.start(nextConfig);
   };
@@ -67,6 +87,16 @@ export default function App() {
   const handleSpeedChange = (ms) => {
     if (!configReady) return;
     const newConfig = { ...config, speed_ms: ms };
+    setConfig(newConfig);
+    if (isRunning) {
+      sim.send({ type: 'config', data: newConfig });
+    }
+  };
+
+  // Toggle per-step animation on/off (also live, mid-run)
+  const handleSkipPlaybackChange = (skip) => {
+    if (!configReady) return;
+    const newConfig = { ...config, skip_playback: skip };
     setConfig(newConfig);
     if (isRunning) {
       sim.send({ type: 'config', data: newConfig });
@@ -174,11 +204,13 @@ export default function App() {
             onRestart={handleRestart}
             speed={config?.speed_ms ?? 100}
             onSpeedChange={handleSpeedChange}
+            skipPlayback={skipPlayback}
+            onSkipPlaybackChange={handleSkipPlaybackChange}
             disabled={!sim.connected || !configReady}
             labels={isMoe ? {
-              start: '▶ Train + Run Tries',
-              instant: '⚡ Train More',
-              evaluate: '▶ Run Tries (no training)',
+              start: '▶ Run Tries',
+              instant: '⚡ Train More (no run)',
+              evaluate: null,
             } : undefined}
           />
         </div>
@@ -195,11 +227,10 @@ export default function App() {
               status={sim.status}
               metrics={sim.episodeMetrics}
               summary={sim.moeSummary}
-              trainedEpochs={sim.moeTrainedEpochs}
             />
           )}
           <MetricsChart metrics={sim.episodeMetrics} />
-          {isMoe && <PolicyComparison episodes={10} />}
+          {isMoe && <PolicyComparison episodes={10} autoRunToken={compareToken} />}
         </div>
 
         {!isMoe && (

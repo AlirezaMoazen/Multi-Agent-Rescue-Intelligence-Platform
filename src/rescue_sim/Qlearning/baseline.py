@@ -10,9 +10,10 @@ BaselineExplorer — Frontier greedy
     action-priority order, then by a seeded RNG. Tends to spread outward
     evenly, giving fast area coverage.
 
-CBSExplorer — Conflict-Based Search
-    Optimal centralized MAPF algorithm. Plans optimal paths for each agent
-    and resolves collision conflicts using a constraint tree.
+APFExplorer — Artificial Potential Fields
+    Classic decentralized swarm navigation (Khatib 1986): per-agent force sum
+    of target attraction, teammate separation, obstacle repulsion, and
+    open-space attraction — all computed from local sensing only.
 
 Shared utilities
     BaselineMetrics — frozen dataclass with the per-episode summary.
@@ -88,7 +89,7 @@ def run_episode(
     ----------
     strategy:
         Any object implementing ``select_action`` and ``update``
-        (i.e. BaselineExplorer or CBSExplorer).
+        (i.e. BaselineExplorer or APFExplorer).
     env:
         Environment conforming to EnvironmentInterface.
     max_steps:
@@ -272,21 +273,47 @@ class BaselineExplorer:
 
 
 # ---------------------------------------------------------------------------
-# Strategy 2 — Conflict-Based Search (CBSExplorer)
+# Strategy 2 — Artificial Potential Fields (APFExplorer)
 # ---------------------------------------------------------------------------
 
-class CBSExplorer:
-    """Conflict-Based Search explorer implementing StrategyInterface.
+class APFExplorer:
+    """Artificial Potential Fields explorer implementing StrategyInterface.
 
-    Optimal centralized MAPF algorithm. Plans optimal paths for each agent
-    and resolves collision conflicts using a constraint tree.
+    Classic non-AI decentralized swarm navigation (Khatib 1986): each agent
+    sums local "forces" and moves down the potential gradient —
+
+      + attraction to the nearest visible unrescued target
+      - separation repulsion from teammates' last-known nearby positions
+        (spreads the swarm so its joint sensor footprint is maximal)
+      - repulsion from visible obstacles adjacent to the candidate cell
+      + mild attraction toward the direction with the most visible free
+        cells (orients the gradient when nothing else is in view)
+
+    Every term is computable from the agent's own sensing, so the policy is
+    honestly decentralized — and learnable by the MoE's feed-forward Expert 1
+    head, which is behavior-cloned from this strategy.
+
+    Parameters
+    ----------
+    seed:
+        RNG seed for tie-breaking.  Pass an integer for reproducible runs.
     """
+
+    W_TARGET = 10.0    # attraction to the nearest visible live target
+    W_PEER = 6.0       # separation repulsion per nearby teammate (strong, so
+                       # the swarm actually disperses and covers the grid)
+    W_OBSTACLE = 1.0   # repulsion per visible obstacle next to the candidate
+    W_OPEN = 0.1       # open-space attraction per visible free cell ahead
+    PEER_RANGE = 10    # Manhattan range within which teammates repel
 
     def __init__(self, seed: int | None = 42) -> None:
         self._rng = random.Random(seed)
-        self._visited: dict[str, set[Position]] = {}
-        self._path_buffer: dict[str, list[Action]] = {}
-        self._known_obstacles: dict[str, set[Position]] = {}
+        # Last-known teammate positions (proximity sensing between robots).
+        self._agent_positions: dict[str, Position] = {}
+
+    # ------------------------------------------------------------------
+    # StrategyInterface
+    # ------------------------------------------------------------------
 
     def select_action(
         self,
@@ -294,120 +321,86 @@ class CBSExplorer:
         state: LearningState,
         valid_actions: tuple[Action, ...],
     ) -> Action:
-        """Return the next CBS action for *agent_id*."""
-        visited = self._visited_for(agent_id)
+        """Return the valid action with the highest potential-field score."""
         pos = state.agent_position
-        visited.add(pos)
-
-        obs = self._obstacles_for(agent_id)
-        obs.update(state.visible_obstacles)
+        self._agent_positions[agent_id] = pos
 
         moveable = [a for a in valid_actions if a != Action.WAIT]
         if not moveable:
             return Action.WAIT
 
-        buf = self._buffer_for(agent_id)
+        live_targets = [
+            t
+            for t in (state.visible_target_a_positions | state.visible_target_b_positions)
+            if t not in state.rescued_target_a_positions
+            and t not in state.rescued_target_b_positions
+        ]
+        teammates = [
+            p
+            for other_id, p in self._agent_positions.items()
+            if other_id != agent_id
+            and abs(p.x - pos.x) + abs(p.y - pos.y) <= self.PEER_RANGE
+        ]
 
-        while buf:
-            action = buf[0]
-            if action in valid_actions:
-                buf.pop(0)
-                return action
-            buf.clear()
-            break
+        # Deduplicate candidate destinations (UP and FORWARD share a delta).
+        seen_positions: set[Position] = set()
+        candidates: list[tuple[Action, Position]] = []
+        for action in moveable:
+            dx, dy = MOVE_DELTAS[action.value]
+            next_pos = Position(pos.x + dx, pos.y + dy)
+            if next_pos not in seen_positions:
+                seen_positions.add(next_pos)
+                candidates.append((action, next_pos))
 
-        targets = sorted(
-            list(
-                state.visible_target_a_positions
-                | state.visible_target_b_positions
-                | state.remaining_target_a_positions
-                | state.remaining_target_b_positions
-            ),
-            key=lambda t: abs(t.x - pos.x) + abs(t.y - pos.y)
-        )
+        best_score = float("-inf")
+        best: list[Action] = []
+        for action, next_pos in candidates:
+            s = self._score(pos, next_pos, live_targets, teammates, state)
+            if s > best_score + 1e-9:
+                best_score = s
+                best = [action]
+            elif abs(s - best_score) <= 1e-9:
+                best.append(action)
 
-        path = []
-        passable = set(state.discovered_cells) - obs
-
-        for target in targets:
-            path = self._bfs_navigate(pos, target, passable)
-            if path:
-                break
-
-        if path:
-            actions = self._path_to_actions(pos, path)
-            if actions:
-                buf.extend(actions[1:])
-                return actions[0]
-
-        return self._rng.choice(moveable)
+        return best[0] if len(best) == 1 else self._rng.choice(best)
 
     def update(self, transition: Transition) -> None:
-        """No-op: the CBS baseline never updates from experience."""
-        pass
+        """No-op: potential fields never learn from experience."""
 
-    def run_episode(
+    # ------------------------------------------------------------------
+    # Force sum
+    # ------------------------------------------------------------------
+
+    def _score(
         self,
-        env: EnvironmentInterface,
-        max_steps: int = 500,
-        total_cells: int | None = None,
-    ) -> BaselineMetrics:
-        """Convenience wrapper around the module-level :func:`run_episode`."""
-        return run_episode(self, env, max_steps, total_cells)
-
-    def _visited_for(self, agent_id: str) -> set[Position]:
-        if agent_id not in self._visited:
-            self._visited[agent_id] = set()
-        return self._visited[agent_id]
-
-    def _buffer_for(self, agent_id: str) -> list[Action]:
-        if agent_id not in self._path_buffer:
-            self._path_buffer[agent_id] = []
-        return self._path_buffer[agent_id]
-
-    def _obstacles_for(self, agent_id: str) -> set[Position]:
-        if agent_id not in self._known_obstacles:
-            self._known_obstacles[agent_id] = set()
-        return self._known_obstacles[agent_id]
-
-    def _bfs_navigate(
-        self,
-        start: Position,
-        target: Position,
-        passable: set[Position],
-    ) -> list[Position]:
-        if start == target:
-            return [start]
-        queue: deque[tuple[Position, list[Position]]] = deque([(start, [start])])
-        seen: set[Position] = {start}
-        reachable = passable | {start, target}
-        while queue:
-            pos, path = queue.popleft()
-            for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
-                npos = Position(pos.x + dx, pos.y + dy)
-                if npos == target:
-                    return path + [npos]
-                if npos not in seen and npos in reachable:
-                    seen.add(npos)
-                    queue.append((npos, path + [npos]))
-        return []
-
-    def _path_to_actions(self, start: Position, path: list[Position]) -> list[Action]:
-        actions = []
-        curr = start
-        for next_pos in path[1:]:
-            if next_pos.x > curr.x:
-                actions.append(Action.RIGHT)
-            elif next_pos.y > curr.y:
-                actions.append(Action.DOWN)
-            elif next_pos.x < curr.x:
-                actions.append(Action.LEFT)
-            elif next_pos.y < curr.y:
-                actions.append(Action.UP)
-            else:
-                actions.append(Action.WAIT)
-            curr = next_pos
-        return actions
+        pos: Position,
+        next_pos: Position,
+        live_targets: list[Position],
+        teammates: list[Position],
+        state: LearningState,
+    ) -> float:
+        score = 0.0
+        if live_targets:
+            d = min(
+                abs(t.x - next_pos.x) + abs(t.y - next_pos.y) for t in live_targets
+            )
+            score += self.W_TARGET / (1.0 + d)
+        for t in teammates:
+            d = abs(t.x - next_pos.x) + abs(t.y - next_pos.y)
+            score -= self.W_PEER / (1.0 + d)
+        for o in state.visible_obstacles:
+            d = abs(o.x - next_pos.x) + abs(o.y - next_pos.y)
+            if d <= 1:
+                score -= self.W_OBSTACLE / (1.0 + d)
+        dx, dy = next_pos.x - pos.x, next_pos.y - pos.y
+        open_ahead = sum(
+            1
+            for c in state.visible_cells
+            if c not in state.visible_obstacles
+            and (c.x - pos.x) * dx + (c.y - pos.y) * dy > 0
+        )
+        score += self.W_OPEN * open_ahead
+        return score
 
 
 BaselineFactory = Callable[[int | None], StrategyInterface]
@@ -415,7 +408,7 @@ BaselineFactory = Callable[[int | None], StrategyInterface]
 
 DEFAULT_MULTI_AGENT_BASELINES: Mapping[str, BaselineFactory] = {
     "frontier": BaselineExplorer,
-    "cbs": CBSExplorer,
+    "apf": APFExplorer,
 }
 
 
