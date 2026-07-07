@@ -114,7 +114,7 @@ class SimConfig(BaseModel):
     num_agents: int = _DEFAULT_FLEET.num_agents
     sensor_range: int = _DEFAULT_AGENT.get("sensor_range", 3)
     max_steps: int = _DEFAULT_SIMULATION.get("max_steps", 500)
-    num_episodes: int = 10
+    num_episodes: int = 5
     learning_rate: float = 0.1
     discount_factor: float = 0.9
     exploration_rate: float = 1.0
@@ -642,8 +642,15 @@ async def _run_moe_simulation(websocket: WebSocket, config: SimConfig, run_mode:
     await _run_moe_rollout(websocket, policy, settings, config, view_radius)
 
 
-# One "Train" press worth of MoE training (accumulates across presses)
-_MOE_TRAIN_EPOCHS = 15
+# One "Train" press worth of MoE training (accumulates across presses).
+# Kept modest so a press finishes in a handful of seconds; use "Train More"
+# to accumulate quality. The GRU fallback head (TBPTT) dominates BC cost.
+_MOE_TRAIN_EPOCHS = 12
+
+# Per-try step cap for the live MoE rollout. On the demo grids agents rescue
+# or plateau well before this, so a lower cap keeps the animation short
+# without changing outcomes (the user's max_steps can still lower it further).
+_MOE_ROLLOUT_MAX_STEPS = 200
 
 
 async def _train_moe_policy_async(
@@ -797,6 +804,7 @@ async def _run_moe_rollout(
     should_stop = False
 
     rollout_rng = random.Random(settings.random_seed)
+    rollout_steps = min(config.max_steps, _MOE_ROLLOUT_MAX_STEPS)
 
     for episode in range(max(1, config.num_episodes)):
         obs = env.reset()  # identical grid every try (fixed competition grid)
@@ -829,7 +837,7 @@ async def _run_moe_rollout(
             }
         )
 
-        for step in range(1, config.max_steps + 1):
+        for step in range(1, rollout_steps + 1):
             # Cancellation / live config (speed) updates
             try:
                 raw = await asyncio.wait_for(websocket.receive_text(), timeout=0.001)
