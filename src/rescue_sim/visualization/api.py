@@ -23,7 +23,7 @@ from pathlib import Path
 import yaml
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -114,7 +114,7 @@ class SimConfig(BaseModel):
     num_agents: int = _DEFAULT_FLEET.num_agents
     sensor_range: int = _DEFAULT_AGENT.get("sensor_range", 3)
     max_steps: int = _DEFAULT_SIMULATION.get("max_steps", 500)
-    num_episodes: int = 5
+    num_episodes: int = 20
     learning_rate: float = 0.1
     discount_factor: float = 0.9
     exploration_rate: float = 1.0
@@ -156,6 +156,160 @@ async def set_config(config: SimConfig):
 async def health():
     """Health check endpoint for Docker."""
     return {"status": "ok"}
+
+
+# ── Standalone-experts vs. blended-MoE comparison ───────────────────────────
+
+# Fixed labels + brand colors shared with the frontend comparison panel.
+_COMPARE_POLICIES = [
+    ("Expert 1", 0, "#3b82f6"),      # exploration / frontier
+    ("Expert 2", 1, "#10b981"),      # ensemble coordination
+    ("Expert 3", 2, "#f59e0b"),      # GRU fallback / hysteretic
+    ("MoE", "moe", "#8b5cf6"),       # attention-router blend
+]
+_COMPARE_SEED = 20260707  # same grids for every policy => fair comparison
+
+
+def _policy_mode_actions(policy, mode, obs_t, peer_t, mask_t, hidden):
+    """Greedy per-agent actions for one policy 'mode' (expert index 0/1/2 or 'moe').
+
+    Standalone experts bypass the router: encode with the (frozen) expert
+    encoder and run the single head. 'moe' runs the full router-blended policy.
+    Returns ``(actions[A], hidden)`` — hidden carries the GRU state for the
+    recurrent fallback head / the MoE.
+    """
+    import torch
+
+    if mode == "moe":
+        y_final, _weights, hidden = policy(obs_t, peer_t, mask_t, hidden)
+        logits = y_final.squeeze(0)                                   # [A, act]
+    else:
+        obs_flat = obs_t.squeeze(0)                                   # [A, obs]
+        peer_count = peer_t.squeeze(0).sum(dim=-1, keepdim=True)      # [A, 1]
+        z = policy.expert_encoder(obs_flat, peer_count)               # [A, latent]
+        if mode == 0:
+            logits = policy.expert_exploration(z)
+        elif mode == 1:
+            logits = policy.expert_coordination(z)
+        else:  # recurrent fallback head
+            logits, hidden = policy.expert_fallback(z, hidden)
+    logits = logits.masked_fill(~mask_t.squeeze(0), -1e9)
+    return torch.argmax(logits, dim=-1), hidden
+
+
+def _evaluate_policy_mode(policy, settings, num_agents, max_steps, view_radius, mode, episodes):
+    """Greedy rollouts of one policy mode on a fixed seeded grid sequence."""
+    import torch
+
+    from rescue_sim.MAPPO import RescueEnv
+    from rescue_sim.MoE.pipeline import build_peer_matrix
+
+    env = RescueEnv(settings, num_agents=num_agents, max_steps=max_steps,
+                    view_radius=view_radius, seed=_COMPARE_SEED)
+    successes, rescued, steps = [], [], []
+    connected_steps, agent_steps = 0, 0
+    total_targets = settings.target_a_count + settings.target_b_count
+
+    for _ in range(episodes):
+        obs = env.reset()
+        hidden = None
+        done = False
+        info = {"success": False, "rescued": 0, "steps": 0}
+        while not done:
+            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+            peer_np = build_peer_matrix(env.positions)
+            peer_t = torch.tensor(peer_np, dtype=torch.float32).unsqueeze(0)
+            mask_t = torch.tensor(env.valid_action_mask(), dtype=torch.bool).unsqueeze(0)
+            with torch.no_grad():
+                actions, hidden = _policy_mode_actions(policy, mode, obs_t, peer_t, mask_t, hidden)
+            # Connectivity: an agent is "connected" when it has >=1 peer (row sum > 1).
+            peer_counts = peer_np.sum(axis=1)
+            connected_steps += int((peer_counts > 1).sum())
+            agent_steps += num_agents
+            obs, _reward, done, info = env.step(actions.numpy())
+        successes.append(bool(info["success"]))
+        rescued.append(int(info["rescued"]))
+        steps.append(int(info["steps"]))
+
+    n = max(len(successes), 1)
+    return {
+        "success_rate": round(sum(successes) / n, 4),
+        "avg_steps": round(sum(steps) / n, 1),
+        "avg_rescued": round(sum(rescued) / n, 3),
+        "targets": total_targets,
+        "peer_connectivity": round(connected_steps / max(agent_steps, 1), 4),
+    }
+
+
+_compare_lock = asyncio.Lock()
+
+
+@app.get("/api/compare_policies")
+async def compare_policies(episodes: int = 30):
+    """Compare the three standalone experts against the blended MoE.
+
+    Runs greedy rollouts of Expert 1/2/3 and the full MoE on the *same* seeded
+    14×14 grids (using the currently cached trained MoE policy) and returns
+    averaged metrics per policy for the frontend comparison dashboard.
+    """
+    if _compare_lock.locked():
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "compare_running",
+                "message": "A comparison is already running — wait for it to finish.",
+            },
+        )
+    if trained_moe_policy is None:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "no_trained_moe",
+                "message": "Train the Neural MoE first, then run the comparison.",
+            },
+        )
+
+    episodes = max(3, min(int(episodes), 60))
+    cfg = current_config
+    target_a = min(cfg.target_count // 2, cfg.target_count)
+    target_b = cfg.target_count - target_a
+    settings = GridSettings(
+        width=cfg.grid_width, height=cfg.grid_height,
+        obstacle_probability=cfg.obstacle_probability,
+        target_a_count=target_a, target_b_count=target_b,
+        random_seed=_COMPARE_SEED,
+    )
+    view_radius = max(1, cfg.sensor_range)
+    # Comparison rollouts need far fewer steps than a full training episode;
+    # capping keeps the 4-policy sweep interactive on CPU.
+    compare_steps = min(cfg.max_steps, 200)
+
+    async with _compare_lock:
+        policies = []
+        for name, mode, color in _COMPARE_POLICIES:
+            metrics = await asyncio.to_thread(
+                _evaluate_policy_mode, trained_moe_policy, settings,
+                cfg.num_agents, compare_steps, view_radius, mode, episodes,
+            )
+            policies.append({"name": name, "color": color, **metrics})
+
+    # Category winners for the metric cards.
+    def _winner(key, better_low=False):
+        best = min(policies, key=lambda p: p[key]) if better_low else max(policies, key=lambda p: p[key])
+        return {"name": best["name"], "value": best[key], "color": best["color"]}
+
+    return {
+        "episodes": episodes,
+        "grid": f"{cfg.grid_width}x{cfg.grid_height}",
+        "num_agents": cfg.num_agents,
+        "policies": policies,
+        "winners": {
+            "success": _winner("success_rate"),
+            "efficiency": _winner("avg_steps", better_low=True),
+            "rescued": _winner("avg_rescued"),
+            "connectivity": _winner("peer_connectivity"),
+        },
+    }
 
 
 # ── WebSocket simulation stream ────────────────────────────────────────────
@@ -711,6 +865,10 @@ async def _train_moe_policy_async(
             on_distill_epoch=stage_reporter("distillation"),
             on_router_step=stage_reporter("router", every=10),
             policy=existing,
+            # Expert 2 = trained QMIX+TransfQMix+MAPPO teachers via
+            # state-conditioned gated reverse-KL (falls back to the heuristic
+            # teacher automatically if the checkpoints don't match the config).
+            e2_gated=True,
         )
 
     task = asyncio.create_task(asyncio.to_thread(train))

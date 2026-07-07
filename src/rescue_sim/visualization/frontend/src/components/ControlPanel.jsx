@@ -48,9 +48,9 @@ export default function ControlPanel({
           id="speed-slider"
           className="speed-slider"
           type="range"
-          min="10"
+          min="6"
           max="500"
-          step="10"
+          step="2"
           value={speed}
           onChange={(e) => onSpeedChange(Number(e.target.value))}
         />

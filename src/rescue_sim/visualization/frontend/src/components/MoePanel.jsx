@@ -1,6 +1,6 @@
 export const EXPERT_META = {
   exploration: { label: 'E1 · Heuristic Explorer', hint: 'non-AI frontier', color: 'var(--accent-cyan)' },
-  coordination: { label: 'E2 · Deep Coordination', hint: 'distilled QMIX / TransfQMix', color: 'var(--accent-green)' },
+  coordination: { label: 'E2 · Deep Coordination', hint: 'distilled MAPPO + QMIX + TransfQMix', color: 'var(--accent-green)' },
   fallback: { label: 'E3 · Local Hysteretic Q', hint: 'GRU fallback (isolated)', color: 'var(--accent-amber)' },
 };
 

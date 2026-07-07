@@ -7,6 +7,7 @@ import ParameterPanel from './components/ParameterPanel';
 import MetricsChart from './components/MetricsChart';
 import MoePanel, { EXPERT_META } from './components/MoePanel';
 import EvaluationPanel from './components/EvaluationPanel';
+import PolicyComparison from './components/PolicyComparison';
 
 export default function App() {
   const [config, setConfig] = useState(null);
@@ -198,11 +199,14 @@ export default function App() {
             />
           )}
           <MetricsChart metrics={sim.episodeMetrics} />
+          {isMoe && <PolicyComparison episodes={10} />}
         </div>
 
-        <section className="evaluation-wide">
-          <EvaluationPanel report={sim.baselineComparison} />
-        </section>
+        {!isMoe && (
+          <section className="evaluation-wide">
+            <EvaluationPanel report={sim.baselineComparison} />
+          </section>
+        )}
       </main>
     </div>
   );

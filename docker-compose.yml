@@ -52,17 +52,17 @@ services:
   # ── Train MAPPO (deep multi-agent RL) ───────────────────────────────
   train-mappo:
     <<: *base
-    command: python scripts/train_mappo.py --grid 20 --agents 4 --view-radius 3 --max-steps 500 --updates 100 --checkpoint checkpoints/mappo.pt
+    command: python scripts/train_mappo.py --grid 14 --agents 4 --view-radius 3 --max-steps 200 --time-budget 5400 --eval-every 10 --device auto --checkpoint checkpoints/mappo.pt
 
   # ── Train QMIX (deep multi-agent RL) ────────────────────────────────
   train-qmix:
     <<: *base
-    command: python scripts/train_qmix.py --grid 20 --agents 4 --view-radius 3 --max-steps 500 --episodes 200 --checkpoint checkpoints/qmix.pt
+    command: python scripts/train_qmix.py --grid 14 --agents 4 --view-radius 3 --max-steps 200 --time-budget 5400 --eval-every 50 --device auto --checkpoint checkpoints/qmix.pt
 
   # ── Train TransfQMix (transformer-based deep MARL) ───────────────────
   train-transfqmix:
     <<: *base
-    command: python scripts/train_transfqmix.py --grid 20 --agents 4 --view-radius 3 --max-steps 500 --episodes 200 --checkpoint checkpoints/transfqmix.pt
+    command: python scripts/train_transfqmix.py --grid 14 --agents 4 --view-radius 3 --max-steps 200 --time-budget 5400 --eval-every 30 --device auto --checkpoint checkpoints/transfqmix.pt
 
   # ── Compare all methods + ensemble + distilled student ──────────────
   compare-all:
