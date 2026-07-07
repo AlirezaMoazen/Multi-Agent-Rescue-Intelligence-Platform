@@ -73,3 +73,8 @@ services:
   train-moe:
     <<: *base
     command: python scripts/train_moe.py
+
+  # ── Neural MoE live 20x20 dashboard demo (train + simulate + pytest) ─
+  demo-moe:
+    <<: *base
+    command: python demo_moe.py

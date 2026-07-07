@@ -4,7 +4,7 @@
 
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12+-blue.svg)](https://python.org)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-198%20passing-brightgreen.svg)](#test-and-lint)
+[![Tests](https://img.shields.io/badge/Tests-200%20passing-brightgreen.svg)](#test-and-lint)
 [![CPU Training](https://img.shields.io/badge/GPU-Not%20Required-orange.svg)](#technology)
 
 ---
@@ -17,14 +17,20 @@ git clone https://collaborating.tuhh.de/e16/courses/software-development/ss26/gr
 cd group05
 
 # Option A: Docker (recommended — zero setup)
+# One command: builds the multi-stage container and launches the live 20x20
+# MoE simulation (training dashboard + ASCII grid + telemetry + pytest gate)
+docker compose run --rm demo-moe
+
+# Or start the web visualization dashboard instead:
 docker compose up --build viz
 # Open http://localhost:8000/app in your browser
 
 # Option B: Local install
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
+pip install torch --index-url https://download.pytorch.org/whl/cpu
 python demo_moe.py            # Run the full MoE dashboard demonstration
-pytest                         # Verify all 198 tests pass
+pytest                         # Verify the full test suite passes
 ```
 
 ---
@@ -128,7 +134,7 @@ Main dependencies are declared in [pyproject.toml](pyproject.toml):
 |   |-- train_qmix.py          # Train QMIX
 |   |-- train_transfqmix.py    # Train TransfQMix
 |   |-- compare_all.py         # Train all -> ensemble -> distill -> compare table
-|   `-- train_moe.py           # Mixture-of-Experts: deep ensemble vs. adaptive fleet
+|   `-- train_moe.py           # (legacy) portfolio-gate MoE runner — superseded by demo_moe.py
 |-- src/rescue_sim/
 |   |-- shared.py              # Project contract + shared deep-RL helpers
 |   |-- config/                # YAML loading and typed settings
@@ -316,7 +322,11 @@ subject to the **monotonicity constraint**:
 
 $$\frac{\partial Q_{\text{tot}}}{\partial Q_i} \geq 0 \quad \forall i$$
 
-This constraint ensures that the individual greedy policy $\arg\max_{a_i} Q_i$ is consistent with $\arg\max_{\mathbf{a}} Q_{\text{tot}}$ — agents can act locally while optimising a shared team objective.
+This constraint enforces the **Individual-Global-Max (IGM) principle**:
+
+$$\arg\max_{\mathbf{a}} Q_{\text{tot}}(\mathbf{o}, \mathbf{a}) = \bigl(\arg\max_{a_1} Q_1(o_1, a_1),\ \ldots,\ \arg\max_{a_n} Q_n(o_n, a_n)\bigr)$$
+
+i.e. the individual greedy policy $\arg\max_{a_i} Q_i$ is consistent with the joint greedy policy over $Q_{\text{tot}}$ — agents can act locally (decentralized execution) while optimising a shared team objective learned centrally (**CTDE**).
 
 **Mixing network (hypernetwork):**
 
@@ -543,9 +553,9 @@ src/rescue_sim/
 ├── Ensemble/
 │   ├── ensemble.py      # ValueEnsemble: combine QMIX + TransfQMix at test time
 │   └── distill.py       # Distiller: compress the ensemble into one student net
-└── MoE/moe.py           # Mixture-of-Experts gate: frozen ensemble vs. adaptive
-                         #   fleet on one fixed grid (reuses the ensemble, the
-                         #   fleet, the comms bus, and the spread-start placement)
+└── MoE/moe.py           # Neural Mixture-of-Experts: dual encoders, attention
+                         #   gating router, GRU temporal fallback head, logit
+                         #   blending — demonstrated end-to-end by demo_moe.py
 ```
 
 - **One environment.** `RescueEnv` is written once and reused by all the deep
@@ -587,65 +597,65 @@ pip install -e ".[ensemble]"
 python scripts/compare_all.py          # or: docker compose run --rm compare-all
 ```
 
-### Mixture-of-Experts router (the best method for *this* grid) — ✅ implemented
+### Neural Mixture-of-Experts — The Technical Engine — ✅ implemented
 
-Implemented in `src/rescue_sim/MoE/moe.py`. This is the project's **top layer**:
-where the *Ensemble* blends two deep models that are good at the **same** thing,
-the **Mixture-of-Experts** is a *gate* over **every** method in the project that
-routes each grid to whichever expert solves it best. Formally this is the
-classical **per-instance algorithm-selection / portfolio** problem (Rice 1976;
-SATzilla, Xu et al. 2008) written as a Mixture-of-Experts (Jacobs et al. 1991)
-whose experts are mostly *fixed* — with one twist: one expert keeps learning.
+Implemented in `src/rescue_sim/MoE/moe.py`, demonstrated live by `demo_moe.py`.
+This is the project's **top layer**: a step-level neural gate (Jacobs et al.
+1991) that blends three specialized expert heads *per agent, per step*, driven
+by real-time communication topology. It follows the **CTDE** paradigm: experts
+are distilled centrally from team trajectories, but at execution time each
+agent routes on its **local** observation and peer set only.
 
-**The expert pool is the whole project:**
+**Dual-Encoder topology.** Two independent `SharedFeatureEncoder`s (CNN over
+the 7×7 ego window + MLPs for scalars/peer count) isolate learning: a frozen
+*expert encoder* feeds the three heads, a trainable *router encoder* feeds the
+gate — so online router fine-tuning can never corrupt the distilled experts.
 
-| group | experts | role |
-|---|---|---|
-| Classical (no-AI) | frontier, DFS, prioritized planning, CBS, ICBS, ECBS, M\* | fixed candidates |
-| Deep (frozen) | QMIX, TransfQMix, MAPPO, ValueEnsemble | fixed candidates **+** teacher |
-| Adaptive | Epidemic Hysteretic fleet | learns this grid every try |
+**Attention-based gating router.** The rigid MLP gate is replaced with scaled
+dot-product attention over the *variable-size set* of visible peer embeddings —
+no zero-padding, no index-ordering failures:
 
-**The gate.** Every expert is scored on the *same fixed grid* with one number:
+$$\mathbf{q} = W_Q z_{\text{ego}}, \quad K = W_K Z_{\text{peers}}, \quad V = W_V Z_{\text{peers}}$$
 
-$$\text{score} = \underbrace{2\cdot\mathbb{1}[\text{success}]}_{\text{rescued all targets?}} \;+\; \underbrace{\tfrac{\text{rescued}}{\text{targets}}}_{\in[0,1]} \;-\; \underbrace{\tfrac{1}{2}\cdot\tfrac{\text{steps}}{\text{steps}_{\max}}}_{\text{tie-break: be quick}}$$
+$$\text{ctx} = \operatorname{softmax}\!\Bigl(\tfrac{\mathbf{q}K^{\top}}{\sqrt{d}} + M\Bigr)V, \qquad \mathbf{g} = \operatorname{softmax}\bigl(W_g\,\text{ctx}\bigr) \in \Delta^{2}$$
 
-A full rescue always beats a partial one; ties break on speed. The score reads
-the environment's `success/rescued/steps` (**not** the reward), so an MLP, a
-transformer, a CBS planner, and a tabular fleet are all comparable. The deep
-models and classical baselines are frozen, so their scores are computed **once**
-(a leaderboard); only the adaptive fleet is re-scored each try.
+where $M$ masks agents outside the 3-block communication radius to $-\infty$.
 
-**The loop.** Each try the fleet plays one learning episode (hysteretic TD update
-+ a gossip round) and is re-scored. **While it is behind, the strongest deep
-expert *teaches* it** — the fleet learns *off-policy* (Q-learning is off-policy)
-from the generalist's trajectories, which is how a tabular learner bootstraps on
-a grid too large to stumble onto targets by chance. **Once the fleet's greedy
-score beats the whole leaderboard, it leads** and self-plays from then on.
+**Recurrent temporal fallback (Expert 3).** A `GRUCell` head carries a hidden
+state $h_t$ across the episode timeline, so an isolated agent remembers its
+trajectory history and escapes dead-ends instead of blind looping:
 
-```python
-from rescue_sim.MoE import MixtureOfExperts
-from rescue_sim.config.settings import MoeSettings
+$$h_t = \operatorname{GRU}(z_t,\ h_{t-1}), \qquad y^{(3)} = W_o\,h_t$$
 
-moe = MixtureOfExperts.from_models(qmix=qmix, transf=transf, mappo=mappo, ensemble=ens,
-                                   settings=MoeSettings(num_trials=40))
-report = moe.run()
-report.leaderboard          # every fixed expert scored once on the grid
-report.surpassed_at         # first try the fleet beat them all (or None)
-report.to_dict()            # JSON-ready: API/frontend can render the whole race
+**Logit blending mechanics.** The final policy logits are the gate-weighted sum
+of the three expert heads, then invalid moves are masked before the softmax:
+
+$$y_{\text{final}} = \sum_{j=1}^{3} g_j\, y^{(j)}, \qquad y_{\text{final}}[a] \leftarrow -10^{9} \ \ \forall a \notin \mathcal{A}_{\text{valid}}$$
+
+**Blackout-aware router training.** After behavioral cloning of the heads, the
+router is fine-tuned with a Conditional Indicator Mask penalty that forces
+$g_{\text{fallback}} \to 1$ under blackout and $g_{\text{coord}} \to 1$ when
+connected:
+
+$$\mathcal{L}_{\text{route}} = \mathbb{1}[\text{peers}=1]\,(1 - g_{\text{fallback}})^2 + \mathbb{1}[\text{peers}=A]\,(1 - g_{\text{coord}})^2$$
+
+Live telemetry from `demo_moe.py` shows the routing flip the moment an agent
+leaves the 3-block radius:
+
+```text
+Step  Agent    Pos     Peers  Baseline Params               MoE Gating [g_exp, g_coord, g_fall]
+5     Agent-0  (1,3)   3      Frontier Exploration: γ=0.95  [0.0042, 0.9948, 0.0011]
+5     Agent-1  (3,1)   1      Hyst Q: α=0.10, β=0.01 [ISO]  [0.0003, 0.0007, 0.9990]   ← blackout
 ```
-
-**Why the gate makes this safe.** It only serves the best-scoring expert, so the
-MoE is **never worse than the strongest single method** in the pool. On a grid
-the fleet can master (navigation-style / few targets) it climbs the leaderboard
-and takes over; on a hard multi-target 20×20 the tabular cell-state (no memory of
-*which* targets remain) can't beat a well-trained generalist, so the gate simply
-keeps the generalist in charge. That honest trade-off is exactly what a portfolio
-gate is for — pay nothing, gain when a specialist earns it.
 
 ```bash
-pip install -e ".[ensemble]"
-python scripts/train_moe.py            # or: docker compose run --rm train-moe
+pip install -e ".[moe]"
+python demo_moe.py                     # or: docker compose run --rm demo-moe
 ```
+
+The demo trains on the real 20×20 `RescueEnv` (full behavioral-cloning epochs +
+router optimization), renders the live ASCII grid and telemetry dashboard, and
+finishes by running `pytest tests/test_moe.py` as an integration gate.
 
 ### Indicative results (short CPU training runs)
 
@@ -661,20 +671,18 @@ so this measures generalisation, not memorisation):
 All trained on CPU in minutes (TransfQMix is slowest — transformers are heavier).
 Numbers are indicative of short runs; longer training improves all three.
 
-**Mixture-of-Experts** is measured differently — on **one fixed grid**, scoring
-the whole expert pool (7 baselines + QMIX + TransfQMix + MAPPO + Ensemble) once
-as a leaderboard, then letting the adaptive fleet climb it:
+**Neural Mixture-of-Experts** is measured differently — `demo_moe.py` runs the
+full production pipeline on the real 20×20 grid and prints the numbers live:
 
-- On a grid the frozen experts solve poorly (e.g. a single target down a long
-  corridor on a 10×10), the fleet learns it from the strongest deep expert's
-  demonstrations and **overtakes the whole leaderboard** — `train_moe.py` prints
-  the try it took over (regression-tested deterministically).
-- On the full 20×20 / 4-target task, a well-trained deep generalist tops the
-  leaderboard and the fleet is the *adaptive challenger*: it imitates and
-  improves but, being tabular with a memoryless cell-state, does not fully match
-  a strong deep model on a grid that large and sparse. The gate then simply
-  keeps the generalist — so the MoE is always **at least as good as the best
-  single method in the pool**, by construction.
+- Behavioral cloning converges (cross-entropy ≈ 1.37 → ≈ 0.63 over 20 epochs on
+  three heuristic-teacher datasets; validation accuracy reported per epoch under
+  `torch.no_grad()`).
+- Router optimization drives the blackout penalty to ≈ 2×10⁻⁴ within 120 steps:
+  connected agents route to the coordination head with $g_{\text{coord}} > 0.99$
+  and isolated agents flip to the GRU fallback with $g_{\text{fallback}} > 0.99$
+  — visible per step in the Phase C telemetry table.
+- The run finishes by executing `pytest tests/test_moe.py` as an automatic
+  integration gate.
 
 ### Sources & further reading
 
