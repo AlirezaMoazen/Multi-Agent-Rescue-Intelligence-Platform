@@ -14,6 +14,20 @@ function WeightBar({ value, color }) {
   );
 }
 
+function ShareBar({ share }) {
+  return (
+    <div className="moe-share-bar" title={EXPERT_ORDER.map((n) => `${EXPERT_META[n].label}: ${Math.round((share[n] || 0) * 100)}%`).join(' · ')}>
+      {EXPERT_ORDER.map((name) => (
+        <div
+          key={name}
+          className="moe-share-seg"
+          style={{ width: `${(share[name] || 0) * 100}%`, background: EXPERT_META[name].color }}
+        />
+      ))}
+    </div>
+  );
+}
+
 function TrainingProgress({ training }) {
   const stageLabel = training.stage === 'distillation'
     ? 'Stage 1 · Behavioral cloning (3 expert heads)'
@@ -34,27 +48,78 @@ function TrainingProgress({ training }) {
   );
 }
 
+function TriesList({ metrics }) {
+  const tries = metrics.filter((m) => m.moe);
+  if (!tries.length) return null;
+  return (
+    <div className="moe-tries">
+      <div className="moe-section-label">Tries on this grid</div>
+      {tries.map((m) => (
+        <div key={m.episode} className="moe-try-row">
+          <span className={`moe-try-result ${m.success ? 'ok' : ''}`}>
+            {m.success ? '✓' : '✗'}
+          </span>
+          <span className="moe-try-label">#{m.episode + 1}</span>
+          <span className="moe-try-stat">{m.rescued_count}/{m.target_count}</span>
+          <span className="moe-try-stat">{m.steps} st</span>
+          <div className="moe-try-share"><ShareBar share={m.moe.expert_share} /></div>
+          <span className="moe-try-stat" title="expert switches during the try">⇄ {m.moe.switches}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function RunSummary({ summary }) {
+  return (
+    <div className="moe-summary">
+      <div className="moe-section-label">Run summary</div>
+      <div className="moe-summary-line">
+        <strong>{summary.successes}/{summary.tries}</strong> tries solved ·
+        avg <strong>{summary.avg_rescued}</strong> rescued ·
+        avg <strong>{summary.avg_switches}</strong> switches
+      </div>
+      <ShareBar share={summary.expert_share} />
+      <div className="moe-summary-rescues">
+        {EXPERT_ORDER.map((name) => (
+          <span key={name} style={{ color: EXPERT_META[name].color }}>
+            {EXPERT_META[name].label.slice(0, 2)}: {summary.rescues_by_expert[name]} rescues
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /**
  * MoePanel — live view of the neural Mixture-of-Experts router.
  *
- * Top: the three experts with the fleet-average gating weight (the "router
- * diagram"). Middle: per-agent softmax routing vectors with peer count and an
- * ISOLATED badge under communication blackout. Bottom: baseline parameters.
- * While training, shows the streamed stage/epoch/loss progress instead.
+ * Top: the three experts with the fleet-average gating weight (the router
+ * "diagram"). Middle: per-agent softmax routing vectors with peer count and a
+ * BLACKOUT badge under communication blackout. Below: per-try results on the
+ * fixed grid and the end-of-run per-expert summary. While training, shows
+ * the streamed stage/epoch/loss progress instead.
  */
-export default function MoePanel({ moe, training, status }) {
+export default function MoePanel({ moe, training, status, metrics, summary, trainedEpochs }) {
   const isTraining = status === 'running' && !moe && training;
 
   return (
     <div className="card">
-      <div className="card-title">MoE Router — 3 Experts</div>
+      <div className="card-title moe-title">
+        <span>MoE Router — 3 Experts</span>
+        <span className={`moe-trained-badge ${trainedEpochs > 0 ? 'trained' : ''}`}>
+          {trainedEpochs > 0 ? `trained · ${trainedEpochs} epochs` : 'untrained'}
+        </span>
+      </div>
 
       {isTraining && <TrainingProgress training={training} />}
 
       {!moe && !isTraining && (
         <div className="moe-empty">
-          Select <strong>Neural MoE</strong> and press Start: the router trains
-          live, then solves the same grid over repeated tries.
+          Select <strong>Neural MoE</strong>, then <strong>Train + Run Tries</strong>:
+          the 3 expert heads train live, and the router then solves the
+          <strong> same grid</strong> on every try. Use <strong>Train More</strong> to
+          keep improving the cached policy before running tries.
         </div>
       )}
 
@@ -102,12 +167,17 @@ export default function MoePanel({ moe, training, status }) {
               );
             })}
           </div>
-
-          <div className="moe-baselines">
-            Hyst Q α={moe.baselines.hysteretic_alpha} · β={moe.baselines.hysteretic_beta} ·
-            frontier γ={moe.baselines.frontier_decay}
-          </div>
         </>
+      )}
+
+      {metrics && <TriesList metrics={metrics} />}
+      {summary && <RunSummary summary={summary} />}
+
+      {moe && (
+        <div className="moe-baselines">
+          Hyst Q α={moe.baselines.hysteretic_alpha} · β={moe.baselines.hysteretic_beta} ·
+          frontier γ={moe.baselines.frontier_decay}
+        </div>
       )}
     </div>
   );

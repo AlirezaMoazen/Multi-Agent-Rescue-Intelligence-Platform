@@ -222,6 +222,7 @@ def run_live_simulation(
     Returns:
         Episode summary: rescued targets, total targets, success flag, steps.
     """
+    policy = policy.to("cpu")  # training may run on GPU; serve inference on CPU
     obs_np = env.reset()
     assert env.grid is not None
     goals: list[Position] = sorted(
@@ -254,10 +255,16 @@ def run_live_simulation(
 
         with torch.no_grad():
             y_final, weights, fallback_hidden = policy(obs_t, peer_t, mask_t, fallback_hidden)
-            probs = torch.softmax(y_final, dim=-1)
-            actions = torch.multinomial(
-                probs.view(env.num_agents, policy.action_dim), num_samples=1
-            ).squeeze(-1)
+            actions = torch.argmax(y_final.squeeze(0), dim=-1)
+
+        # Small epsilon breaks feed-forward oscillation loops
+        actions = actions.numpy().copy()
+        for i in range(env.num_agents):
+            if np.random.random() < 0.1:
+                valid = np.flatnonzero(env.valid_action_mask()[i])
+                if len(valid):
+                    actions[i] = np.random.choice(valid)
+        actions = torch.tensor(actions)
 
         positions_before = list(env.positions)
         if step == 1 or step % render_every == 0:

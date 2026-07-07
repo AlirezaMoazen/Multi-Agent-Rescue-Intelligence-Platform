@@ -120,7 +120,7 @@ class SimConfig(BaseModel):
     exploration_rate: float = 1.0
     speed_ms: int = 100  # delay between steps in ms
     run_mode: str = "train"  # train | evaluate | instant_train
-    algorithm: str = "epidemic_fleet"  # epidemic_fleet | neural_moe
+    algorithm: str = "neural_moe"  # neural_moe | epidemic_fleet
 
 
 # ── Global state ────────────────────────────────────────────────────────────
@@ -130,6 +130,7 @@ trained_visual_seed: int | None = None
 trained_visual_shape: tuple[int, int, int] | None = None
 trained_moe_policy: object | None = None
 trained_moe_shape: tuple[int, int, int, int] | None = None
+trained_moe_epochs: int = 0
 
 
 # ── REST endpoints ──────────────────────────────────────────────────────────
@@ -566,7 +567,7 @@ async def _run_moe_simulation(websocket: WebSocket, config: SimConfig, run_mode:
     rendered rollout then runs ``num_episodes`` tries on the *same* grid so
     the routing evolution is comparable try-to-try.
     """
-    global trained_moe_policy, trained_moe_shape
+    global trained_moe_policy, trained_moe_shape, trained_moe_epochs
 
     try:
         from rescue_sim.MoE.pipeline import FixedGridRescueEnv  # noqa: F401 (torch probe)
@@ -593,8 +594,10 @@ async def _run_moe_simulation(websocket: WebSocket, config: SimConfig, run_mode:
     view_radius = max(1, config.sensor_range)
     expected_shape = (config.grid_width, config.grid_height, config.num_agents, view_radius)
 
+    compatible_cache = trained_moe_policy if trained_moe_shape == expected_shape else None
+
     if run_mode == "evaluate":
-        if trained_moe_policy is None or trained_moe_shape != expected_shape:
+        if compatible_cache is None:
             await websocket.send_json(
                 {
                     "type": "error",
@@ -605,13 +608,25 @@ async def _run_moe_simulation(websocket: WebSocket, config: SimConfig, run_mode:
                 }
             )
             return
-        policy = trained_moe_policy
+        policy = compatible_cache
     else:
-        policy = await _train_moe_policy_async(websocket, settings, config, view_radius, seed)
+        # Train presses accumulate: an existing compatible policy keeps
+        # training on freshly collected data instead of starting over.
+        policy = await _train_moe_policy_async(
+            websocket, settings, config, view_radius, seed, existing=compatible_cache
+        )
         if policy is None:
             return
+        if compatible_cache is None:
+            trained_moe_epochs = _MOE_TRAIN_EPOCHS
+        else:
+            trained_moe_epochs += _MOE_TRAIN_EPOCHS
         trained_moe_policy = policy
         trained_moe_shape = expected_shape
+
+    await websocket.send_json(
+        {"type": "moe_status", "trained_epochs": trained_moe_epochs}
+    )
 
     if run_mode == "instant_train":
         await websocket.send_json(
@@ -627,12 +642,17 @@ async def _run_moe_simulation(websocket: WebSocket, config: SimConfig, run_mode:
     await _run_moe_rollout(websocket, policy, settings, config, view_radius)
 
 
+# One "Train" press worth of MoE training (accumulates across presses)
+_MOE_TRAIN_EPOCHS = 15
+
+
 async def _train_moe_policy_async(
     websocket: WebSocket,
     settings: GridSettings,
     config: SimConfig,
     view_radius: int,
     seed: int,
+    existing: object | None = None,
 ):
     """Runs the MoE training pipeline in a worker thread, streaming progress.
 
@@ -663,23 +683,27 @@ async def _train_moe_policy_async(
                 )
         return report
 
+    # Vary the seed per training round so "Train More" sees fresh grids/data
+    round_seed = seed + trained_moe_epochs * 31
+
     def train():
         env = RescueEnv(
             settings,
             num_agents=config.num_agents,
             max_steps=80,
             view_radius=view_radius,
-            seed=seed,
+            seed=round_seed,
         )
         return train_moe_policy(
             env,
-            episodes_per_head=4,
-            collect_steps=60,
-            epochs=12,
-            router_steps=80,
-            seed=seed,
+            episodes_per_head=6,
+            collect_steps=70,
+            epochs=_MOE_TRAIN_EPOCHS,
+            router_steps=150,
+            seed=round_seed,
             on_distill_epoch=stage_reporter("distillation"),
             on_router_step=stage_reporter("router", every=10),
+            policy=existing,
         )
 
     task = asyncio.create_task(asyncio.to_thread(train))
@@ -737,6 +761,10 @@ async def _run_moe_rollout(
 
     from rescue_sim.MoE.pipeline import FixedGridRescueEnv, build_peer_matrix
 
+    # Training may have run on the GPU; single-step inference is trivial, so
+    # serve the rollout on CPU and keep the per-step input tensors local.
+    policy = policy.to("cpu")
+
     try:
         env = FixedGridRescueEnv(
             settings,
@@ -768,6 +796,8 @@ async def _run_moe_rollout(
     episode_metrics: list[dict] = []
     should_stop = False
 
+    rollout_rng = random.Random(settings.random_seed)
+
     for episode in range(max(1, config.num_episodes)):
         obs = env.reset()  # identical grid every try (fixed competition grid)
         hidden = None      # GRU temporal memory resets per try
@@ -776,6 +806,10 @@ async def _run_moe_rollout(
         total_reward = 0.0
         explore_sum = 0.0
         explore_samples = 0
+        usage = {name: 0 for name in _MOE_EXPERT_LABELS}
+        rescues_by_expert = {name: 0 for name in _MOE_EXPERT_LABELS}
+        switches = 0
+        prev_dominant: list[int] | None = None
         info = {"rescued": 0, "targets": total_targets, "success": False, "steps": 0}
 
         await websocket.send_json(
@@ -823,20 +857,17 @@ async def _run_moe_rollout(
 
             with torch.no_grad():
                 y_final, weights, hidden = policy(obs_t, peer_t, mask_t, hidden)
-                probs = torch.softmax(y_final, dim=-1)
-                actions = torch.multinomial(
-                    probs.view(num_agents, policy.action_dim), num_samples=1
-                ).squeeze(-1)
+                actions = torch.argmax(y_final.squeeze(0), dim=-1)  # greedy [A]
 
-            obs, reward, done, info = env.step(actions.numpy())
-            total_reward += float(reward)
-
-            for pos in env.positions:
-                if grid.has_target(pos) and pos not in rescued_seen:
-                    rescued_seen.add(pos)
-                    rescued_records.append(
-                        {"x": pos.x, "y": pos.y, "step": step, "type": grid.target_type_at(pos)}
-                    )
+            # Small epsilon keeps tries from being carbon copies of each
+            # other and breaks feed-forward oscillation loops.
+            valid_np = mask_t.squeeze(0).numpy()
+            act_np = actions.numpy().copy()
+            for i in range(num_agents):
+                if rollout_rng.random() < 0.1:
+                    valid = [a for a in range(policy.action_dim) if valid_np[i, a]]
+                    if valid:
+                        act_np[i] = rollout_rng.choice(valid)
 
             weights_step = weights.squeeze(0)                    # [A, 3]
             dominant = torch.argmax(weights_step, dim=-1).tolist()
@@ -844,13 +875,29 @@ async def _run_moe_rollout(
             peer_counts = peer_np.sum(axis=1).astype(int).tolist()
             explore_sum += float(weights_step[:, 0].mean().item())
             explore_samples += 1
+            for d in dominant:
+                usage[_MOE_EXPERT_LABELS[d]] += 1
+            if prev_dominant is not None:
+                switches += sum(1 for a, b in zip(prev_dominant, dominant) if a != b)
+            prev_dominant = dominant
+
+            obs, reward, done, info = env.step(act_np)
+            total_reward += float(reward)
+
+            for i, pos in enumerate(env.positions):
+                if grid.has_target(pos) and pos not in rescued_seen:
+                    rescued_seen.add(pos)
+                    rescued_records.append(
+                        {"x": pos.x, "y": pos.y, "step": step, "type": grid.target_type_at(pos)}
+                    )
+                    rescues_by_expert[_MOE_EXPERT_LABELS[dominant[i]]] += 1
 
             agent_states = [
                 {
                     "id": i,
                     "x": env.positions[i].x,
                     "y": env.positions[i].y,
-                    "action": CARDINAL_ACTIONS[int(actions[i])].value,
+                    "action": CARDINAL_ACTIONS[int(act_np[i])].value,
                     "reward": round(float(reward) / num_agents, 2),
                     "expert": _MOE_EXPERT_LABELS[dominant[i]],
                 }
@@ -888,6 +935,7 @@ async def _run_moe_rollout(
         if should_stop:
             break
 
+        usage_total = max(sum(usage.values()), 1)
         metric = {
             "episode": episode,
             "steps": int(info["steps"]),
@@ -898,6 +946,13 @@ async def _run_moe_rollout(
             # For the MoE the "exploration rate" is the mean exploration
             # gating weight over the try — comparable across tries.
             "exploration_rate": round(explore_sum / max(explore_samples, 1), 4),
+            "moe": {
+                "expert_share": {
+                    name: round(count / usage_total, 3) for name, count in usage.items()
+                },
+                "switches": switches,
+                "rescues_by_expert": rescues_by_expert,
+            },
         }
         episode_metrics.append(metric)
         success_rate = sum(1 for m in episode_metrics if m["success"]) / len(episode_metrics)
@@ -913,16 +968,32 @@ async def _run_moe_rollout(
         )
 
     if not should_stop:
+        n = max(len(episode_metrics), 1)
+        moe_summary = {
+            "tries": len(episode_metrics),
+            "successes": sum(1 for m in episode_metrics if m["success"]),
+            "avg_rescued": round(sum(m["rescued_count"] for m in episode_metrics) / n, 2),
+            "expert_share": {
+                name: round(
+                    sum(m["moe"]["expert_share"][name] for m in episode_metrics) / n, 3
+                )
+                for name in _MOE_EXPERT_LABELS
+            },
+            "rescues_by_expert": {
+                name: sum(m["moe"]["rescues_by_expert"][name] for m in episode_metrics)
+                for name in _MOE_EXPERT_LABELS
+            },
+            "avg_switches": round(sum(m["moe"]["switches"] for m in episode_metrics) / n, 1),
+        }
         await websocket.send_json(
             {
                 "type": "training_complete",
                 "total_episodes": len(episode_metrics),
                 "final_success_rate": round(
-                    sum(1 for m in episode_metrics if m["success"])
-                    / max(len(episode_metrics), 1),
-                    4,
+                    sum(1 for m in episode_metrics if m["success"]) / n, 4
                 ),
                 "metrics": episode_metrics,
+                "moe_summary": moe_summary,
             }
         )
 

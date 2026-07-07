@@ -13,7 +13,7 @@ export default function App() {
   const sim = useSimulation();
 
   const isRunning = sim.status === 'running';
-  const isMoe = (config?.algorithm || 'epidemic_fleet') === 'neural_moe';
+  const isMoe = (config?.algorithm || 'neural_moe') === 'neural_moe';
   const isComplete = sim.status === 'complete';
   const configReady = config !== null;
 
@@ -174,6 +174,11 @@ export default function App() {
             speed={config?.speed_ms ?? 100}
             onSpeedChange={handleSpeedChange}
             disabled={!sim.connected || !configReady}
+            labels={isMoe ? {
+              start: '▶ Train + Run Tries',
+              instant: '⚡ Train More',
+              evaluate: '▶ Run Tries (no training)',
+            } : undefined}
           />
         </div>
 
@@ -183,7 +188,14 @@ export default function App() {
             <ParameterPanel config={config} onChange={setConfig} disabled={isRunning} />
           )}
           {isMoe && (
-            <MoePanel moe={sim.moe} training={sim.moeTraining} status={sim.status} />
+            <MoePanel
+              moe={sim.moe}
+              training={sim.moeTraining}
+              status={sim.status}
+              metrics={sim.episodeMetrics}
+              summary={sim.moeSummary}
+              trainedEpochs={sim.moeTrainedEpochs}
+            />
           )}
           <MetricsChart metrics={sim.episodeMetrics} />
         </div>

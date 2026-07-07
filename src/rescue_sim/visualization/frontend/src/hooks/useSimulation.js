@@ -42,6 +42,8 @@ export default function useSimulation() {
   const [baselineComparison, setBaselineComparison] = useState(null);
   const [moe, setMoe] = useState(null);                 // latest per-step MoE routing payload
   const [moeTraining, setMoeTraining] = useState(null); // streamed MoE training progress
+  const [moeSummary, setMoeSummary] = useState(null);   // end-of-run per-expert aggregate
+  const [moeTrainedEpochs, setMoeTrainedEpochs] = useState(0); // accumulated BC epochs
 
   const connectFn = useRef(null);
 
@@ -139,6 +141,7 @@ export default function useSimulation() {
             total_reward: msg.total_reward,
             success_rate: msg.success_rate,
             exploration_rate: msg.exploration_rate,
+            moe: msg.moe || null,
           }]);
           setSuccessRate(msg.success_rate);
           setAvgSteps(msg.avg_steps);
@@ -147,6 +150,7 @@ export default function useSimulation() {
           break;
 
         case 'training_complete':
+          if (msg.moe_summary) setMoeSummary(msg.moe_summary);
           setStatus('complete');
           break;
 
@@ -156,6 +160,10 @@ export default function useSimulation() {
 
         case 'moe_training':
           setMoeTraining(msg);
+          break;
+
+        case 'moe_status':
+          setMoeTrainedEpochs(msg.trained_epochs || 0);
           break;
 
         case 'stopped':
@@ -216,6 +224,7 @@ export default function useSimulation() {
     setBaselineComparison(null);
     setMoe(null);
     setMoeTraining(null);
+    setMoeSummary(null);
     setStatus('running');
     if (config) {
       send({ type: 'config', data: config });
@@ -252,6 +261,8 @@ export default function useSimulation() {
     baselineComparison,
     moe,
     moeTraining,
+    moeSummary,
+    moeTrainedEpochs,
     trails,
     error,
     start,

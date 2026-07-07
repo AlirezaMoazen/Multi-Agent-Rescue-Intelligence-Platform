@@ -11,6 +11,7 @@ export default function ControlPanel({
   speed,
   onSpeedChange,
   disabled,
+  labels,
 }) {
   const isRunning = status === 'running';
   const isIdle = status === 'idle' || status === 'stopped' || status === 'complete';
@@ -19,17 +20,17 @@ export default function ControlPanel({
     <div className="controls">
       {isIdle && (
         <button id="btn-start" className="btn btn-primary" onClick={onStart} disabled={disabled}>
-          ▶ Start Simulation
+          {labels?.start ?? '▶ Start Simulation'}
         </button>
       )}
       {isIdle && (
         <button id="btn-instant-train" className="btn btn-success" onClick={onInstantTrain} disabled={disabled}>
-          ⚡ Train Instantly
+          {labels?.instant ?? '⚡ Train Instantly'}
         </button>
       )}
       {isIdle && (
         <button id="btn-run-learned" className="btn" onClick={onRunLearned} disabled={disabled}>
-          Run Learned Policy
+          {labels?.evaluate ?? 'Run Learned Policy'}
         </button>
       )}
       {isRunning && (

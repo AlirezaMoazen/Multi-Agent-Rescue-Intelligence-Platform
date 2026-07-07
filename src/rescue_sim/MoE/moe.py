@@ -170,9 +170,12 @@ class AttentionGatingRouter(nn.Module):
         self.W_k = nn.Linear(latent_dim, latent_dim)
         self.W_v = nn.Linear(latent_dim, latent_dim)
 
-        # Output projection: attended context → 3 expert gating logits
+        # Output projection: attended context concatenated with the ego
+        # embedding (skip connection) → 3 expert gating logits. The context
+        # alone is a convex mix of peer embeddings, which dilutes per-agent
+        # signals (e.g. "a target is in MY window") — the skip keeps them.
         self.gate_proj = nn.Sequential(
-            nn.Linear(latent_dim, 32),
+            nn.Linear(2 * latent_dim, 32),
             nn.ReLU(),
             nn.Linear(32, 3),
         )
@@ -214,11 +217,11 @@ class AttentionGatingRouter(nn.Module):
         # Handle fully-masked rows (all peers invalid → NaN after softmax)
         attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
 
-        # Attended context
+        # Attended context + ego skip connection
         context = torch.bmm(attn_weights, v).squeeze(1)  # [B, D]
 
         # Project to gating logits
-        logits = self.gate_proj(context)  # [B, 3]
+        logits = self.gate_proj(torch.cat([context, z_ego], dim=-1))  # [B, 3]
         return torch.softmax(logits, dim=-1)
 
 
