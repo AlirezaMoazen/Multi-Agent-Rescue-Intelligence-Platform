@@ -1,19 +1,13 @@
-from random import Random
-
 from rescue_sim.environment.grid import Position
-from rescue_sim.environment.generator import generate_grid
-from rescue_sim.Qlearning.q_learning import QLearningAgent
 from rescue_sim.simulation.evaluation import (
-    ACTIONS,
     EvaluationScenario,
     RunTrace,
     calculate_run_metrics,
     evaluate_agents,
     report_to_csv,
     report_to_json,
-    train_q_learning_agent,
 )
-from rescue_sim.shared import GridSettings, SPRINT3_REWARD_CONFIG
+from rescue_sim.shared import GridSettings
 
 
 def test_calculate_run_metrics_reports_success_and_exploration() -> None:
@@ -93,67 +87,8 @@ def test_evaluation_includes_single_agent_count_everywhere() -> None:
     assert {aggregate["num_agents"] for aggregate in report.aggregates} == {1}
 
 
-def test_evaluation_reports_learning_feedback_for_trained_agent() -> None:
-    report = evaluate_agents(
-        [
-            EvaluationScenario(
-                name="learning-feedback",
-                grid_settings=GridSettings(
-                    width=4,
-                    height=4,
-                    obstacle_probability=0.0,
-                    target_a_count=1,
-                    target_b_count=0,
-                    random_seed=5,
-                ),
-                max_steps=20,
-            )
-        ],
-        training_episodes=5,
-    )
-
-    feedback = report.learning_feedback[0]
-
-    assert feedback["scenario_name"] == "learning-feedback"
-    assert feedback["training_episodes"] == 5
-    assert feedback["learned_state_actions"] > 0
-    assert "trained" in report.sprint_demo_summary
-
-
-def test_learning_episode_updates_agent_q_values() -> None:
-    scenario = EvaluationScenario(
-        name="q-values",
-        grid_settings=GridSettings(
-            width=4,
-            height=4,
-            obstacle_probability=0.0,
-            target_a_count=1,
-            target_b_count=0,
-            random_seed=9,
-        ),
-        max_steps=20,
-    )
-    grid = generate_grid(scenario.grid_settings, start=scenario.start)
-    learner = QLearningAgent(
-        actions=ACTIONS,
-        epsilon=0.2,
-        reward_config=SPRINT3_REWARD_CONFIG,
-        rng=Random(9),
-    )
-
-    feedback = train_q_learning_agent(
-        learner=learner,
-        scenario=scenario,
-        grid=grid,
-        training_episodes=2,
-    )
-
-    assert feedback.learned_state_actions > 0
-    assert learner.q_table
-
-
 def test_default_evaluation_separates_training_and_test_scenarios() -> None:
-    report = evaluate_agents(training_episodes=2)
+    report = evaluate_agents()
 
     training_seeds = {
         scenario["grid"]["random_seed"] for scenario in report.training_scenarios

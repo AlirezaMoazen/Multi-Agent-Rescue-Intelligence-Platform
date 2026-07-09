@@ -83,9 +83,12 @@ The whole test suite is green and every method trains on a normal CPU.
 > radius and a BLACKOUT badge, and the router panel shows each agent's
 > softmax routing vector in real time.
 >
-> **Legacy note.** Anything tied to the original *single-agent* flow
-> (`QLearningAgent`, the single-agent evaluation path) is kept but **marked
-> legacy** — superseded by the multi-agent line-up above.
+> **Legacy code removed.** The original *single-agent* flow (`QLearningAgent`
+> and its evaluation-panel comparator path) has been **deleted** — it was
+> superseded by the multi-agent line-up above and nothing production-facing
+> depended on it anymore. See
+> [Q-Learning (removed)](#q-learning-tabular-single-agent--removed) for what
+> the problem was and why removal was the right fix.
 
 Architecture documents:
 
@@ -166,14 +169,15 @@ The project compares a ladder of rescue strategies against non-learning
 baselines. They all share one contract — the same `Action` set, `Grid`,
 observation, and `calculate_reward` — so the numbers are directly comparable.
 
-**Status:** ✅ all implemented — **Baselines** (frontier greedy + APF potential fields, single- and multi-agent), **Q-Learning** (single-agent), **Epidemic Hysteretic Q-Learning** (decentralized multi-agent), **MAPPO** (deep, policy-gradient, CTDE), **QMIX** (deep, value-decomposition, CTDE), **TransfQMix** (deep, transformer-based, CTDE), a **ValueEnsemble** + distilled student, and a **Mixture-of-Experts** gate.
+**Status:** ✅ all implemented — **Baselines** (frontier greedy + APF potential fields, single- and multi-agent), **Epidemic Hysteretic Q-Learning** (decentralized multi-agent), **MAPPO** (deep, policy-gradient, CTDE), **QMIX** (deep, value-decomposition, CTDE), **TransfQMix** (deep, transformer-based, CTDE), a **ValueEnsemble** + distilled student, and a **Mixture-of-Experts** gate. The original single-agent **Q-Learning** rung has been removed (see its section below).
 
 > **Reading guide for juniors.** Each section below states *what problem the
 > method solves*, *the key equation in plain symbols*, and *how it differs from
 > its neighbours*. The thread connecting them: a single agent that memorizes
-> (Q-learning) → a decentralized fleet that shares knowledge (Epidemic) → deep
-> nets that generalize across grids (QMIX/TransfQMix/MAPPO) → combining them
-> (Ensemble) → and finally routing between a generalist and a specialist (MoE).
+> (the removed Q-learning rung) → a decentralized fleet that shares knowledge
+> (Epidemic) → deep nets that generalize across grids (QMIX/TransfQMix/MAPPO)
+> → combining them (Ensemble) → and finally routing between a generalist and a
+> specialist (MoE).
 
 ---
 
@@ -209,28 +213,47 @@ for name, m in results.items():
 
 ---
 
-### Q-Learning (tabular, single-agent) — legacy
+### Q-Learning (tabular, single-agent) — ❌ removed
 
-> **Status:** this single-agent learner is the project's *first* RL rung and is
-> kept only because the visualization API's live single-agent demo and the
-> evaluation panel still use it. It is **not** part of the multi-agent line-up
-> or the Mixture-of-Experts. Its multi-agent successor is the **Epidemic
-> Hysteretic fleet** below.
+> **Status:** the project's *first* RL rung, `QLearningAgent`, has been
+> **deleted** from `src/rescue_sim/Qlearning/q_learning.py`, together with its
+> comparator path in `simulation/evaluation.py` and the "Legacy Q-learning" row
+> in the evaluation panel. Its multi-agent successor is the **Epidemic
+> Hysteretic fleet** below, which keeps the exact same TD update at its core.
 
-Standard temporal-difference learning with an ε-greedy policy, implemented as `QLearningAgent` in `src/rescue_sim/Qlearning/q_learning.py`.
-
-**Update rule:**
+It was standard temporal-difference learning with an ε-greedy policy:
 
 $$Q(s, a) \leftarrow Q(s, a) + \alpha \left[ r + \gamma \max_{a'} Q(s', a') - Q(s, a) \right]$$
 
-| Symbol | Meaning |
-|--------|---------|
-| $\alpha$ | Learning rate |
-| $\gamma$ | Discount factor |
-| $r$ | Reward received after action $a$ |
-| $s'$ | Next state |
+**What was the problem?**
 
-**Limitation:** The `LearningState` encodes full sets of cell positions, so nearly every state is unique. The Q-table memorises episodes rather than generalising — the main motivation for the methods below.
+1. **State explosion → memorisation, not learning.** The learner keyed its
+   Q-table on the full `LearningState` — entire *sets* of visible cells,
+   discovered cells, and remaining targets. Almost every step produced a
+   brand-new, never-seen-again key, so the table memorised individual episodes
+   instead of generalising. Its evaluation numbers were effectively noise.
+2. **Dead code kept on life support.** Nothing in the multi-agent line-up
+   (Epidemic fleet, QMIX, TransfQMix, MAPPO, Ensemble, MoE) used it. It
+   survived only because the evaluation panel still rendered a "Legacy
+   Q-learning" comparator row — a row whose numbers were misleading (point 1).
+3. **Maintenance drag.** Two Q-learners in one module meant duplicated update
+   logic, extra tests, extra imports (`MovementModel`, `CentralSensor`,
+   reward plumbing), and a confusing "which one is real?" question for every
+   new reader.
+
+**Why is deletion the best solution?**
+
+- *Fixing* the state key would just re-derive the Epidemic fleet: collapse the
+  state to the grid cell $(y,x)$ and you get exactly the representation the
+  fleet already uses — with the identical TD rule, plus hysteresis and gossip
+  on top. There is no behaviour the legacy learner offered that the fleet
+  does not supersede.
+- Removing it deleted an entire misleading comparator from the evaluation
+  report, so every remaining row (`epidemic_hysteretic_q`, baselines, deep RL)
+  now measures something meaningful on the same grid.
+- The single-agent → multi-agent story is preserved *here in the docs* where
+  it belongs, instead of as ~300 lines of unused runtime code that every
+  refactor had to keep compiling and every test run had to keep training.
 
 ---
 
@@ -517,18 +540,18 @@ print(trainer.evaluate(episodes=20))   # greedy success rate / steps
 
 ### Algorithm Comparison
 
-| | Q-Learning | Epidemic Hysteretic Q | QMIX | TransfQMix | MAPPO |
-|---|---|---|---|---|---|
-| Status | ✅ implemented | ✅ implemented | ✅ implemented | ✅ implemented | ✅ implemented |
-| Family | Value-based | Value-based | Value-based | Value-based | Policy-gradient |
-| Agents | Single | Multi (decentralized) | Multi | Multi | Multi |
-| Function approx. | Tabular | Tabular (dense NumPy) | Deep (MLP) | Deep (Transformer) | Deep (MLP) |
-| State / input | Full `LearningState` | Grid cell $(y,x)$ | Local window vector | Entity token sequence | Local window vector |
-| Replay buffer | No | No | Yes (off-policy) | Yes (off-policy) | No (on-policy) |
-| Coordination | None | Peer gossip (max-sync) | Mixer (training only) | Mixer (training only) | Critic (training only) |
-| Runtime comms | No | Yes (when robots meet) | No | No | No |
-| Key innovation | Baseline RL | Optimistic + epidemic max-sync | Monotonic mixing | Attention over entities | Clipped policy update |
-| PC trainable | Yes | Yes | Yes | Yes | Yes |
+| | Epidemic Hysteretic Q | QMIX | TransfQMix | MAPPO |
+|---|---|---|---|---|
+| Status | ✅ implemented | ✅ implemented | ✅ implemented | ✅ implemented |
+| Family | Value-based | Value-based | Value-based | Policy-gradient |
+| Agents | Multi (decentralized) | Multi | Multi | Multi |
+| Function approx. | Tabular (dense NumPy) | Deep (MLP) | Deep (Transformer) | Deep (MLP) |
+| State / input | Grid cell $(y,x)$ | Local window vector | Entity token sequence | Local window vector |
+| Replay buffer | No | Yes (off-policy) | Yes (off-policy) | No (on-policy) |
+| Coordination | Peer gossip (max-sync) | Mixer (training only) | Mixer (training only) | Critic (training only) |
+| Runtime comms | Yes (when robots meet) | No | No | No |
+| Key innovation | Optimistic + epidemic max-sync | Monotonic mixing | Attention over entities | Clipped policy update |
+| PC trainable | Yes | Yes | Yes | Yes |
 
 ---
 
@@ -892,7 +915,7 @@ docker compose run --rm lint
 This project is licensed under the Apache License, Version 2.0. See the [LICENSE](LICENSE) file for the full license text.
 
 * **Authors (Group 05)**:
-  * Adriana Herrero Callejo
+  * Adriana Herrero Callejo ([github.com/adrianaherrerocallejo](https://github.com/adrianaherrerocallejo))
   * Cristina Marcos Alonso
   * Mohammad Mustafa Orfany
   * Alireza Moazzen ([alirezamoazen.com](http://alirezamoazen.com))

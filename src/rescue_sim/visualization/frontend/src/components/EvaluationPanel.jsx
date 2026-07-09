@@ -2,7 +2,6 @@ const SAME_GRID = [
   ['epidemic_hysteretic_q', 'Q-learning gossip', 'Multi-agent Q-learning with nearby-agent gossip.'],
   ['frontier', 'Baseline', 'Greedy frontier exploration.'],
   ['apf', 'Baseline', 'Artificial Potential Fields swarm navigation.'],
-  ['trained', 'Legacy Q-learning', 'Legacy tabular comparator.'],
 ];
 
 const DEEP = [

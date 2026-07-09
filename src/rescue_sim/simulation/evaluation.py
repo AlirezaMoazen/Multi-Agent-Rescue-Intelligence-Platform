@@ -6,7 +6,6 @@ from dataclasses import asdict, dataclass
 import csv
 import io
 import json
-from random import Random
 from typing import Iterable
 
 from rescue_sim.environment.generator import generate_grid
@@ -18,14 +17,12 @@ from rescue_sim.Qlearning.baseline import (
     default_start_positions,
     run_multi_agent_baseline,
 )
-from rescue_sim.Qlearning.q_learning import EpidemicHystereticQLearning, QLearningAgent
+from rescue_sim.Qlearning.q_learning import EpidemicHystereticQLearning
 from rescue_sim.shared import (
-    Action,
     CARDINAL_ACTIONS,
     GossipConfig,
     GridSettings,
     HystereticConfig,
-    LearningState,
     RewardEvent,
     SPRINT3_REWARD_CONFIG,
     StrategyInterface,
@@ -34,9 +31,7 @@ from rescue_sim.shared import (
 )
 
 DEFAULT_NUM_AGENTS = 4
-DEFAULT_TRAINING_EPISODES = 25
 EVALUATION_SENSOR_RANGE = 3
-ACTIONS: tuple[Action, ...] = (Action.RIGHT, Action.DOWN, Action.LEFT, Action.UP, Action.WAIT)
 
 BASELINE_STRATEGIES = tuple(DEFAULT_MULTI_AGENT_BASELINES.items())
 
@@ -58,19 +53,6 @@ class EvaluationScenario:
     start: Position = Position(0, 0)
     num_agents: int = DEFAULT_NUM_AGENTS
     communication_range: float = 3.0
-
-
-@dataclass(frozen=True)
-class LearningFeedback:
-    """Small training summary for the Q-learning comparator."""
-
-    scenario_name: str
-    training_episodes: int
-    first_episode_steps: int
-    last_episode_steps: int
-    first_episode_reward: float
-    last_episode_reward: float
-    learned_state_actions: int
 
 
 @dataclass(frozen=True)
@@ -154,12 +136,15 @@ def default_training_scenarios() -> list[EvaluationScenario]:
 def evaluate_agents(
     scenarios: Iterable[EvaluationScenario] | None = None,
     training_scenarios: Iterable[EvaluationScenario] | None = None,
-    training_episodes: int = DEFAULT_TRAINING_EPISODES,
 ) -> EvaluationReport:
     """Compatibility wrapper that builds demo grids from scenario settings.
 
     The real simulation/visualization path should call evaluate_simulation_grid()
     with the grid that the main simulation already generated.
+
+    All compared learners train online during their runs, so there is no
+    separate pre-training pass; ``training_scenarios`` are only echoed into
+    the report for the train/test split bookkeeping.
     """
 
     selected = list(scenarios or default_evaluation_scenarios())
@@ -169,24 +154,6 @@ def evaluate_agents(
         else (selected if scenarios is not None else default_training_scenarios())
     )
 
-    learner = QLearningAgent(
-        actions=ACTIONS,
-        learning_rate=0.2,
-        discount_factor=0.9,
-        epsilon=0.35,
-        reward_config=SPRINT3_REWARD_CONFIG,
-        rng=Random(10_000),
-    )
-    feedback = [
-        train_q_learning_agent(
-            learner,
-            training_scenario,
-            generate_grid(training_scenario.grid_settings, start=training_scenario.start),
-            training_episodes,
-        )
-        for training_scenario in train_selected
-    ]
-
     all_runs: list[dict] = []
     scenario_dicts: list[dict] = []
     for scenario in selected:
@@ -195,7 +162,6 @@ def evaluate_agents(
         report = evaluate_simulation_grid(
             scenario=scenario,
             grid=grid,
-            learner=learner,
             start_positions=starts,
         )
         all_runs.extend(report.runs)
@@ -208,7 +174,7 @@ def evaluate_agents(
         scenarios=scenario_dicts,
         runs=all_runs,
         aggregates=aggregates,
-        learning_feedback=[asdict(item) for item in feedback],
+        learning_feedback=[],
         sprint_demo_summary=build_sprint_demo_summary(aggregates),
         deep_benchmark=_deep_benchmark_rows(),
         deep_benchmark_note=DEEP_BENCHMARK_NOTE,
@@ -219,18 +185,8 @@ def evaluate_simulation_grid(
     scenario: EvaluationScenario,
     grid: Grid,
     start_positions: dict[str, Position],
-    learner: QLearningAgent | None = None,
 ) -> EvaluationReport:
     """Evaluate algorithms on the exact grid used by the main simulation."""
-
-    q_learner = learner or QLearningAgent(
-        actions=ACTIONS,
-        learning_rate=0.2,
-        discount_factor=0.9,
-        epsilon=0.0,
-        reward_config=SPRINT3_REWARD_CONFIG,
-        rng=Random(_policy_seed(scenario.grid_settings.random_seed, "trained")),
-    )
 
     runs = [calculate_run_metrics(run_main_algorithm(scenario, grid, start_positions))]
     for name, strategy_type in BASELINE_STRATEGIES:
@@ -242,11 +198,6 @@ def evaluate_simulation_grid(
                 run_strategy_on_grid(scenario, grid, name, strategy, start_positions)
             )
         )
-    runs.append(
-        calculate_run_metrics(
-            run_q_learning_agent_on_grid(scenario, grid, q_learner, start_positions)
-        )
-    )
 
     aggregates = _aggregate_by_agent(runs)
     return EvaluationReport(
@@ -331,93 +282,6 @@ def run_strategy_on_grid(
         explorable_cells=_explorable_cell_count(grid),
         algorithm_group="baseline",
     )
-
-
-def train_q_learning_agent(
-    learner: QLearningAgent,
-    scenario: EvaluationScenario,
-    grid: Grid,
-    training_episodes: int,
-) -> LearningFeedback:
-    # Legacy single-agent Q-learning path: retained for the visualization API and
-    # the evaluation panel. The multi-agent line-up (Epidemic fleet, QMIX,
-    # TransfQMix, MAPPO, MoE) does not go through here.
-    starts = _agent_starts(grid, scenario)
-    traces = [
-        run_q_learning_agent_on_grid(scenario, grid, learner, starts, training=True)
-        for _ in range(training_episodes)
-    ]
-    first, last = traces[0], traces[-1]
-    return LearningFeedback(
-        scenario.name,
-        training_episodes,
-        first.steps_taken,
-        last.steps_taken,
-        first.total_reward,
-        last.total_reward,
-        len(learner.q_table),
-    )
-
-
-def run_q_learning_agent_on_grid(
-    scenario: EvaluationScenario,
-    grid: Grid,
-    learner: QLearningAgent,
-    starts: dict[str, Position],
-    training: bool = False,
-) -> RunTrace:
-    """Run the regular Q-learning policy as another comparator."""
-
-    previous_epsilon = learner.epsilon
-    if not training:
-        learner.epsilon = 0.0
-
-    sensor = CentralSensor(grid)
-
-    def pick_actions() -> dict[str, Action]:
-        actions: dict[str, Action] = {}
-        for agent_id, position in positions.items():
-            observation = sensor.observe(agent_id, position, EVALUATION_SENSOR_RANGE)
-            state = learner.state_from_observation(observation, grid, frozenset(), 0)
-            actions[agent_id] = learner.choose_action(state, _learner_actions(learner, grid, position))
-        return actions
-
-    def learn(
-        actions: dict[str, Action],
-        rewards: dict[str, float],
-        next_positions: dict[str, Position],
-        dones: dict[str, bool],
-    ) -> int:
-        if not training:
-            return 0
-        for agent_id, action in actions.items():
-            before = positions[agent_id]
-            after = next_positions[agent_id]
-            state_obs = sensor.observe(agent_id, before, EVALUATION_SENSOR_RANGE)
-            next_obs = sensor.observe(agent_id, after, EVALUATION_SENSOR_RANGE)
-            state = learner.state_from_observation(state_obs, grid, frozenset(), 0)
-            next_state = learner.state_from_observation(next_obs, grid, frozenset(), 0)
-            learner.update_q_value(
-                state,
-                action,
-                rewards[agent_id],
-                next_state,
-                _learner_actions(learner, grid, after),
-            )
-        return 0
-
-    positions = starts
-    trace = _run_fleet_loop(
-        scenario,
-        grid,
-        positions,
-        group="q_learning",
-        name="trained",
-        action_picker=pick_actions,
-        after_step=learn,
-    )
-    learner.epsilon = previous_epsilon
-    return trace
 
 
 def _run_fleet_loop(
@@ -555,54 +419,6 @@ def build_sprint_demo_summary(aggregates: list[dict]) -> str:
             f"status={row['status']}{error}"
         )
     return "\n".join(lines)
-
-
-def _learning_state(
-    observation: object,
-    grid: Grid,
-    discovered_cells: frozenset[Position],
-    rescued: frozenset[Position],
-    steps: int,
-) -> LearningState:
-    rescued_a = frozenset(position for position in rescued if position in grid.target_a_positions)
-    rescued_b = frozenset(position for position in rescued if position in grid.target_b_positions)
-    visible_a = frozenset(
-        position for position, target_type in observation.target_types.items() if target_type == "A"
-    )
-    visible_b = frozenset(
-        position for position, target_type in observation.target_types.items() if target_type == "B"
-    )
-    return LearningState(
-        agent_id=observation.agent_id,
-        agent_position=observation.agent_position,
-        visible_cells=observation.visible_cells,
-        visible_obstacles=observation.obstacles,
-        visible_target_a_positions=visible_a,
-        visible_target_b_positions=visible_b,
-        discovered_cells=discovered_cells,
-        discovered_target_a_positions=visible_a,
-        discovered_target_b_positions=visible_b,
-        rescued_target_a_positions=rescued_a,
-        rescued_target_b_positions=rescued_b,
-        remaining_target_a_positions=grid.target_a_positions - rescued_a,
-        remaining_target_b_positions=grid.target_b_positions - rescued_b,
-        steps_taken=steps,
-    )
-
-
-def _valid_actions(grid: Grid, position: Position) -> tuple[Action, ...]:
-    movement = MovementModel()
-    valid = tuple(Action(move) for move in movement.allowed_moves(grid, position))
-    return valid or (Action.WAIT,)
-
-
-def _learner_actions(
-    learner: QLearningAgent,
-    grid: Grid,
-    position: Position,
-) -> tuple[Action, ...]:
-    valid = tuple(action for action in _valid_actions(grid, position) if action in learner.actions)
-    return valid or (Action.WAIT,)
 
 
 def _target_type_enum(grid: Grid, position: Position) -> TargetType | None:
