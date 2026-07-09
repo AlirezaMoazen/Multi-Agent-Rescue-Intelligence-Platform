@@ -1016,7 +1016,11 @@ async def _run_moe_rollout(
 
     import torch
 
-    from rescue_sim.MoE.pipeline import FixedGridRescueEnv, build_peer_matrix
+    from rescue_sim.MoE.pipeline import (
+        ExplorationMemory,
+        FixedGridRescueEnv,
+        build_peer_matrix,
+    )
 
     # Training may have run on the GPU; single-step inference is trivial, so
     # serve the rollout on CPU and keep the per-step input tensors local.
@@ -1103,6 +1107,11 @@ async def _run_moe_rollout(
     for episode in range(max(1, config.num_episodes)):
         obs = env.reset()  # identical grid every try (fixed competition grid)
         hidden = None      # GRU temporal memory resets per try
+        # Anti-revisit memory: penalizes moves onto already-visited cells while
+        # no target is in the ego window, so targets far from the start corner
+        # are reached instead of the team looping over searched ground.
+        memory = ExplorationMemory(num_agents)
+        memory.observe(env.positions)
         last_action: list[int | None] = [None] * num_agents
         policy.route_bias = _torch.tensor(adapt_bias, dtype=_torch.float32)
         last_rescue_step = 0
@@ -1177,15 +1186,20 @@ async def _run_moe_rollout(
             assert peer_t.shape == (1, num_agents, num_agents), f"peer shape {peer_t.shape}"
             assert mask_t.shape == (1, num_agents, policy.action_dim), f"mask shape {mask_t.shape}"
 
+            valid_np = mask_t.squeeze(0).numpy()
             with torch.no_grad():
                 y_final, weights, hidden = policy(obs_t, peer_t, mask_t, hidden)
-                logits = y_final.squeeze(0).clone()               # [A, act]
+                # Anti-revisit bias: log-prob scores penalized by per-agent
+                # visit counts (only while no target is visible), so the team
+                # expands toward unexplored ground and far targets get found.
+                logits = memory.bias_logits(
+                    env, obs, y_final.squeeze(0), valid_np
+                ).clone()                                         # [A, act]
 
             # No-backtrack rule: mask the exact reverse of each agent's
             # previous move (feed-forward heads have no memory, so without
             # this they ping-pong east/west forever). Skipped when the
             # reverse is the only valid option.
-            valid_np = mask_t.squeeze(0).numpy()
             for i in range(num_agents):
                 prev = last_action[i]
                 if prev is None:
@@ -1265,6 +1279,7 @@ async def _run_moe_rollout(
                     recent_dominant[i].pop(0)
 
             obs, reward, done, info = env.step(act_np)
+            memory.observe(env.positions)
             total_reward += float(reward)
             last_action = [int(a) for a in act_np]
 

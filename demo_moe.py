@@ -59,6 +59,7 @@ try:
         run_expert_distillation,
         run_router_optimization,
         build_peer_matrix,
+        ExplorationMemory,
         ACTION_DIM,
         EXPERT_NAMES,
     )
@@ -74,6 +75,7 @@ except ModuleNotFoundError:  # source checkout without `pip install -e .`
         run_expert_distillation,
         run_router_optimization,
         build_peer_matrix,
+        ExplorationMemory,
         ACTION_DIM,
         EXPERT_NAMES,
     )
@@ -224,6 +226,8 @@ def run_live_simulation(
     """
     policy = policy.to("cpu")  # training may run on GPU; serve inference on CPU
     obs_np = env.reset()
+    memory = ExplorationMemory(env.num_agents)
+    memory.observe(env.positions)
     assert env.grid is not None
     goals: list[Position] = sorted(
         env.grid.target_a_positions | env.grid.target_b_positions,
@@ -253,15 +257,20 @@ def run_live_simulation(
         assert mask_t.shape == (1, env.num_agents, policy.action_dim), \
             f"mask shape: expected [1, {env.num_agents}, {policy.action_dim}], got {mask_t.shape}"
 
+        valid_mask = env.valid_action_mask()
         with torch.no_grad():
             y_final, weights, fallback_hidden = policy(obs_t, peer_t, mask_t, fallback_hidden)
-            actions = torch.argmax(y_final.squeeze(0), dim=-1)
+            # Anti-revisit bias steers exploration toward unvisited ground so
+            # far-away targets are actually reached (replaces the old blind
+            # 10% random jitter, which broke loops but also broke rescues).
+            scores = memory.bias_logits(env, obs_np, y_final.squeeze(0), valid_mask)
+            actions = torch.argmax(scores, dim=-1)
 
-        # Small epsilon breaks feed-forward oscillation loops
+        # Tiny residual epsilon still breaks exact policy ties
         actions = actions.numpy().copy()
         for i in range(env.num_agents):
-            if np.random.random() < 0.1:
-                valid = np.flatnonzero(env.valid_action_mask()[i])
+            if np.random.random() < 0.03:
+                valid = np.flatnonzero(valid_mask[i])
                 if len(valid):
                     actions[i] = np.random.choice(valid)
         actions = torch.tensor(actions)
@@ -272,6 +281,7 @@ def run_live_simulation(
             print_telemetry_table(step, positions_before, weights, peer_t, fallback_hidden)
 
         obs_np, _, done, step_info = env.step(actions.numpy())
+        memory.observe(env.positions)
         info = step_info
         rescued.update(g for g in goals if g in set(env.positions))
 
@@ -331,7 +341,10 @@ def parse_args() -> argparse.Namespace:
                         help="attention router optimization steps")
     parser.add_argument("--router-batch", type=int, default=16,
                         help="real states sampled per router step")
-    parser.add_argument("--sim-steps", type=int, default=60, help="live simulation step cap")
+    # 150 steps: a 20x20 grid with targets far from the start corner needs
+    # room to cross (~19 steps) and sweep; 60 steps routinely timed out with
+    # distant targets still undiscovered.
+    parser.add_argument("--sim-steps", type=int, default=150, help="live simulation step cap")
     parser.add_argument("--render-every", type=int, default=5, help="dashboard render period")
     parser.add_argument("--seed", type=int, default=7, help="global random seed")
     parser.add_argument("--skip-tests", action="store_true", help="skip the pytest gate")

@@ -80,6 +80,66 @@ def build_peer_matrix(positions: list[Position]) -> np.ndarray:
     return peer
 
 
+class ExplorationMemory:
+    """Rollout-time anti-revisit bias (decentralized, per-agent visit counts).
+
+    Why: the policy only sees a small ego window, so a target far from the
+    start positions is invisible for most of the episode. The observation has
+    no "already visited" channel, so the memoryless feed-forward heads can
+    loop over already-searched ground and never reach a distant target. This
+    helper gives each agent its own visited-cell counter and penalizes moves
+    whose destination was already visited — pushing the search frontier
+    outward instead of relying on random jitter.
+
+    The bias only applies while an agent has NO live target in its ego
+    window; the moment one is visible the raw policy logits decide, so
+    close-range rescue behavior is completely untouched. Each agent uses only
+    its own history — the scheme stays honestly decentralized.
+    """
+
+    def __init__(self, num_agents: int, beta: float = 0.6) -> None:
+        self.beta = beta
+        # Keyed by plain (x, y) tuples: the codebase has two distinct Position
+        # dataclasses (shared vs environment.grid) that hash alike but never
+        # compare equal across classes, which would silently break dict lookups.
+        self.visits: list[dict[tuple[int, int], int]] = [{} for _ in range(num_agents)]
+
+    def observe(self, positions: list[Position]) -> None:
+        """Records the agents' current cells (call after reset and each step)."""
+        for i, pos in enumerate(positions):
+            key = (pos.x, pos.y)
+            self.visits[i][key] = self.visits[i].get(key, 0) + 1
+
+    def bias_logits(
+        self,
+        env: RescueEnv,
+        obs: np.ndarray,
+        logits: torch.Tensor,
+        valid_mask: np.ndarray,
+    ) -> torch.Tensor:
+        """Returns [A, 4] scores: masked log-probs minus the visit penalty.
+
+        Log-probs (not raw logits) give a bounded, comparable scale so one
+        ``beta`` works regardless of how large the blended expert logits are.
+        """
+        win, channels = 2 * env.view_radius + 1, 4  # matches RescueEnv obs layout
+        win_dim = win * win * channels
+        window = obs[:, :win_dim].reshape(env.num_agents, win, win, channels)
+        has_target = window[..., 1:3].max(axis=(1, 2, 3)) > 0.5  # [A]
+
+        mask_t = torch.tensor(valid_mask, dtype=torch.bool)
+        scores = torch.log_softmax(logits.masked_fill(~mask_t, -1e9), dim=-1)
+        for i, pos in enumerate(env.positions):
+            if has_target[i]:
+                continue  # target in sight: let the pure policy act
+            for a, (dx, dy) in enumerate(ACTION_DELTAS):
+                if not valid_mask[i, a]:
+                    continue
+                nxt = (pos.x + dx, pos.y + dy)
+                scores[i, a] = scores[i, a] - self.beta * self.visits[i].get(nxt, 0)
+        return scores.masked_fill(~mask_t, -1e9)
+
+
 class FixedGridRescueEnv(RescueEnv):
     """RescueEnv that regenerates the *same* grid on every reset.
 
@@ -894,20 +954,24 @@ def evaluate_moe_policy(
     successes, rescued, steps = [], [], []
     for _ in range(episodes):
         obs = env.reset()
+        memory = ExplorationMemory(env.num_agents)
+        memory.observe(env.positions)
         hidden = None
         done = False
         info = {"success": False, "rescued": 0, "steps": 0}
         while not done:
+            valid_mask = env.valid_action_mask()
             obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
             peer_t = torch.tensor(
                 build_peer_matrix(env.positions), dtype=torch.float32
             ).unsqueeze(0)
-            mask_t = torch.tensor(env.valid_action_mask(), dtype=torch.bool).unsqueeze(0)
+            mask_t = torch.tensor(valid_mask, dtype=torch.bool).unsqueeze(0)
             with torch.no_grad():
                 y_final, _weights, hidden = policy(obs_t, peer_t, mask_t, hidden)
-            logits = y_final.squeeze(0).masked_fill(~mask_t.squeeze(0), -1e9)
-            actions = torch.argmax(logits, dim=-1)
+            scores = memory.bias_logits(env, obs, y_final.squeeze(0), valid_mask)
+            actions = torch.argmax(scores, dim=-1)
             obs, _reward, done, info = env.step(actions.numpy())
+            memory.observe(env.positions)
         successes.append(bool(info["success"]))
         rescued.append(int(info["rescued"]))
         steps.append(int(info["steps"]))
