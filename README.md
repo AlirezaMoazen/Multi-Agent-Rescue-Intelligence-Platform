@@ -915,11 +915,11 @@ docker compose run --rm lint
 This project is licensed under the Apache License, Version 2.0. See the [LICENSE](LICENSE) file for the full license text.
 
 * **Authors (Group 05)**:
-  * Adriana Herrero Callejo ([github.com/adrianaherrerocallejo](https://github.com/adrianaherrerocallejo))
-  * Cristina Marcos Alonso (https://github.com/CristinaMarcosAlonso)
-  * Mohammad Mustafa Orfany (https://github.com/MustafaZo77o)
-  * Alireza Moazzen ([alirezamoazen.com](http://alirezamoazen.com))
-* **Institution**: Hamburg University of Technology (TUHH) — Software Development SS26
-* **Supervisor**: Rainer Marrone
+ * Adriana Herrero Callejo ([github.com/adrianaherrerocallejo](https://github.com/adrianaherrerocallejo))
+ * Cristina Marcos Alonso ([github.com/CristinaMarcosAlonso](https://github.com/CristinaMarcosAlonso))
+ * Mohammad Mustafa Orfany ([github.com/MustafaZo77o](https://github.com/MustafaZo77o))
+ * Alireza Moazzen ([alirezamoazen.com](http://alirezamoazen.com))
+ * **Institution**: Hamburg University of Technology (TUHH) — Software Development SS26
+ * **Supervisor**: Rainer Marrone
 
 
