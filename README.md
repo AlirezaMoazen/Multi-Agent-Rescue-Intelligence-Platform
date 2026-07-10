@@ -13,8 +13,8 @@
 
 ```bash
 # Clone the repository
-git clone https://collaborating.tuhh.de/e16/courses/software-development/ss26/group05.git
-cd group05
+git clone https://github.com/AlirezaMoazen/Multi-Agent-Rescue-Intelligence-Platform.git
+cd Multi-Agent-Rescue-Intelligence-Platform
 
 # Option A: Docker (recommended — zero setup)
 # One command: builds the multi-stage container and launches the live 20x20

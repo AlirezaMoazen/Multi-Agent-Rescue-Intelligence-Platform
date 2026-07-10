@@ -6,8 +6,8 @@ welcome — bug reports, doc fixes, new experiments, frontend polish.
 ## Getting set up
 
 ```bash
-git clone <your-fork-url>
-cd group05
+git clone https://github.com/AlirezaMoazen/Multi-Agent-Rescue-Intelligence-Platform.git
+cd Multi-Agent-Rescue-Intelligence-Platform
 pip install -e ".[dev]"                 # Python package + pytest + ruff
 pip install torch --index-url https://download.pytorch.org/whl/cpu  # deep RL / MoE
 ```
