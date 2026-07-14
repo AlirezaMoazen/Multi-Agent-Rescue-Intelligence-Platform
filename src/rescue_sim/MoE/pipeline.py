@@ -914,6 +914,7 @@ def save_moe_policy(
             "shape": tuple(shape),
             "epochs": int(epochs),
             "gate_tau": float(getattr(policy, "gate_tau", 1.0)),
+            "coord_hidden": int(getattr(policy, "coord_hidden", 64)),
         },
         target,
     )
@@ -933,6 +934,7 @@ def load_moe_policy(path: str) -> tuple[NeuralMoEPolicy, tuple, int] | None:
         ckpt["view_radius"],
         ckpt["action_dim"],
         ckpt["latent_dim"],
+        coord_hidden=int(ckpt.get("coord_hidden", 64)),
     )
     policy.load_state_dict(ckpt["state_dict"])
     policy.gate_tau = float(ckpt.get("gate_tau", 1.0))

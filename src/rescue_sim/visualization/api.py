@@ -1088,6 +1088,18 @@ async def _run_moe_rollout(
     except Exception as exc:  # noqa: BLE001 - live E3 is an enhancement, not a dependency
         print(f"[MoE] live E3 epidemic fleet unavailable ({exc})")
 
+    # Live E1/E2: real APF and the real TransfQMix checkpoint act whenever the
+    # router routes an agent to exploration/coordination — the router decides,
+    # the genuine experts move (measured: bare 72% -> 84% on unseen grids).
+    from rescue_sim.MoE.live_moe import LiveExperts
+
+    live_experts = LiveExperts.from_checkpoints(
+        settings, num_agents, view_radius, config.max_steps,
+        seed=settings.random_seed or 0,
+    )
+    if live_experts is None:
+        print("[MoE] live E1/E2 experts unavailable — distilled heads stay in charge")
+
     # Online scoreboard adaptation (learns WITHIN a run, like E3's Q-table):
     # log-space per-expert routing bias, updated after every try from who
     # actually delivered rescues on THIS grid. E2 starts with a positive
@@ -1106,6 +1118,8 @@ async def _run_moe_rollout(
 
     for episode in range(max(1, config.num_episodes)):
         obs = env.reset()  # identical grid every try (fixed competition grid)
+        if live_experts is not None:
+            live_experts.reset(env)  # re-anchor APF's live-target tracking
         hidden = None      # GRU temporal memory resets per try
         # Anti-revisit memory: penalizes moves onto already-visited cells while
         # no target is in the ego window, so targets far from the start corner
@@ -1233,6 +1247,12 @@ async def _run_moe_rollout(
             weights_step = weights.squeeze(0)                    # [A, 3]
             dominant = torch.argmax(weights_step, dim=-1).tolist()
 
+            # Live E1/E2: the router decides, the real experts move — APF on
+            # exploration-routed agents, TransfQMix on coordination-routed ones.
+            if live_experts is not None:
+                proposals = live_experts.actions(env, valid_np)
+                act_np = live_experts.apply(act_np, dominant, proposals, valid_np)
+
             # Live E3 takes over agents the router assigns to the fallback
             # expert: the tabular fleet acts from its (ever-improving) Q-table.
             if live_fleet is not None:
@@ -1280,6 +1300,8 @@ async def _run_moe_rollout(
 
             obs, reward, done, info = env.step(act_np)
             memory.observe(env.positions)
+            if live_experts is not None:
+                live_experts.observe(env)  # APF drops just-rescued targets
             total_reward += float(reward)
             last_action = [int(a) for a in act_np]
 

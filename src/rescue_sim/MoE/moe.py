@@ -309,6 +309,7 @@ class NeuralMoEPolicy(nn.Module):
         view_radius: int = 3,
         action_dim: int = 4,
         latent_dim: int = 128,
+        coord_hidden: int = 64,
     ) -> None:
         """Initializes encoders, the attention router, and three expert heads.
 
@@ -318,11 +319,15 @@ class NeuralMoEPolicy(nn.Module):
             view_radius: Sensor range radius (default 3, 7x7 egocentric window).
             action_dim: Total actions in policy distribution.
             latent_dim: Layer size for shared space.
+            coord_hidden: Hidden width of the coordination head (Expert 2).
+                The default 64 matches historical checkpoints; wider heads give
+                the distilled deep-RL student more imitation capacity.
         """
         super().__init__()
         self.action_dim = action_dim
         self.num_agents = num_agents
         self.latent_dim = latent_dim
+        self.coord_hidden = coord_hidden
         # Gate sharpening temperature: 1.0 = soft blend; <1 pushes routing
         # toward winner-take-all so the MoE acts like its best expert per
         # state instead of a logit compromise. Set by outcome-based router
@@ -348,9 +353,9 @@ class NeuralMoEPolicy(nn.Module):
 
         # Expert Head 2: Coordination distilled from QMIX/MAPPO (feed-forward)
         self.expert_coordination = nn.Sequential(
-            nn.Linear(latent_dim, 64),
+            nn.Linear(latent_dim, coord_hidden),
             nn.ReLU(),
-            nn.Linear(64, action_dim),
+            nn.Linear(coord_hidden, action_dim),
         )
 
         # Expert Head 3: Recurrent fallback with GRU temporal memory
