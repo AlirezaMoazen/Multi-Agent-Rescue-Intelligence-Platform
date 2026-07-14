@@ -30,6 +30,7 @@ def main() -> None:
     parser.add_argument("--device", default="auto", help="auto | cpu | cuda")
     parser.add_argument("--time-budget", type=float, default=5400.0, help="max wall-clock seconds")
     parser.add_argument("--eval-every", type=int, default=10, help="updates between greedy evals + best-checkpoint")
+    parser.add_argument("--eval-episodes", type=int, default=30, help="greedy episodes per eval (best-checkpoint selection)")
     parser.add_argument("--checkpoint", default="checkpoints/mappo.pt")
     args = parser.parse_args()
 
@@ -61,7 +62,7 @@ def main() -> None:
     )
 
     trainer = MAPPO(env, settings, device=args.device)
-    hook, state = make_eval_hook(trainer, args.checkpoint, args.time_budget, eval_episodes=20)
+    hook, state = make_eval_hook(trainer, args.checkpoint, args.time_budget, eval_episodes=args.eval_episodes)
     trainer.train(num_updates=args.updates, eval_hook=hook, hook_every=args.eval_every)
 
     print("\nFinal greedy evaluation (best checkpoint kept during training):")

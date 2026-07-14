@@ -9,6 +9,7 @@ contract needed for independent multi-agent work.
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -703,6 +704,10 @@ class RunningMeanStd:
         batch_mean = float(x.mean())
         batch_var = float(x.var(unbiased=False))
         batch_count = x.numel()
+        # A single non-finite target (e.g. masked -inf reaching the Bellman
+        # backup) would poison mean/var permanently; skip such batches.
+        if not (math.isfinite(batch_mean) and math.isfinite(batch_var)):
+            return
         delta = batch_mean - self.mean
         total = self.count + batch_count
         self.mean += delta * batch_count / total

@@ -32,6 +32,14 @@ def main() -> None:
     parser.add_argument("--device", default="auto", help="auto | cpu | cuda")
     parser.add_argument("--time-budget", type=float, default=5400.0, help="max wall-clock seconds")
     parser.add_argument("--eval-every", type=int, default=50, help="episodes between greedy evals + best-checkpoint")
+    parser.add_argument("--eval-episodes", type=int, default=30, help="greedy episodes per eval (best-checkpoint selection)")
+    parser.add_argument("--epsilon-anneal", type=int, default=300,
+                        help="episodes to anneal epsilon 1.0 -> 0.05. Keep moderate: the "
+                             "value-target normalizer is anchored by early greedy successes, "
+                             "and very long random phases (e.g. 1500) make it diverge")
+    parser.add_argument("--buffer-size", type=int, default=5000,
+                        help="replay capacity in transitions (shipped default; larger buffers "
+                             "hold too much stale random data for the normalized mixer)")
     parser.add_argument("--checkpoint", default="checkpoints/qmix.pt")
     args = parser.parse_args()
 
@@ -53,6 +61,8 @@ def main() -> None:
         view_radius=args.view_radius,
         max_steps=args.max_steps,
         random_seed=args.seed,
+        epsilon_anneal_episodes=args.epsilon_anneal,
+        buffer_size=args.buffer_size,
     )
     env = RescueEnv(
         grid,
@@ -63,7 +73,7 @@ def main() -> None:
     )
 
     trainer = QMIX(env, settings, device=args.device)
-    hook, state = make_eval_hook(trainer, args.checkpoint, args.time_budget, eval_episodes=20)
+    hook, state = make_eval_hook(trainer, args.checkpoint, args.time_budget, eval_episodes=args.eval_episodes)
     trainer.train(num_episodes=args.episodes, eval_hook=hook, hook_every=args.eval_every)
 
     print("\nFinal greedy evaluation (best checkpoint kept during training):")

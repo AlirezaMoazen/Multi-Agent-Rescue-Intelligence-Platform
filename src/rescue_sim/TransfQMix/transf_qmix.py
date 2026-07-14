@@ -158,7 +158,7 @@ class TransfQMIX:
     @torch.no_grad()
     def select_actions(self, tokens: np.ndarray, avail: np.ndarray, greedy: bool = False):
         q, _ = self.agent(torch.as_tensor(tokens).float().to(self.device))
-        q = q.masked_fill(~torch.as_tensor(avail).to(self.device), -float("inf"))
+        q = q.masked_fill(~torch.as_tensor(avail).to(self.device), -1e9)
         greedy_actions = q.argmax(dim=-1).cpu().numpy()
         if greedy:
             return greedy_actions
@@ -224,10 +224,10 @@ class TransfQMIX:
 
         with torch.no_grad():
             tgt_q, tgt_h = self._agent_forward(self.target_agent, batch["next_obs"])
-            tgt_q = tgt_q.masked_fill(~batch["next_avail"], -float("inf"))
+            tgt_q = tgt_q.masked_fill(~batch["next_avail"], -1e9)
             if cfg.double_q:
                 online_q, _ = self._agent_forward(self.agent, batch["next_obs"])
-                online_q = online_q.masked_fill(~batch["next_avail"], -float("inf"))
+                online_q = online_q.masked_fill(~batch["next_avail"], -1e9)
                 next_actions = online_q.argmax(dim=2, keepdim=True)
                 next_q = tgt_q.gather(2, next_actions).squeeze(2)
             else:

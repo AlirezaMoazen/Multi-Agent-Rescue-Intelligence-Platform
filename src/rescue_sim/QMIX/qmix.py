@@ -112,7 +112,7 @@ class QMIX:
     @torch.no_grad()
     def select_actions(self, obs: np.ndarray, avail: np.ndarray, greedy: bool = False) -> np.ndarray:
         q = self.agent(torch.as_tensor(obs).float().to(self.device))
-        q = q.masked_fill(~torch.as_tensor(avail).to(self.device), -float("inf"))
+        q = q.masked_fill(~torch.as_tensor(avail).to(self.device), -1e9)
         greedy_actions = q.argmax(dim=-1).cpu().numpy()
         if greedy:
             return greedy_actions
@@ -186,10 +186,10 @@ class QMIX:
 
         with torch.no_grad():
             target_q = self.target_agent(batch["next_obs"])
-            target_q = target_q.masked_fill(~batch["next_avail"], -float("inf"))
+            target_q = target_q.masked_fill(~batch["next_avail"], -1e9)
             if cfg.double_q:  # pick next actions with the online net, value with target
                 online_next = self.agent(batch["next_obs"])
-                online_next = online_next.masked_fill(~batch["next_avail"], -float("inf"))
+                online_next = online_next.masked_fill(~batch["next_avail"], -1e9)
                 next_actions = online_next.argmax(dim=2, keepdim=True)
                 next_q = target_q.gather(2, next_actions).squeeze(2)
             else:
