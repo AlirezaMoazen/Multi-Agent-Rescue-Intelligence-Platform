@@ -344,10 +344,10 @@ docker compose run --rm lint           # ruff
 
 Licensed under the Apache License, Version 2.0 — see [LICENSE](LICENSE).
 
-* **Authors (Group 05)**:
+* **Authors **:
  * Adriana Herrero Callejo ([github.com/adrianaherrerocallejo](https://github.com/adrianaherrerocallejo))
  * Cristina Marcos Alonso ([github.com/CristinaMarcosAlonso](https://github.com/CristinaMarcosAlonso))
  * Mohammad Mustafa Orfany ([github.com/MustafaZo77o](https://github.com/MustafaZo77o))
- * Alireza Moazzen ([alirezamoazen.com](http://alirezamoazen.com))
+ * Alireza Moazen ([alirezamoazen.com](http://alirezamoazen.com))
  * **Institution**: Hamburg University of Technology (TUHH) — Software Development SS26
  * **Supervisor**: Rainer Marrone
