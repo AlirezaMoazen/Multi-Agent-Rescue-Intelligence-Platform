@@ -194,7 +194,7 @@ class TransfQMIX:
 
     def load_checkpoint(self, path: str | Path) -> None:
         """Load weights into an already-created TransfQMIX trainer."""
-        checkpoint = torch.load(Path(path), map_location="cpu")
+        checkpoint = torch.load(Path(path), map_location="cpu", weights_only=True)
         self.agent.load_state_dict(checkpoint["agent"])
         self.mixer.load_state_dict(checkpoint["mixer"])
         self.target_agent.load_state_dict(checkpoint.get("target_agent", checkpoint["agent"]))

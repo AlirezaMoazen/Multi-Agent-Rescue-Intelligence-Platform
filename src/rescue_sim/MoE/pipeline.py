@@ -927,7 +927,10 @@ def load_moe_policy(path: str) -> tuple[NeuralMoEPolicy, tuple, int] | None:
     source = Path(path)
     if not source.is_file():
         return None
-    ckpt = torch.load(source, map_location="cpu", weights_only=False)
+    # weights_only=True uses torch's restricted unpickler, so a tampered
+    # checkpoint cannot execute arbitrary code on load. The checkpoint only
+    # holds tensors + plain scalars, so this is sufficient.
+    ckpt = torch.load(source, map_location="cpu", weights_only=True)
     policy = NeuralMoEPolicy(
         ckpt["obs_dim"],
         ckpt["num_agents"],

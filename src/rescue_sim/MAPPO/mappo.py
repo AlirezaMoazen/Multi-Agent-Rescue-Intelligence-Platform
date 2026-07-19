@@ -108,7 +108,7 @@ class MAPPO:
 
     def load_checkpoint(self, path: str | Path) -> None:
         """Load weights into an already-created MAPPO trainer."""
-        checkpoint = torch.load(Path(path), map_location="cpu")
+        checkpoint = torch.load(Path(path), map_location="cpu", weights_only=True)
         self.net.load_state_dict(checkpoint["network"])
         self.net.to(self.device)
         if "optimizer" in checkpoint:

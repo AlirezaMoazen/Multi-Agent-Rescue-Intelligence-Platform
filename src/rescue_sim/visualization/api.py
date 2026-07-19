@@ -25,7 +25,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
 
 from rescue_sim.config.settings import FleetSettings, GridSettings
 from rescue_sim.environment.generator import generate_grid
@@ -107,18 +107,27 @@ _CHECKPOINTS = {
 
 
 class SimConfig(BaseModel):
-    grid_width: int = _DEFAULT_GRID.get("width", 10)
-    grid_height: int = _DEFAULT_GRID.get("height", 10)
-    obstacle_probability: float = _DEFAULT_GRID.get("obstacle_probability", 0.15)
-    target_count: int = _DEFAULT_GRID.get("target_a_count", 2) + _DEFAULT_GRID.get("target_b_count", 2)
-    num_agents: int = _DEFAULT_FLEET.num_agents
-    sensor_range: int = _DEFAULT_AGENT.get("sensor_range", 3)
-    max_steps: int = _DEFAULT_SIMULATION.get("max_steps", 500)
-    num_episodes: int = 30
-    learning_rate: float = 0.1
-    discount_factor: float = 0.9
-    exploration_rate: float = 1.0
-    speed_ms: int = 100  # delay between steps in ms
+    # Bounds are enforced by pydantic so the public API rejects malformed or
+    # resource-exhausting requests (e.g. a huge grid/fleet) before any grid or
+    # Q-table is allocated, rather than trusting client input.
+    grid_width: int = Field(default=_DEFAULT_GRID.get("width", 10), ge=4, le=100)
+    grid_height: int = Field(default=_DEFAULT_GRID.get("height", 10), ge=4, le=100)
+    obstacle_probability: float = Field(
+        default=_DEFAULT_GRID.get("obstacle_probability", 0.15), ge=0.0, le=0.9
+    )
+    target_count: int = Field(
+        default=_DEFAULT_GRID.get("target_a_count", 2) + _DEFAULT_GRID.get("target_b_count", 2),
+        ge=1,
+        le=100,
+    )
+    num_agents: int = Field(default=_DEFAULT_FLEET.num_agents, ge=1, le=50)
+    sensor_range: int = Field(default=_DEFAULT_AGENT.get("sensor_range", 3), ge=1, le=20)
+    max_steps: int = Field(default=_DEFAULT_SIMULATION.get("max_steps", 500), ge=1, le=5000)
+    num_episodes: int = Field(default=30, ge=1, le=500)
+    learning_rate: float = Field(default=0.1, gt=0.0, le=1.0)
+    discount_factor: float = Field(default=0.9, ge=0.0, le=1.0)
+    exploration_rate: float = Field(default=1.0, ge=0.0, le=1.0)
+    speed_ms: int = Field(default=100, ge=10, le=500)  # delay between steps in ms
     skip_playback: bool = False  # skip per-step animation: run at full speed, stream only per-try results
     run_mode: str = "train"  # train | evaluate | instant_train
     algorithm: str = "neural_moe"  # neural_moe | epidemic_fleet
@@ -374,7 +383,16 @@ async def simulation_ws(websocket: WebSocket):
             msg = json.loads(raw)
 
             if msg.get("type") == "config":
-                current_config = SimConfig(**msg.get("data", {}))
+                try:
+                    current_config = SimConfig(**msg.get("data", {}))
+                except ValidationError as exc:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "message": f"Invalid configuration: {exc.error_count()} field(s) out of range.",
+                        }
+                    )
+                    continue
                 await websocket.send_json(
                     {"type": "config_ack", "config": current_config.model_dump()}
                 )
@@ -578,9 +596,13 @@ async def simulation_ws(websocket: WebSocket):
                                 should_stop = True
                                 break
                             if cancel_msg.get("type") == "config":
-                                new_cfg = SimConfig(**cancel_msg.get("data", {}))
-                                current_config = new_cfg
-                                config = new_cfg
+                                try:
+                                    new_cfg = SimConfig(**cancel_msg.get("data", {}))
+                                except ValidationError:
+                                    pass  # ignore an invalid mid-run config; keep running
+                                else:
+                                    current_config = new_cfg
+                                    config = new_cfg
                         except asyncio.TimeoutError:
                             pass
 
